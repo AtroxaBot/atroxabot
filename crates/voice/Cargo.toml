@@ -1,0 +1,18 @@
+[package]
+name = "atroxabot-voice"
+description = "Voice calls for AtroxaBot: speech-to-text and text-to-speech from Fish Audio or ElevenLabs, voice activity detection and audio devices."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+# why: HTTPS to the speech providers; TLS and HTTP/1.1 are not something to write by hand.
+ureq.workspace = true
+# why: microphone capture and speaker playback; WASAPI, CoreAudio and ALSA are large unsafe FFI surfaces.
+cpal.workspace = true
+
+[lints]
+workspace = true

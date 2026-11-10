@@ -1,0 +1,86 @@
+# CLAUDE.md
+
+AtroxaBot is a native desktop app for agents the user chats with and calls. It is a Cargo workspace:
+`crates/claude-agent` (the Rust port of the Claude Agent SDK's transport), `crates/mcp` (a small MCP
+client), `crates/core` (agents, sessions, API client, agent loop and tools, usage statistics, git; no GUI), `crates/voice` (Fish
+Audio and ElevenLabs, the call loop, audio devices) and `crates/desktop` (the app; package and binary
+`atroxabot`). `README.md` describes every feature, the crate layout and the storage format: read it before
+changing behaviour, and keep it current when you do.
+
+```sh
+cargo run --release -p atroxabot
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --all --check
+```
+
+## Hard requirements
+
+- **Anthropic's terms, for Claude accounts.** Run the user's installed Claude Code binary as published:
+  never bundle, modify or wrap it, and never pass `--bare`. Never read, store, set, strip or forward its
+  credentials (no credentials files, no `ANTHROPIC_API_KEY`, no OAuth tokens), and never add a Claude
+  sign-in to the app: signing in is `claude auth login`, started in a terminal the user sees. The one
+  thing the app sets is `CLAUDE_CONFIG_DIR`, to select an extra account's configuration folder, which is
+  how Anthropic documents using several accounts; the app never looks inside that folder. Do not set
+  `CLAUDE_CODE_ENTRYPOINT` or `CLAUDE_AGENT_SDK_VERSION`. The UI says "Claude", never "Claude Code" as a
+  product name of ours (a plain statement that it runs the user's Claude Code is fine). The README's
+  section on this is the reference; re-read Anthropic's pages linked there before changing how the binary
+  is started.
+- **Rust-native, custom UI.** `winit` + `wgpu`, and we draw the app's interface ourselves. No UI
+  frameworks (egui, iced, Tauri, …).
+- **Beautiful, elegant and fast.** Redraw only when something changes, do minimal work per frame, and keep
+  the single-pipeline, single-draw-call renderer (`gpu.rs` + `shader.wgsl`). New visual effects go into
+  that pipeline as new quad kinds, never as extra passes.
+- **Cross-platform:** Windows, macOS and Linux.
+- **Dependencies are costly.** Add one only if it is truly required and can't reasonably be written by
+  hand, with a `# why:` comment. No `thiserror` (write error types by hand: `Display` +
+  `std::error::Error`), no `anyhow`, no async runtimes (threads and blocking I/O), no convenience crates.
+- **Code quality:** every public item has doc comments, `clippy::pedantic` stays clean, no `unwrap`s on
+  fallible runtime paths, non-trivial logic gets a small unit test. Parsers survive hostile input.
+- **Token discipline:** within a session the system prompt and tool list do not change and history is only
+  appended to (this keeps the prompt cache and Claude's thinking blocks valid). Never edit or reorder
+  earlier turns of a request; add a note to the newest user message instead (see `CALL_STARTED`).
+- **Secrets:** never log an API key. Config files are written atomically, `0600` on Unix. A key is only
+  sent to the address it was saved for. Agents' file tools never reach `~/.atroxabot` (`tools::risk`).
+- **Safety:** links from replies only open `http(s)` and `mailto`. A tool call that changes something,
+  runs a command or goes online is asked about unless the agent's autonomy allows it.
+- **Testing:** the owner tests the GUI. Don't drive the app with computer use; `cargo build`, `clippy`
+  and `test` are enough. To look at a visual change, render the screens offscreen:
+  `ATROXABOT_SNAPSHOTS=<folder> cargo test -p atroxabot snapshots -- --ignored` saves each scene in
+  `shell/snapshot.rs` as a PNG per theme (add a scene there for a new surface). Tests that use real
+  services are `#[ignore]`d and spend the owner's usage: run one only when a change needs it.
+
+## Design
+
+Modern, quiet and uncluttered. The only colour on screen is an agent's own (`theme::agent_color`), on its
+face (`orb.rs`) and, faintly, washed down the top of its canvas; everything else is the theme's greys.
+The exceptions are what a diff adds and removes (`Palette::positive`, `Palette::danger`) and a provider's
+mark: its platform's logo (`logo.rs`, drawn from an outline through the glyph atlas with `Painter::logo`,
+in `theme::provider_color` where the platform has a colour), or a picture the user put in
+`~/.atroxabot/icons/`. The owner decided the logos are fine to show as nominative use: they only say
+which platform a provider is. Never use one as the app's own branding.
+
+- The shell: the app draws its own title bar (`titlebar.rs`). The sidebar sits on the window
+  (`Palette::panel`); the session floats beside it on a rounded canvas (`Palette::bg`), and the side
+  panel (`shell/panel.rs`: usage and git) on another. The agent editor, the settings, the statistics and
+  a diff are modals (`widgets::modal`), the spotlight one of its own shape; menus, the approval card and
+  the composer float on `Palette::surface` with a soft shadow. The top bar holds only what belongs to
+  the session; the sidebar holds the app's as icons: search and a new agent over the agents, settings
+  and statistics at its foot. Under the message box: the paperclip at the left, the model at the right.
+- An agent has no model or effort in its editor: both are chosen under the message box. There is no
+  "auto" effort; `Shell::effort_in_use` gives every model a level of its own.
+- What the agent needs from the user rides on a card over the message box: an approval (`draw_ask`) or a
+  question (`shell/question.rs`). A subagent is a card in the conversation and a tab over it
+  (`shell/thread.rs`), never a separate window.
+- An agent's system prompt is its own (`Agent::system_prompt`, plus `CLAUDE_TOOLS` on a Claude account),
+  not Claude Code's preset: keep it short, and add to it only what an agent here needs.
+- Say it with a control, not a sentence: a dropdown for one of many (`widgets::dropdown` + `Menu`), option
+  cards for one of a few that need explaining, a switch for on or off, an icon where one is understood.
+  Adding something is a button, then a choice of what, then only the fields that choice needs.
+- Whatever scrolls uses `widgets::Scroll`: the wheel moves a target that never leaves the content, and the
+  view eases after it.
+- Colours and sizes live in `theme.rs`, from the active `Palette` (`p.theme`), never hard-coded, so every
+  theme (Black default, White, Amber) keeps working.
+- Icons come from the Lucide font (`ui::icon`): add a glyph by its codepoint from `lucide-static`'s
+  `font/lucide.css`; the icon test checks every one resolves.
+- An agent's face animates only while it is busy or on a call, so an idle app draws nothing.

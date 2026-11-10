@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- AtroxaBot.app's manifest; CI fills in @VERSION@ from the release tag. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>AtroxaBot</string>
+	<key>CFBundleDisplayName</key>
+	<string>AtroxaBot</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.luvarly.atroxabot</string>
+	<key>CFBundleExecutable</key>
+	<string>atroxabot</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VERSION@</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.productivity</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>11.0</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>AtroxaBot listens to you while you are on a voice call with an agent.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>

@@ -1,0 +1,20 @@
+[package]
+name = "atroxabot-mcp"
+description = "A small Model Context Protocol client: starts or reaches MCP servers, lists their tools and calls them."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde_json.workspace = true
+ureq.workspace = true
+
+[lints]
+workspace = true
+
+# The end-to-end stdio test starts itself again as the fake MCP server it talks to, so it has its own `main`.
+[[test]]
+name = "stdio"
+harness = false

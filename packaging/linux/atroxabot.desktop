@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=AtroxaBot
+Comment=Agents you chat with and call
+Exec=atroxabot
+Icon=atroxabot
+Terminal=false
+Categories=Utility;Development;
+StartupWMClass=atroxabot

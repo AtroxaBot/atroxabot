@@ -1,0 +1,105 @@
+# Lint, test and build on every OS we ship. Pushing a `v*` tag also
+# publishes release binaries to a GitHub release of that name.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      # cpal records and plays through ALSA, whose headers Linux builds need.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - run: cargo test --workspace --locked
+
+  release:
+    name: Release (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    permissions:
+      contents: write
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive: atroxabot-linux-x86_64.tar.gz
+          - os: windows-latest
+            archive: atroxabot-windows-x86_64.zip
+          - os: macos-latest
+            archive: atroxabot-macos-arm64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # cpal records and plays through ALSA, whose headers Linux builds need.
+      - if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev
+      - run: cargo build --release --locked -p atroxabot
+      # Windows: the exe carries its icon (build.rs). macOS: an AtroxaBot.app
+      # bundle, whose icon the Dock shows. Linux: the binary with a launcher
+      # entry, icon and install.sh, so desktops show its name and icon.
+      - name: Package
+        shell: bash
+        run: |
+          icons=crates/desktop/assets/icon
+          # Every archive carries AtroxaBot's licenses and the bundled fonts'.
+          mkdir licenses
+          cp LICENSE-MIT LICENSE-APACHE crates/desktop/assets/*-LICENSE.txt licenses/
+          case "$RUNNER_OS" in
+            Windows)
+              7z a "${{ matrix.archive }}" ./target/release/atroxabot.exe ./licenses
+              ;;
+            macOS)
+              app=AtroxaBot.app
+              mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources" AppIcon.iconset
+              cp target/release/atroxabot "$app/Contents/MacOS/atroxabot"
+              sed "s/@VERSION@/${GITHUB_REF_NAME#v}/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+              for size in 16 32 128 256 512; do
+                sips -z "$size" "$size" "$icons/macos.png" --out "AppIcon.iconset/icon_${size}x${size}.png" > /dev/null
+                sips -z "$((size * 2))" "$((size * 2))" "$icons/macos.png" --out "AppIcon.iconset/icon_${size}x${size}@2x.png" > /dev/null
+              done
+              iconutil -c icns AppIcon.iconset -o "$app/Contents/Resources/AppIcon.icns"
+              # Ad-hoc sign the bundle as a whole; Apple silicon refuses unsigned code.
+              codesign --force --deep --sign - "$app"
+              tar czf "${{ matrix.archive }}" "$app" licenses
+              ;;
+            Linux)
+              dir=atroxabot-linux-x86_64
+              mkdir "$dir"
+              cp target/release/atroxabot packaging/linux/atroxabot.desktop packaging/linux/install.sh "$dir/"
+              cp "$icons/256.png" "$dir/atroxabot.png"
+              cp -r licenses "$dir/"
+              chmod +x "$dir/atroxabot" "$dir/install.sh"
+              tar czf "${{ matrix.archive }}" "$dir"
+              ;;
+          esac
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.archive }}

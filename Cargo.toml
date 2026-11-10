@@ -1,0 +1,61 @@
+[workspace]
+resolver = "3"
+members = ["crates/claude-agent", "crates/mcp", "crates/core", "crates/voice", "crates/desktop"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/Luvarly/atroxabot"
+
+[workspace.dependencies]
+atroxabot-claude-agent = { path = "crates/claude-agent" }
+atroxabot-core = { path = "crates/core" }
+atroxabot-mcp = { path = "crates/mcp" }
+atroxabot-voice = { path = "crates/voice" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
+winit = "0.30.13"
+wgpu = { version = "30.0.1", default-features = false, features = ["std", "wgsl", "dx12", "metal", "vulkan", "gles"] }
+ttf-parser = { version = "0.25.1", default-features = false, features = ["std", "opentype-layout"] }
+bytemuck = "1.25.2"
+arboard = { version = "3.7.0", default-features = false }
+# Agent portraits. Hand-written decoders for hostile input are not worth
+# the risk; these three are fuzzed and pure Rust. zune-jpeg's features are SIMD only.
+png = "0.18.1"
+zune-jpeg = { version = "0.5.15", default-features = false, features = ["std", "x86", "neon"] }
+image-webp = "0.2.4"
+# why: microphone capture and speaker playback for voice calls; WASAPI, CoreAudio
+# and ALSA are three large unsafe FFI surfaces we cannot reasonably write by hand.
+cpal = "0.18.2"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+cast_possible_truncation = "allow"
+cast_precision_loss = "allow"
+cast_sign_loss = "allow"
+cast_possible_wrap = "allow"
+module_name_repetitions = "allow"
+too_many_lines = "allow"
+# Hex colour literals read best unseparated; UI state structs are flag-heavy.
+unreadable_literal = "allow"
+struct_excessive_bools = "allow"
+# `assert!(x.is_empty())` reads better in tests than `assert_eq!(x, [])`.
+assert_is_empty = "allow"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# Font rasterisation and shader compilation are painfully slow unoptimised.
+[profile.dev.package."*"]
+opt-level = 3
