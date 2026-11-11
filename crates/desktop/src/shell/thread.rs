@@ -38,9 +38,11 @@ const SUB_KEYS: usize = 1 << 62;
 /// The layout key, within a subagent, of what it was asked.
 const BRIEF_KEY: usize = usize::MAX / 2;
 
-/// Whether `call` started a subagent.
+/// Whether `call` started a subagent. Not every call with news of a task
+/// did: a command or a monitor sent to the background has some too (saved
+/// sessions still hold such news), and none of a subagent's own messages.
 fn is_agent(call: &ToolUse) -> bool {
-    matches!(call.name.as_str(), "Agent" | "Task") || !call.sub.is_empty() || !call.activity.is_empty()
+    matches!(call.name.as_str(), "Agent" | "Task") || !call.sub.is_empty()
 }
 
 /// The subagent calls in `blocks`, those of subagents included, in order.
@@ -1083,7 +1085,15 @@ mod tests {
         ]));
         // Sent to the background: its call returned at once, and it works on.
         let background = agent("a3", "Run the tests", Some("Started."), "cargo test · 1 tool call");
-        thread.session.entries.push(reply(vec![background]));
+        // A command sent to the background, with the task news older sessions saved for it: no subagent.
+        let command = Block::Tool(ToolUse {
+            id: "b1".into(),
+            name: "Bash".into(),
+            output: Some("Command running in background".into()),
+            activity: "Done · 0 tool calls · 0 tokens · 0s".into(),
+            ..ToolUse::default()
+        });
+        thread.session.entries.push(reply(vec![background, command]));
         thread.busy = true;
         let listed = |thread: &Thread| -> Vec<(String, bool, bool)> {
             thread.subagents().into_iter().map(|agent| (agent.label, agent.running, agent.open)).collect()

@@ -297,14 +297,19 @@ fn compact(count: u64) -> String {
 /// One line on a subagent: what it is doing, or how it ended and what that took.
 fn activity(task: &sdk::Task) -> String {
     let calls = if task.tool_uses == 1 { "1 tool call".to_owned() } else { format!("{} tool calls", task.tool_uses) };
-    let took = format!("{calls} · {} tokens · {}s", compact(task.total_tokens), task.duration_ms / 1000);
+    // An end reported without numbers (one sent to the background, say) says only how it ended.
+    let took = if task.tool_uses == 0 && task.total_tokens == 0 {
+        String::new()
+    } else {
+        format!(" · {calls} · {} tokens · {}s", compact(task.total_tokens), task.duration_ms / 1000)
+    };
     match task.state {
         sdk::TaskState::Started => "Starting…".to_owned(),
         sdk::TaskState::Running if task.description.is_empty() => calls,
         sdk::TaskState::Running => format!("{} · {calls}", task.description),
-        sdk::TaskState::Completed => format!("Done · {took}"),
-        sdk::TaskState::Failed => format!("Failed · {took}"),
-        sdk::TaskState::Stopped => format!("Stopped · {took}"),
+        sdk::TaskState::Completed => format!("Done{took}"),
+        sdk::TaskState::Failed => format!("Failed{took}"),
+        sdk::TaskState::Stopped => format!("Stopped{took}"),
     }
 }
 
@@ -328,12 +333,23 @@ struct Mapper {
     /// The subagents (by the call that started each) whose words streamed
     /// since their last complete message, which then repeats them.
     sub_streamed: HashSet<String>,
+    /// The calls that started a subagent. Claude Code reports a command
+    /// or a monitor sent to the background as a task too, and those are
+    /// no subagents: only these calls are told how their task is doing.
+    agents: HashSet<String>,
     /// The follow-ups sent and not taken in yet, by the id they were sent
     /// under; shared with [`ClaudeAgent::follow_up`].
     follow_ups: Arc<Mutex<HashMap<String, FollowUp>>>,
 }
 
 impl Mapper {
+    /// Remembers the call `id` if it starts a subagent.
+    fn note_agent(&mut self, id: &str, name: &str) {
+        if matches!(name, "Agent" | "Task") {
+            self.agents.insert(id.to_owned());
+        }
+    }
+
     fn map(&mut self, event: sdk::Event) -> Vec<AgentEvent> {
         let mut out = Vec::new();
         match event {
@@ -360,6 +376,7 @@ impl Mapper {
                             out.push(AgentEvent::Thinking(text));
                         }
                         sdk::Block::ToolUse { id, name, input } => {
+                            self.note_agent(&id, &name);
                             let call = ToolUse { id, name, input: input.to_string(), ..ToolUse::default() };
                             out.push(AgentEvent::ToolCall(call));
                         }
@@ -388,6 +405,7 @@ impl Mapper {
                         sdk::Block::Text(text) if !text.trim().is_empty() => AgentEvent::Text(text),
                         sdk::Block::Thinking(text) if !text.trim().is_empty() => AgentEvent::Thinking(text),
                         sdk::Block::ToolUse { id, name, input } => {
+                            self.note_agent(&id, &name);
                             AgentEvent::ToolCall(ToolUse { id, name, input: input.to_string(), ..ToolUse::default() })
                         }
                         _ => continue,
@@ -396,7 +414,14 @@ impl Mapper {
                 }
             }
             sdk::Event::Task(task) if !task.tool_use_id.is_empty() => {
-                out.push(AgentEvent::Activity { text: activity(&task), id: task.tool_use_id });
+                // A task of a subagent's kind is one, whatever its call is named.
+                let kind = task.task_type.as_str();
+                if kind.contains("agent") || kind.contains("teammate") {
+                    self.agents.insert(task.tool_use_id.clone());
+                }
+                if self.agents.contains(&task.tool_use_id) {
+                    out.push(AgentEvent::Activity { text: activity(&task), id: task.tool_use_id });
+                }
             }
             sdk::Event::RateLimit(limit) => {
                 let window =
@@ -549,6 +574,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_subagents_hear_of_their_tasks() {
+        let mut mapper = Mapper::default();
+        let calls = |calls: &[(&str, &str)]| sdk::Event::Assistant {
+            blocks: calls
+                .iter()
+                .map(|(id, name)| sdk::Block::ToolUse { id: (*id).into(), name: (*name).into(), input: json!({}) })
+                .collect(),
+            model: "m".into(),
+            parent_tool_use_id: None,
+            usage: sdk::Usage::default(),
+            error: None,
+        };
+        let task = |id: &str, kind: &str, state: sdk::TaskState| {
+            sdk::Event::Task(sdk::Task {
+                tool_use_id: id.into(),
+                task_type: kind.into(),
+                state,
+                ..sdk::Task::default()
+            })
+        };
+        let news = |out: Vec<AgentEvent>| -> Vec<String> {
+            out.into_iter()
+                .filter_map(|e| if let AgentEvent::Activity { id, .. } = e { Some(id) } else { None })
+                .collect()
+        };
+        mapper.map(calls(&[("b1", "Bash"), ("m1", "Monitor"), ("a1", "Agent")]));
+        // A command and a monitor sent to the background are tasks, but no subagents.
+        for (id, kind) in [("b1", "local_bash"), ("m1", "monitor_mcp"), ("a1", "local_agent")] {
+            let mut said = news(mapper.map(task(id, kind, sdk::TaskState::Started)));
+            said.extend(news(mapper.map(task(id, "", sdk::TaskState::Completed))));
+            let expected: &[&str] = if id == "a1" { &["a1", "a1"] } else { &[] };
+            assert_eq!(said, expected, "{id}");
+        }
+        // A call of another name is a subagent when its task says so.
+        assert_eq!(news(mapper.map(task("r1", "remote_agent", sdk::TaskState::Started))), ["r1"]);
+        assert_eq!(news(mapper.map(task("r1", "", sdk::TaskState::Completed))), ["r1"]);
+    }
+
+    #[test]
     fn subagents_limits_and_compaction_are_mapped() {
         let mut mapper = Mapper::default();
         let said = |parent: Option<&str>, blocks: Vec<sdk::Block>| sdk::Event::Assistant {
@@ -595,6 +659,8 @@ mod tests {
             ..task
         };
         assert_eq!(activity(&done), "Done · 3 tool calls · 28.8k tokens · 3s");
+        let failed = sdk::Task { state: sdk::TaskState::Failed, tool_uses: 0, total_tokens: 0, ..done };
+        assert_eq!(activity(&failed), "Failed", "no row of zeros when the end came without numbers");
 
         let window =
             sdk::RateWindow { name: "five_hour".into(), utilization: 0.1, resets_at: 9, status: "allowed".into() };

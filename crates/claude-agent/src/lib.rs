@@ -203,6 +203,9 @@ pub struct Task {
     pub description: String,
     /// Its kind, e.g. `general-purpose` or `Explore`.
     pub subagent_type: String,
+    /// What sort of task it is, from `task_started` only: `local_agent` (a subagent), but also
+    /// `local_bash` (a command sent to the background), `monitor_mcp` and others that are no subagent.
+    pub task_type: String,
     /// The tool it called last.
     pub last_tool: String,
     /// Tool calls it made so far.

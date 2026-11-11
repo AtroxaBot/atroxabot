@@ -224,6 +224,7 @@ fn system(data: Value) -> Parsed {
                 state,
                 description: text(&data, "description"),
                 subagent_type: text(&data, "subagent_type"),
+                task_type: text(&data, "task_type"),
                 last_tool: text(&data, "last_tool_name"),
                 tool_uses: number(usage, "tool_uses"),
                 total_tokens: number(usage, "total_tokens"),
