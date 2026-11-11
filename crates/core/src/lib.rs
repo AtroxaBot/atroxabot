@@ -26,6 +26,7 @@ mod error;
 pub mod git;
 mod mcp;
 mod messages;
+mod pattern;
 mod responses;
 mod session;
 pub mod skills;

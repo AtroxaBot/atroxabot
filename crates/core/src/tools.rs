@@ -6,20 +6,27 @@
 //! Each call is a typed action, so the app can judge it before it runs
 //! ([`risk`]) and show what it did. Outputs are bounded: a long file is read
 //! in pages and a long command output is cut in the middle, with a note
-//! saying so, which keeps one careless call from flooding the context.
+//! saying so, which keeps one careless call from flooding the context. They
+//! are also made to save the model a step: `search` takes a regular
+//! expression, leaves out what Git ignores and can name the files alone,
+//! `edit` makes several changes at once and says which lines they are now,
+//! and a command's output that was cut is kept whole in a file to search.
 
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
 use crate::config::Config;
+use crate::pattern::Pattern;
 use crate::skills::{self, Skill};
 
 /// Most lines one `read` returns.
@@ -34,6 +41,25 @@ const MAX_ENTRIES: usize = 400;
 const MAX_VISITS: usize = 50_000;
 /// How deep `list` and `search` descend.
 const MAX_DEPTH: usize = 24;
+/// Longest line `read` returns whole, in characters.
+const LINE_CHARS: usize = 2_000;
+/// How much of a line `search` looks at and shows: bytes of it, then characters.
+const SEARCH_LINE: (usize, usize) = (10_000, 240);
+/// Most lines `search` shows before and after a match.
+const MAX_CONTEXT: usize = 10;
+/// How long one `search` may take.
+const SEARCH_TIME: Duration = Duration::from_secs(20);
+/// Most places an `edit` names in its answer.
+const MAX_PLACES: usize = 12;
+/// How much of a cut command output is its start; the rest is its end,
+/// where a build or a test run says what went wrong.
+const SHELL_HEAD: usize = OUTPUT_CHARS / 4;
+/// Most command outputs kept whole on disk at a time.
+const KEPT_OUTPUTS: usize = 20;
+/// What the folder of this process's kept outputs is named by, in the temporary folder.
+const OUTPUTS: &str = "atroxabot-output-";
+/// How long another process's kept outputs are left alone.
+const OUTPUTS_AGE: Duration = Duration::from_secs(24 * 3600);
 /// How long a command may run unless it asks for longer, and the most it may ask for.
 const SHELL_TIMEOUT: (u64, u64) = (120, 900);
 /// Largest page `fetch` reads, in bytes.
@@ -52,6 +78,17 @@ pub struct Workspace {
     pub library: Option<PathBuf>,
     /// The skills it has, as they were when its session began.
     pub skills: Arc<Vec<Skill>>,
+    /// The files it read or wrote, as they were on disk then: what tells
+    /// `edit` and `write` that one was changed since by something else.
+    seen: Arc<Mutex<HashMap<PathBuf, Stamp>>>,
+}
+
+/// What tells one state of a file on disk from another: when it was last
+/// written, and how long it is.
+type Stamp = (Option<SystemTime>, u64);
+
+fn stamp(path: &Path) -> Option<Stamp> {
+    fs::metadata(path).ok().map(|meta| (meta.modified().ok(), meta.len()))
 }
 
 impl Workspace {
@@ -60,7 +97,20 @@ impl Workspace {
     #[must_use]
     pub fn new(dir: &Path, memory: Option<&Path>) -> Self {
         let real = |path: &Path| resolve(&path.to_string_lossy(), &Self::default());
-        Self { dir: real(dir), memory: memory.map(real), library: None, skills: Arc::default() }
+        Self { dir: real(dir), memory: memory.map(real), ..Self::default() }
+    }
+
+    /// Remembers `path` as it is on disk now.
+    fn saw(&self, path: &Path) {
+        if let (Some(stamp), Ok(mut seen)) = (stamp(path), self.seen.lock()) {
+            seen.insert(path.to_owned(), stamp);
+        }
+    }
+
+    /// Whether `path` is not as it was when the agent last read or wrote it.
+    fn changed(&self, path: &Path) -> bool {
+        let known = self.seen.lock().ok().and_then(|seen| seen.get(path).copied());
+        known.is_some_and(|known| stamp(path) != Some(known))
     }
 
     /// The same workspace with the installed `skills`, whose folders are in `library`.
@@ -94,7 +144,7 @@ pub fn definitions() -> Vec<(&'static str, &'static str, Value)> {
     vec![
         (
             "read",
-            "Read a text file. Returns numbered lines. Long files come in pages: pass `offset` (first line, from 1) and `limit` to read on.",
+            "Read a text file. Returns numbered lines. Long files come in pages: pass `offset` (first line, from 1) and `limit` to read on, or to read only the part you need.",
             object(
                 json!({ "path": text("File path, absolute or relative to your folder."), "offset": number("First line to return, from 1."), "limit": number("Most lines to return.") }),
                 &["path"],
@@ -110,15 +160,28 @@ pub fn definitions() -> Vec<(&'static str, &'static str, Value)> {
         ),
         (
             "edit",
-            "Replace text in a file. `old` must match the file exactly and, unless `all` is true, exactly once: include enough surrounding lines to make it unique.",
+            "Replace text in a file. `old` must match the file exactly and, unless `all` is true, exactly once: include enough surrounding lines to make it unique. To change several places of one file, pass them as `edits`: they are made in order, and none is kept unless all fit. The answer names the lines that changed; a call that did not fail worked, so do not read the file again to check.",
             object(
-                json!({ "path": text("File path."), "old": text("Exact text to replace."), "new": text("Text to put in its place."), "all": { "type": "boolean", "description": "Replace every occurrence." } }),
-                &["path", "old", "new"],
+                json!({
+                    "path": text("File path."),
+                    "old": text("Exact text to replace."),
+                    "new": text("Text to put in its place."),
+                    "all": { "type": "boolean", "description": "Replace every occurrence." },
+                    "edits": {
+                        "type": "array",
+                        "description": "Several replacements, instead of `old` and `new`.",
+                        "items": object(
+                            json!({ "old": text("Exact text to replace."), "new": text("Text to put in its place."), "all": { "type": "boolean", "description": "Replace every occurrence." } }),
+                            &["old", "new"],
+                        ),
+                    },
+                }),
+                &["path"],
             ),
         ),
         (
             "list",
-            "List a folder. With `recursive`, lists everything below it; `match` keeps names that fit a pattern with `*` wildcards, such as `*.rs`.",
+            "List a folder. With `recursive`, lists the files below it, leaving out what `.gitignore` excludes; `match` keeps names that fit a pattern with `*` wildcards, such as `*.rs`.",
             object(
                 json!({ "path": text("Folder path; your folder when omitted."), "recursive": { "type": "boolean", "description": "Descend into subfolders." }, "match": text("Name pattern with `*` wildcards.") }),
                 &[],
@@ -126,18 +189,24 @@ pub fn definitions() -> Vec<(&'static str, &'static str, Value)> {
         ),
         (
             "search",
-            "Find lines containing some text in the files below a folder (case-insensitive, plain text, not a regular expression). Returns `path:line: text`.",
+            "Find the lines a regular expression matches in the files below a folder, leaving out what `.gitignore` excludes. Letters match whatever their case unless the pattern has a capital. Returns each file's name and under it `line: text`. With `files`, returns only the files' names and how many lines match in each: start with that when you do not know where to look.",
             object(
-                json!({ "text": text("Text to find."), "path": text("Folder or file to search; your folder when omitted."), "match": text("Only search files whose name fits this `*` pattern.") }),
-                &["text"],
+                json!({
+                    "pattern": text("Regular expression, matched within a line: `fn \\w+\\(`, `TODO|FIXME`, `^use `."),
+                    "path": text("Folder or file to search; your folder when omitted."),
+                    "match": text("Only search files whose name fits this `*` pattern, such as `*.rs`."),
+                    "files": { "type": "boolean", "description": "Only name the files that have a match." },
+                    "context": number("Lines to show before and after each match; none by default."),
+                }),
+                &["pattern"],
             ),
         ),
         (
             "shell",
             if cfg!(windows) {
-                "Run a PowerShell command in your folder and return its output and exit code. Each call is a fresh shell."
+                "Run a PowerShell command in your folder and return its output and exit code. Each call is a fresh shell. Long output is cut in the middle and kept whole in a file the answer names: search that file rather than run the command again."
             } else {
-                "Run a shell command (`sh -c`) in your folder and return its output and exit code. Each call is a fresh shell."
+                "Run a shell command (`sh -c`) in your folder and return its output and exit code. Each call is a fresh shell. Long output is cut in the middle and kept whole in a file the answer names: search that file rather than run the command again."
             },
             object(
                 json!({ "command": text("The command line."), "timeout": number("Seconds before it is stopped; 120 by default, 900 at most.") }),
@@ -164,10 +233,12 @@ pub fn risk(name: &str, input: &Value, workspace: &Workspace) -> Risk {
     let private =
         !notes && Config::dir().is_ok_and(|dir| path.starts_with(&dir) && !path.starts_with(dir.join("worktrees")));
     let inside = notes || path.starts_with(&workspace.dir);
+    // What its own commands printed, kept whole for it to look through.
+    let kept = kept_outputs().is_some_and(|outputs| path.starts_with(outputs));
     match name {
         skills::TOOL => Risk::Safe,
         // A skill's files are read, never changed, by an agent.
-        "read" | "list" | "search" if library => Risk::Safe,
+        "read" | "list" | "search" if library || kept => Risk::Safe,
         "read" | "list" | "search" | "write" | "edit" if private => Risk::Forbidden,
         "read" | "list" | "search" if inside => Risk::Safe,
         "write" | "edit" if notes => Risk::Safe,
@@ -201,11 +272,13 @@ pub fn run(name: &str, input: &Value, workspace: &Workspace, cancel: &AtomicBool
     let flag = |key: &str| input.get(key).and_then(Value::as_bool).unwrap_or(false);
     let count = |key: &str| input.get(key).and_then(Value::as_u64).map(|n| usize::try_from(n).unwrap_or(usize::MAX));
     match name {
-        "read" => read(&resolve(need("path")?, workspace), count("offset"), count("limit")),
-        "write" => write(&resolve(need("path")?, workspace), need("content")?),
-        "edit" => edit(&resolve(need("path")?, workspace), need("old")?, need("new")?, flag("all")),
+        "read" => read(&resolve(need("path")?, workspace), count("offset"), count("limit"), workspace),
+        "write" => write(&resolve(need("path")?, workspace), need("content")?, workspace),
+        "edit" => edit(&resolve(need("path")?, workspace), &changes(input)?, workspace),
         "list" => list(&path("path"), flag("recursive"), text("match")),
-        "search" => search(&path("path"), need("text")?, text("match")),
+        "search" => {
+            search(&path("path"), need("pattern")?, text("match"), flag("files"), count("context").unwrap_or(0))
+        }
         "shell" => shell(need("command")?, input.get("timeout").and_then(Value::as_u64), &workspace.dir, cancel),
         "fetch" => fetch(need("url")?),
         skills::TOOL => skills::load(&workspace.skills, input),
@@ -270,8 +343,9 @@ fn load(path: &Path) -> Result<String, String> {
     String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8 text", path.display()))
 }
 
-fn read(path: &Path, offset: Option<usize>, limit: Option<usize>) -> Result<String, String> {
+fn read(path: &Path, offset: Option<usize>, limit: Option<usize>, workspace: &Workspace) -> Result<String, String> {
     let text = load(path)?;
+    workspace.saw(path);
     let first = offset.unwrap_or(1).max(1);
     let limit = limit.unwrap_or(READ_LINES).clamp(1, READ_LINES);
     let total = text.lines().count();
@@ -281,7 +355,7 @@ fn read(path: &Path, offset: Option<usize>, limit: Option<usize>) -> Result<Stri
         if out.len() > OUTPUT_CHARS {
             break;
         }
-        let _ = writeln!(out, "{:>5}  {line}", number + 1);
+        let _ = writeln!(out, "{:>5}  {}", number + 1, clipped(line, LINE_CHARS));
         last = number + 1;
     }
     if total == 0 {
@@ -293,29 +367,154 @@ fn read(path: &Path, offset: Option<usize>, limit: Option<usize>) -> Result<Stri
     Ok(out)
 }
 
-fn write(path: &Path, content: &str) -> Result<String, String> {
+/// `line`, or its first `max` characters and a note of how many more there
+/// are: one line of a minified file is no page to read.
+fn clipped(line: &str, max: usize) -> Cow<'_, str> {
+    match line.char_indices().nth(max) {
+        None => Cow::Borrowed(line),
+        Some((at, _)) => Cow::Owned(format!("{}… [{} more characters]", &line[..at], line[at..].chars().count())),
+    }
+}
+
+fn write(path: &Path, content: &str, workspace: &Workspace) -> Result<String, String> {
+    if path.exists() && workspace.changed(path) {
+        return Err(format!(
+            "{} was changed on disk since you read it; read it again before you replace it",
+            path.display()
+        ));
+    }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
     fs::write(path, content).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    workspace.saw(path);
     Ok(format!("Wrote {} ({} lines).", path.display(), content.lines().count()))
 }
 
-fn edit(path: &Path, old: &str, new: &str, all: bool) -> Result<String, String> {
-    if old.is_empty() {
-        return Err("`old` is empty; use `write` to create a file".to_owned());
+/// One replacement of an `edit` call.
+#[derive(Debug, Clone, Copy)]
+struct Change<'a> {
+    old: &'a str,
+    new: &'a str,
+    all: bool,
+}
+
+/// The replacements an `edit` call asks for: its own `old` and `new`, then
+/// those of its `edits`.
+fn changes(input: &Value) -> Result<Vec<Change<'_>>, String> {
+    fn one(value: &Value) -> Result<Change<'_>, String> {
+        let text = |key: &str| value.get(key).and_then(Value::as_str).ok_or_else(|| format!("missing `{key}`"));
+        Ok(Change {
+            old: text("old")?,
+            new: text("new")?,
+            all: value.get("all").and_then(Value::as_bool).unwrap_or(false),
+        })
     }
-    let text = load(path)?;
-    let found = text.matches(old).count();
-    match found {
-        0 => return Err("`old` was not found in the file; read it again and copy the text exactly".to_owned()),
-        1 => {}
-        _ if all => {}
-        n => return Err(format!("`old` matches {n} places; add surrounding lines to make it unique, or set `all`")),
+    let edits = input.get("edits").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
+    let own = (input.get("old").is_some() || edits.is_empty()).then_some(input);
+    own.into_iter().chain(edits).map(one).collect()
+}
+
+fn edit(path: &Path, changes: &[Change<'_>], workspace: &Workspace) -> Result<String, String> {
+    let stale = workspace.changed(path);
+    let mut text = load(path)?;
+    // Where each replacement's new text is in the file as it will be: its first byte, and its length.
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    for (index, change) in changes.iter().enumerate() {
+        let (which, kept) = if changes.len() == 1 {
+            (String::new(), "")
+        } else {
+            (format!(" of edit {}", index + 1), "; nothing was changed")
+        };
+        if change.old.is_empty() {
+            return Err(format!("`old`{which} is empty; use `write` to create a file{kept}"));
+        }
+        let mut found: Vec<usize> = text.match_indices(change.old).map(|(at, _)| at).collect();
+        match found.len() {
+            0 => {
+                let why = if stale { ", which was changed on disk since you read it" } else { "" };
+                return Err(format!(
+                    "`old`{which} was not found in the file{why}; read it again and copy the text exactly{kept}"
+                ));
+            }
+            1 => {}
+            _ if change.all => {}
+            n => {
+                return Err(format!(
+                    "`old`{which} matches {n} places; add surrounding lines to make it unique, or set `all`{kept}"
+                ));
+            }
+        }
+        found.truncate(if change.all { usize::MAX } else { 1 });
+        // What comes after a replacement moves by as much as it grew or shrank.
+        let grown = change.new.len().saturating_sub(change.old.len());
+        let shrunk = change.old.len().saturating_sub(change.new.len());
+        for span in &mut spans {
+            let before = found.iter().filter(|at| **at + change.old.len() <= span.0).count();
+            span.0 = (span.0 + before * grown).saturating_sub(before * shrunk);
+        }
+        let mut replaced = String::with_capacity(text.len() + found.len() * grown);
+        let mut rest = 0;
+        for at in found {
+            replaced.push_str(&text[rest..at]);
+            spans.push((replaced.len(), change.new.len()));
+            replaced.push_str(change.new);
+            rest = at + change.old.len();
+        }
+        replaced.push_str(&text[rest..]);
+        text = replaced;
     }
-    let replaced = if all { text.replace(old, new) } else { text.replacen(old, new, 1) };
-    fs::write(path, replaced).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    Ok(format!("Edited {} ({found} replacement{}).", path.display(), if found == 1 { "" } else { "s" }))
+    if spans.is_empty() {
+        return Err("nothing to replace: give `old` and `new`, or `edits`".to_owned());
+    }
+    fs::write(path, &text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    workspace.saw(path);
+    let count = spans.len();
+    let mut out = format!(
+        "Edited {} ({count} replacement{}), now at {}.",
+        path.display(),
+        if count == 1 { "" } else { "s" },
+        lines_of(&text, spans)
+    );
+    if stale {
+        out.push_str(" The file was changed on disk since you read it: the rest of it may not be as you saw it.");
+    }
+    Ok(out)
+}
+
+/// The lines the `spans` of `text` (first byte and length) are on, as
+/// `line 4` or `lines 4-9, 20`.
+fn lines_of(text: &str, mut spans: Vec<(usize, usize)>) -> String {
+    spans.sort_unstable();
+    let bytes = text.as_bytes();
+    let breaks = |from: usize, to: usize| {
+        let part = bytes.get(from.min(bytes.len())..to.min(bytes.len())).unwrap_or_default();
+        part.iter().map(|byte| usize::from(*byte == b'\n')).sum::<usize>()
+    };
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    let (mut line, mut at) = (1, 0);
+    for &(start, length) in spans.iter().take(MAX_PLACES) {
+        line += breaks(at, start);
+        at = at.max(start);
+        // A new text that ends its last line does not reach into the next.
+        let ends_line = length > 0 && bytes.get(start + length - 1) == Some(&b'\n');
+        let last = line + breaks(start, start + length).saturating_sub(usize::from(ends_line));
+        if ranges.last() != Some(&(line, last)) {
+            ranges.push((line, last));
+        }
+    }
+    let many = ranges.len() > 1 || ranges.iter().any(|(first, last)| first != last);
+    let mut out = String::from(if many { "lines " } else { "line " });
+    for (index, (first, last)) in ranges.iter().enumerate() {
+        let _ = write!(out, "{}{first}", if index == 0 { "" } else { ", " });
+        if last != first {
+            let _ = write!(out, "-{last}");
+        }
+    }
+    if spans.len() > MAX_PLACES {
+        out.push_str(" and further on");
+    }
+    out
 }
 
 /// Whether `name` fits `pattern`, where `*` stands for any run of characters
@@ -379,15 +578,30 @@ fn walk(root: &Path, recursive: bool, folders: bool, visit: &mut dyn FnMut(&Path
     Ok(())
 }
 
+/// The files below `root` that Git does not ignore, when `root` is in a
+/// repository and has any: what `.gitignore` excludes (builds, packages)
+/// is rarely what is looked for, and drowns what is.
+fn unignored(root: &Path) -> Option<Vec<PathBuf>> {
+    let listed = crate::git::git(root, &["ls-files", "-z", "--cached", "--others", "--exclude-standard"]).ok()?;
+    let files: Vec<PathBuf> = listed
+        .split(|byte| *byte == 0)
+        .filter_map(|name| std::str::from_utf8(name).ok())
+        .filter(|name| !name.is_empty())
+        .take(MAX_VISITS)
+        .map(|name| name.split('/').fold(root.to_owned(), |path, part| path.join(part)))
+        .collect();
+    (!files.is_empty()).then_some(files)
+}
+
 fn list(root: &Path, recursive: bool, pattern: Option<&str>) -> Result<String, String> {
     let mut out = String::new();
     let mut shown = 0usize;
     let mut more = false;
-    walk(root, recursive, true, &mut |path, is_dir| {
+    let wanted = |path: &Path| {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-        if pattern.is_some_and(|pattern| !fits(pattern, name)) {
-            return true;
-        }
+        pattern.is_none_or(|pattern| fits(pattern, name))
+    };
+    let mut show = |path: &Path, is_dir: bool| {
         if shown == MAX_ENTRIES {
             more = true;
             return false;
@@ -396,7 +610,18 @@ fn list(root: &Path, recursive: bool, pattern: Option<&str>) -> Result<String, S
         let relative = path.strip_prefix(root).unwrap_or(path);
         let _ = writeln!(out, "{}{}", relative.display(), if is_dir { "/" } else { "" });
         true
-    })?;
+    };
+    match recursive.then_some(root).and_then(unignored) {
+        // Git also names the files it tracks that are gone from the folder.
+        Some(files) => {
+            for file in files.iter().filter(|file| wanted(file) && file.is_file()) {
+                if !show(file, false) {
+                    break;
+                }
+            }
+        }
+        None => walk(root, recursive, true, &mut |path, is_dir| !wanted(path) || show(path, is_dir))?,
+    }
     if shown == 0 {
         return Ok("(nothing found)".to_owned());
     }
@@ -406,44 +631,106 @@ fn list(root: &Path, recursive: bool, pattern: Option<&str>) -> Result<String, S
     Ok(out)
 }
 
-fn search(root: &Path, needle: &str, pattern: Option<&str>) -> Result<String, String> {
-    if needle.is_empty() {
-        return Err("`text` is empty".to_owned());
+fn search(root: &Path, pattern: &str, glob: Option<&str>, names: bool, context: usize) -> Result<String, String> {
+    const MORE: &str = "more matches were left out; narrow the search";
+    if pattern.is_empty() {
+        return Err("`pattern` is empty".to_owned());
     }
-    let needle = needle.to_lowercase();
     let mut out = String::new();
+    let mut matcher = Pattern::new(pattern).unwrap_or_else(|why| {
+        let _ = writeln!(
+            out,
+            "[`pattern` is not a regular expression this tool reads ({why}): it was looked for as plain text]"
+        );
+        Pattern::plain(pattern)
+    });
+    let context = context.min(MAX_CONTEXT);
+    let deadline = Instant::now() + SEARCH_TIME;
     let mut found = 0usize;
-    let mut more = false;
+    let mut stopped = "";
     let mut look = |path: &Path| {
+        // A link may lead anywhere: only what is really below the folder is read.
+        if !fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file()) {
+            return true;
+        }
         let Ok(text) = load(path) else { return true };
-        for (number, line) in text.lines().enumerate() {
-            if !line.to_lowercase().contains(&needle) {
-                continue;
+        let lines: Vec<&str> = text.lines().collect();
+        let mut hits = Vec::new();
+        for (at, line) in lines.iter().enumerate() {
+            if at % 64 == 0 && Instant::now() > deadline {
+                stopped = "the search took too long and stopped here; narrow it";
+                return false;
             }
-            if found == MAX_ENTRIES || out.len() > OUTPUT_CHARS {
-                more = true;
+            // The start of a line is enough of one that goes on and on.
+            let mut end = line.len().min(SEARCH_LINE.0);
+            while !line.is_char_boundary(end) {
+                end -= 1;
+            }
+            if matcher.is_match(&line[..end]) {
+                hits.push(at);
+            }
+        }
+        if hits.is_empty() {
+            return true;
+        }
+        let full = |found: usize, out: &str| found >= MAX_ENTRIES || out.len() > OUTPUT_CHARS;
+        if full(found, &out) {
+            stopped = MORE;
+            return false;
+        }
+        let name = if path == root {
+            path.file_name().map_or(path, Path::new)
+        } else {
+            path.strip_prefix(root).unwrap_or(path)
+        };
+        if names {
+            found += 1;
+            let _ = writeln!(out, "{}: {}", name.display(), hits.len());
+            return true;
+        }
+        let _ = writeln!(out, "{}", name.display());
+        // The first line not shown yet.
+        let mut next = 0;
+        for &hit in &hits {
+            if full(found, &out) {
+                stopped = MORE;
                 return false;
             }
             found += 1;
-            let shown: String = line.trim().chars().take(240).collect();
-            let relative = path.strip_prefix(root).unwrap_or(path);
-            let _ = writeln!(out, "{}:{}: {shown}", relative.display(), number + 1);
+            let from = hit.saturating_sub(context).max(next);
+            let to = (hit + context).min(lines.len().saturating_sub(1));
+            if context > 0 && next > 0 && from > next {
+                out.push_str("  --\n");
+            }
+            for (at, line) in lines.iter().enumerate().take(to + 1).skip(from) {
+                let mark = if hits.binary_search(&at).is_ok() { ':' } else { '-' };
+                // Indentation only says something next to other lines.
+                let line = if context == 0 { line.trim() } else { line.trim_end() };
+                let shown: String = line.chars().take(SEARCH_LINE.1).collect();
+                let _ = writeln!(out, "  {}{mark} {shown}", at + 1);
+            }
+            next = next.max(to + 1);
         }
         true
     };
     if root.is_file() {
         look(root);
     } else {
-        walk(root, true, false, &mut |path, _| {
+        let mut visit = |path: &Path| {
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-            pattern.is_some_and(|pattern| !fits(pattern, name)) || look(path)
-        })?;
+            glob.is_some_and(|glob| !fits(glob, name)) || look(path)
+        };
+        match unignored(root) {
+            Some(files) => {
+                let _ = files.iter().try_for_each(|file| visit(file).then_some(()));
+            }
+            None => walk(root, true, false, &mut |path, _| visit(path))?,
+        }
     }
-    if found == 0 {
-        return Ok("(no matches)".to_owned());
-    }
-    if more {
-        out.push_str("\n[more matches were left out; narrow the search]");
+    if found == 0 && stopped.is_empty() {
+        out.push_str("(no matches)");
+    } else if !stopped.is_empty() {
+        let _ = write!(out, "\n[{stopped}]");
     }
     Ok(out)
 }
@@ -451,14 +738,101 @@ fn search(root: &Path, needle: &str, pattern: Option<&str>) -> Result<String, St
 /// `text` cut in the middle to at most [`OUTPUT_CHARS`], saying so: the
 /// start and the end of an output matter most.
 fn bounded(text: &str) -> String {
+    match halves(text, OUTPUT_CHARS / 2) {
+        None => text.to_owned(),
+        Some((head, tail, left_out)) => format!("{head}\n\n[{left_out} characters left out here]\n\n{tail}"),
+    }
+}
+
+/// The first `head` characters of a `text` longer than [`OUTPUT_CHARS`]
+/// and as many of its last as still fit, with the count of those between.
+fn halves(text: &str, head: usize) -> Option<(&str, &str, usize)> {
     let count = text.chars().count();
     if count <= OUTPUT_CHARS {
-        return text.to_owned();
+        return None;
     }
-    let half = OUTPUT_CHARS / 2;
-    let head: String = text.chars().take(half).collect();
-    let tail: String = text.chars().skip(count - half).collect();
-    format!("{head}\n\n[{} characters left out here]\n\n{tail}", count - 2 * half)
+    let tail = OUTPUT_CHARS - head;
+    let (end, _) = text.char_indices().nth(head)?;
+    let (start, _) = text.char_indices().rev().nth(tail.checked_sub(1)?)?;
+    Some((&text[..end], &text[start..], count - head - tail))
+}
+
+/// What a command printed, for the model: when it is long, its start and,
+/// mostly, its end, each cut at a line, and the file that has all of it.
+fn shell_output(text: &str) -> String {
+    let Some((head, tail, _)) = halves(text, SHELL_HEAD) else { return text.to_owned() };
+    let head = head.rfind('\n').map_or(head, |at| &head[..at]);
+    let tail = tail.find('\n').map_or(tail, |at| &tail[at + 1..]);
+    let left_out = text.chars().count() - head.chars().count() - tail.chars().count();
+    let whole = keep(text).map_or_else(String::new, |path| {
+        format!("; the whole output is in {}, which `search` and `read` can look through", path.display())
+    });
+    format!("{head}\n\n[{left_out} characters left out here{whole}]\n\n{tail}")
+}
+
+/// This process's folder of kept outputs, once it was made.
+static KEPT: OnceLock<Option<PathBuf>> = OnceLock::new();
+
+/// The folder of kept outputs, when there is one yet.
+fn kept_outputs() -> Option<&'static Path> {
+    KEPT.get().and_then(Option::as_deref)
+}
+
+/// Keeps `output` whole in a file of this process's own folder in the
+/// temporary folder, and returns where; the oldest of more than
+/// [`KEPT_OUTPUTS`] goes. The folder is made new and closed to other
+/// users, so nothing in it is anyone else's, and the ones earlier runs of
+/// the app left are removed.
+fn keep(output: &str) -> Option<PathBuf> {
+    static COUNT: AtomicUsize = AtomicUsize::new(0);
+    let dir = KEPT
+        .get_or_init(|| {
+            let temp = std::env::temp_dir();
+            sweep_outputs(&temp);
+            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.subsec_nanos());
+            let dir = temp.join(format!("{OUTPUTS}{}-{nanos}", std::process::id()));
+            // Fails on a folder that is there already: one somebody else made is never used.
+            make_private(&dir).ok()?;
+            fs::canonicalize(&dir).ok().map(strip_verbatim)
+        })
+        .as_deref()?;
+    let number = COUNT.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("output-{number}.txt"));
+    fs::write(&path, output).ok()?;
+    if let Some(old) = number.checked_sub(KEPT_OUTPUTS) {
+        let _ = fs::remove_file(dir.join(format!("output-{old}.txt")));
+    }
+    Some(path)
+}
+
+/// Makes the folder `dir`, which must not be there yet, for this user alone.
+#[cfg(unix)]
+fn make_private(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new().mode(0o700).create(dir)
+}
+
+/// Makes the folder `dir`, which must not be there yet: the temporary
+/// folder it is in is this user's alone.
+#[cfg(not(unix))]
+fn make_private(dir: &Path) -> std::io::Result<()> {
+    fs::create_dir(dir)
+}
+
+/// Removes the folders of kept outputs in `temp` that nothing wrote to for
+/// a day: what earlier runs of the app left behind.
+fn sweep_outputs(temp: &Path) {
+    let Ok(entries) = fs::read_dir(temp) else { return };
+    for entry in entries.flatten() {
+        let ours = entry.file_name().to_str().is_some_and(|name| name.starts_with(OUTPUTS));
+        // A link is not followed: only a real folder is one of these.
+        let old = entry.metadata().is_ok_and(|meta| {
+            meta.is_dir() && meta.modified().ok().and_then(|at| at.elapsed().ok()).is_some_and(|age| age > OUTPUTS_AGE)
+        });
+        if ours && old {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 fn shell(command: &str, timeout: Option<u64>, dir: &Path, cancel: &AtomicBool) -> Result<String, String> {
@@ -521,7 +895,7 @@ fn shell(command: &str, timeout: Option<u64>, dir: &Path, cancel: &AtomicBool) -
         }
         out.push_str(&errors);
     }
-    let out = bounded(out.trim_end());
+    let out = shell_output(out.trim_end());
     match ended {
         Ok(status) if status.success() => Ok(if out.is_empty() { "(no output)".to_owned() } else { out }),
         Ok(status) => {
@@ -654,11 +1028,185 @@ mod tests {
 
         let listed = call("list", &json!({ "recursive": true, "match": "*.rs" }), &ws).unwrap();
         assert!(listed.contains("a.rs") && listed.contains("c.rs") && !listed.contains("b.txt"));
-        let found = call("search", &json!({ "text": "HELLO" }), &ws).unwrap();
-        assert!(found.contains("b.txt:1: Hello again") && !found.contains("a.rs"));
-        assert_eq!(call("search", &json!({ "text": "zzz" }), &ws).unwrap(), "(no matches)");
+        let found = call("search", &json!({ "pattern": "hello again" }), &ws).unwrap();
+        assert!(found.contains("b.txt\n  1: Hello again") && !found.contains("a.rs"), "{found}");
+        assert_eq!(call("search", &json!({ "pattern": "zzz" }), &ws).unwrap(), "(no matches)");
         assert!(call("nope", &json!({}), &ws).is_err() && call("read", &json!({}), &ws).is_err());
         fs::remove_dir_all(&ws.dir).unwrap();
+    }
+
+    #[test]
+    fn search_reads_patterns_names_files_and_shows_context() {
+        let ws = workspace("search");
+        let code = "use std::fs;\n\nfn one() {}\n\n\n\nfn two() {\n    one();\n}\n";
+        call("write", &json!({ "path": "src/a.rs", "content": code }), &ws).unwrap();
+        call("write", &json!({ "path": "src/b.txt", "content": "one\nONE\n" }), &ws).unwrap();
+        let search = |input: Value| call("search", &input, &ws).unwrap();
+
+        let found = search(json!({ "pattern": r"fn \w+\(", "match": "*.rs" }));
+        assert!(found.contains("a.rs\n  3: fn one() {}\n  7: fn two() {\n") && !found.contains("b.txt"), "{found}");
+        let names = search(json!({ "pattern": "one", "files": true }));
+        assert!(names.contains("a.rs: 2\n") && names.contains("b.txt: 2\n") && !names.contains("fn"), "{names}");
+        // A capital in the pattern makes the case count.
+        let exact = search(json!({ "pattern": "ONE" }));
+        assert!(exact.contains("b.txt\n  2: ONE\n") && !exact.contains("1: one") && !exact.contains("a.rs"), "{exact}");
+        let around = search(json!({ "pattern": "fn (one|two)", "context": 1 }));
+        assert!(
+            around.contains("  2- \n  3: fn one() {}\n  4- \n  --\n  6- \n  7: fn two() {\n  8-     one();\n"),
+            "{around}"
+        );
+        // Lines that are close share what is between them, shown once.
+        let close = search(json!({ "pattern": "^fn two|^}", "context": 1, "path": "src/a.rs" }));
+        assert!(
+            close.contains("a.rs\n  6- \n  7: fn two() {\n  8-     one();\n  9: }\n") && !close.contains("--"),
+            "{close}"
+        );
+        // What is no regular expression is looked for as it is, and the answer says so.
+        let plain = search(json!({ "pattern": "one(" }));
+        assert!(
+            plain.starts_with("[`pattern` is not a regular expression") && plain.contains("  8: one();"),
+            "{plain}"
+        );
+        assert!(call("search", &json!({ "pattern": "" }), &ws).is_err());
+        fs::remove_dir_all(&ws.dir).unwrap();
+    }
+
+    #[test]
+    fn what_git_ignores_is_left_out() {
+        let ws = workspace("ignored");
+        if crate::git::git(&ws.dir, &["init", "-q"]).is_err() {
+            return;
+        }
+        call("write", &json!({ "path": ".gitignore", "content": "build/\n" }), &ws).unwrap();
+        call("write", &json!({ "path": "build/out.txt", "content": "needle\n" }), &ws).unwrap();
+        call("write", &json!({ "path": "src/kept.txt", "content": "needle\n" }), &ws).unwrap();
+        let found = call("search", &json!({ "pattern": "needle" }), &ws).unwrap();
+        assert!(found.contains("kept.txt\n  1: needle") && !found.contains("out.txt"), "{found}");
+        let listed = call("list", &json!({ "recursive": true }), &ws).unwrap();
+        assert!(
+            listed.contains("kept.txt") && listed.contains(".gitignore") && !listed.contains("out.txt"),
+            "{listed}"
+        );
+        // Asked for by name, an ignored folder is looked through like any other.
+        let asked = call("search", &json!({ "pattern": "needle", "path": "build" }), &ws).unwrap();
+        assert!(asked.contains("out.txt\n  1: needle"), "{asked}");
+        assert!(call("list", &json!({ "path": "build", "recursive": true }), &ws).unwrap().contains("out.txt"));
+        // A file Git still tracks but that is gone is not listed.
+        crate::git::git(&ws.dir, &["add", "-A"]).unwrap();
+        fs::remove_file(ws.dir.join("src").join("kept.txt")).unwrap();
+        assert!(!call("list", &json!({ "recursive": true }), &ws).unwrap().contains("kept.txt"));
+        assert_eq!(call("search", &json!({ "pattern": "needle" }), &ws).unwrap(), "(no matches)");
+        let _ = crate::skills::remove_tree(&ws.dir);
+    }
+
+    #[test]
+    fn edits_are_made_together_or_not_at_all() {
+        let ws = workspace("edits");
+        let file = ws.dir.join("a.txt");
+        call("write", &json!({ "path": "a.txt", "content": "one\ntwo\nthree\nfour\nfive\n" }), &ws).unwrap();
+        let two =
+            json!({ "path": "a.txt", "edits": [{ "old": "two", "new": "2\n2b" }, { "old": "four", "new": "4" }] });
+        let done = call("edit", &two, &ws).unwrap();
+        assert!(done.ends_with("(2 replacements), now at lines 2-3, 5."), "{done}");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "one\n2\n2b\nthree\n4\nfive\n");
+        // One that does not fit keeps the others from being made.
+        let half = json!({ "path": "a.txt", "edits": [{ "old": "one", "new": "1" }, { "old": "nope", "new": "x" }] });
+        let failed = call("edit", &half, &ws).unwrap_err();
+        assert!(failed.contains("of edit 2") && failed.contains("nothing was changed"), "{failed}");
+        assert!(fs::read_to_string(&file).unwrap().starts_with("one\n"));
+        // A later edit moves where an earlier one is; a removal is where it was.
+        let moved = json!({ "path": "a.txt", "edits": [{ "old": "five", "new": "5" }, { "old": "one\n", "new": "" }] });
+        assert!(call("edit", &moved, &ws).unwrap().ends_with("now at lines 1, 5."));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "2\n2b\nthree\n4\n5\n");
+        let both =
+            json!({ "path": "a.txt", "old": "three", "new": "3", "edits": [{ "old": "2", "new": "z", "all": true }] });
+        assert!(call("edit", &both, &ws).unwrap().ends_with("(3 replacements), now at lines 1, 2, 3."));
+        assert_eq!(fs::read_to_string(&file).unwrap(), "z\nzb\n3\n4\n5\n");
+        assert!(
+            call("edit", &json!({ "path": "a.txt", "old": "4", "new": "four" }), &ws).unwrap().ends_with("line 4.")
+        );
+        assert!(call("edit", &json!({ "path": "a.txt" }), &ws).unwrap_err().contains("missing `old`"));
+        assert!(
+            call("edit", &json!({ "path": "a.txt", "edits": [{ "old": "z" }] }), &ws).unwrap_err().contains("`new`")
+        );
+
+        // Changed by something else since it was read: said, and not written over whole.
+        call("read", &json!({ "path": "a.txt" }), &ws).unwrap();
+        fs::write(&file, "somebody else's much longer text\n").unwrap();
+        let gone = call("edit", &json!({ "path": "a.txt", "old": "zb", "new": "x" }), &ws).unwrap_err();
+        assert!(gone.contains("changed on disk since you read it"), "{gone}");
+        assert!(
+            call("write", &json!({ "path": "a.txt", "content": "mine" }), &ws).unwrap_err().contains("changed on disk")
+        );
+        let fits = call("edit", &json!({ "path": "a.txt", "old": "longer", "new": "shorter" }), &ws).unwrap();
+        assert!(fits.contains("line 1.") && fits.contains("changed on disk"), "{fits}");
+        // Its own edit is what it knows now.
+        assert!(
+            !call("edit", &json!({ "path": "a.txt", "old": "shorter", "new": "s" }), &ws).unwrap().contains("disk")
+        );
+        call("write", &json!({ "path": "a.txt", "content": "mine" }), &ws).unwrap();
+        fs::remove_dir_all(&ws.dir).unwrap();
+    }
+
+    #[test]
+    fn long_output_keeps_its_end_and_a_file_of_it_all() {
+        let ws = workspace("output");
+        let long = "x".repeat(LINE_CHARS + 5);
+        assert!(clipped(&long, LINE_CHARS).ends_with("… [5 more characters]") && clipped("short", 5) == "short");
+        call("write", &json!({ "path": "min.js", "content": format!("{long}\nend\n") }), &ws).unwrap();
+        let read = call("read", &json!({ "path": "min.js" }), &ws).unwrap();
+        assert!(read.contains("[5 more characters]\n    2  end") && read.chars().count() < LINE_CHARS + 100);
+
+        let mut output = String::new();
+        for n in 0..6_000 {
+            let _ = writeln!(output, "line {n}");
+        }
+        let output = output.trim_end();
+        assert_eq!(shell_output("short"), "short");
+        let cut = shell_output(output);
+        assert!(
+            cut.starts_with("line 0\n") && cut.ends_with("\nline 5999") && cut.chars().count() < OUTPUT_CHARS + 300
+        );
+        let note = cut.find("characters left out here").unwrap();
+        assert!(note < OUTPUT_CHARS / 3, "most of what is kept is the end");
+        assert!(
+            cut[note..]
+                .split_once(
+                    "]
+
+"
+                )
+                .is_some_and(|(_, tail)| tail.starts_with("line ")),
+            "cut at a line"
+        );
+        // All of it is in a file the agent may read and search, and nothing else may be done there.
+        let path = cut.split("the whole output is in ").nth(1).and_then(|rest| rest.split(", which").next()).unwrap();
+        assert_eq!(fs::read_to_string(path).unwrap(), output);
+        assert_eq!(risk("read", &json!({ "path": path }), &ws), Risk::Safe);
+        assert_eq!(risk("search", &json!({ "path": path, "pattern": "x" }), &ws), Risk::Safe);
+        assert_eq!(risk("write", &json!({ "path": path }), &ws), Risk::Ask);
+        let found = call("search", &json!({ "pattern": "^line 4321$", "path": path }), &ws).unwrap();
+        assert!(found.contains("  4322: line 4321"), "{found}");
+        // Only so many are kept.
+        let first = PathBuf::from(path);
+        for _ in 0..=KEPT_OUTPUTS {
+            keep("more").unwrap();
+        }
+        assert!(!first.exists());
+        fs::remove_dir_all(&ws.dir).unwrap();
+        // A folder an earlier run left a day ago is removed; a fresh one is somebody's still.
+        let temp = ws.dir.with_file_name(format!("atroxabot-sweep-{}", std::process::id()));
+        let (old, fresh) = (temp.join(format!("{OUTPUTS}1-1")), temp.join(format!("{OUTPUTS}2-2")));
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&fresh).unwrap();
+        fs::write(old.join("output-0.txt"), "x").unwrap();
+        let long_ago = SystemTime::now() - OUTPUTS_AGE - Duration::from_secs(60);
+        let set = fs::File::open(&old).and_then(|dir| dir.set_modified(long_ago)).is_ok();
+        sweep_outputs(&temp);
+        // Where a folder's time cannot be set, there is nothing to tell.
+        assert!(!set || !old.exists(), "the old one went");
+        assert!(fresh.exists());
+        fs::remove_dir_all(&temp).unwrap();
     }
 
     #[test]
@@ -721,6 +1269,10 @@ mod tests {
         let long = "é".repeat(OUTPUT_CHARS + 10);
         let cut = bounded(&long);
         assert!(cut.contains("[10 characters left out here]") && cut.chars().count() < long.chars().count() + 60);
+        assert_eq!(bounded("short"), "short");
+        assert_eq!(lines_of("a\nb\nc\n", vec![(4, 2), (0, 1)]), "lines 1, 3");
+        assert_eq!(lines_of("a\nb\nc\n", vec![(2, 4)]), "lines 2-3");
+        assert_eq!(lines_of("abc", vec![(9, 9)]), "line 1", "a span that is nowhere is no panic");
         let page = plain("<html><style>p{}</style><p>One &amp; two</p><script>x<y</script><div>Three</div>");
         assert_eq!(page.trim(), "One & two\n\nThree");
         assert!(fetch("file:///etc/passwd").is_err());

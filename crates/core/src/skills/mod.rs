@@ -577,7 +577,7 @@ fn copy_tree(from: &Path, to: &Path, budget: &mut Budget) -> Result<(), String> 
 }
 
 /// Deletes a folder and everything in it, read-only files too (Git makes its objects read-only).
-fn remove_tree(dir: &Path) -> Result<(), String> {
+pub(crate) fn remove_tree(dir: &Path) -> Result<(), String> {
     fn writable(dir: &Path) {
         let Ok(entries) = fs::read_dir(dir) else { return };
         for entry in entries.flatten() {

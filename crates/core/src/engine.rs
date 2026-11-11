@@ -31,6 +31,8 @@ use crate::tools::{self, Risk, Workspace};
 
 /// Most model requests one turn may make before it is stopped.
 const MAX_ROUNDS: usize = 200;
+/// Most tool calls of one reply that run at the same time.
+const SIDE_BY_SIDE: usize = 8;
 /// Waits before a failed request is sent again, one per failure.
 const RETRIES: [Duration; 4] =
     [Duration::from_secs(2), Duration::from_secs(5), Duration::from_secs(15), Duration::from_secs(30)];
@@ -538,19 +540,71 @@ impl ApiEngine {
                 }
                 return Ok(());
             }
-            // ponytail: calls run one after another; run the read-only ones
-            // of a reply in parallel if agents start making many at once.
-            for call in &calls {
-                let (output, is_error) = match self.execute(call, &remote, inbox, session, emit) {
+            self.run_calls(&calls, &remote, inbox, session, emit);
+            // What the user sent while the tools ran goes after their results.
+            Self::take_follow_ups(session, inbox, emit);
+        }
+        Err(format!("Stopped after {MAX_ROUNDS} steps in one turn. Say \"continue\" to let it go on."))
+    }
+
+    /// Runs the calls of one reply and reports each one's result, in the
+    /// order they were made. Calls that only look and follow one another
+    /// run side by side, as nothing they do can change what another sees;
+    /// any other call runs alone, after those before it.
+    fn run_calls(
+        &self,
+        calls: &[ToolCall],
+        remote: &[McpTool],
+        inbox: &Inbox,
+        session: &mut Session,
+        emit: &mut dyn FnMut(&mut Session, AgentEvent),
+    ) {
+        let cancel: &AtomicBool = &inbox.cancel;
+        let mut rest = calls;
+        while let Some((call, after)) = rest.split_first() {
+            let looking: Vec<(&ToolCall, Value)> = rest
+                .iter()
+                .take(SIDE_BY_SIDE)
+                .map_while(|call| self.looks(call, remote).map(|input| (call, input)))
+                .collect();
+            if looking.len() < 2 || inbox.stopped() {
+                let (output, is_error) = match self.execute(call, remote, inbox, session, emit) {
+                    Ok(output) => (output, false),
+                    Err(output) => (output, true),
+                };
+                emit(session, AgentEvent::ToolResult { id: call.call_id.clone(), output, is_error });
+                rest = after;
+                continue;
+            }
+            let outputs: Vec<Result<String, String>> = std::thread::scope(|scope| {
+                let running: Vec<_> = looking
+                    .iter()
+                    .map(|(call, input)| scope.spawn(|| tools::run(&call.name, input, &self.workspace, cancel)))
+                    .collect();
+                running
+                    .into_iter()
+                    .map(|run| run.join().unwrap_or_else(|_| Err("The tool stopped unexpectedly.".to_owned())))
+                    .collect()
+            });
+            for ((call, _), output) in looking.iter().zip(outputs) {
+                let (output, is_error) = match output {
                     Ok(output) => (output, false),
                     Err(output) => (output, true),
                 };
                 emit(session, AgentEvent::ToolResult { id: call.call_id.clone(), output, is_error });
             }
-            // What the user sent while the tools ran goes after their results.
-            Self::take_follow_ups(session, inbox, emit);
+            rest = rest.get(looking.len()..).unwrap_or_default();
         }
-        Err(format!("Stopped after {MAX_ROUNDS} steps in one turn. Say \"continue\" to let it go on."))
+    }
+
+    /// The arguments of `call` when it only looks and needs no asking (a
+    /// `read`, `list` or `search` of what the agent may see): such a call
+    /// can run beside others.
+    fn looks(&self, call: &ToolCall, remote: &[McpTool]) -> Option<Value> {
+        let own = matches!(call.name.as_str(), "read" | "list" | "search")
+            && !remote.iter().any(|tool| tool.name == call.name);
+        let input = serde_json::from_str::<Value>(&call.arguments).ok().filter(|input| own && input.is_object())?;
+        (tools::risk(&call.name, &input, &self.workspace) == Risk::Safe).then_some(input)
     }
 
     /// Takes the user's follow-ups into the conversation, after what is
@@ -1121,6 +1175,35 @@ mod tests {
         assert!(run(&asking, &shell, Some(Verdict::AllowAlways)).unwrap().contains("hi"));
         assert!(run(&asking, &shell, None).unwrap().contains("hi"), "approved for the session");
         assert_eq!(asked, 2);
+
+        // Calls that only look run side by side, and every result still comes in the order of the calls.
+        let looking = engine(Autonomy::Ask);
+        let read = call("read", r#"{"path":"a.txt"}"#);
+        assert!(
+            looking.looks(&read, &[]).is_some() && looking.looks(&call("search", r#"{"pattern":"x"}"#), &[]).is_some()
+        );
+        assert!(looking.looks(&write, &[]).is_none() && looking.looks(&shell, &[]).is_none());
+        assert!(looking.looks(&call("read", r#"{"path":"../b.txt"}"#), &[]).is_none(), "outside its folder: asked");
+        assert!(looking.looks(&call("read", "{"), &[]).is_none());
+        let numbered = |id: &str, name: &str, arguments: &str| ToolCall { call_id: id.into(), ..call(name, arguments) };
+        let calls = [
+            numbered("1", "read", r#"{"path":"a.txt"}"#),
+            numbered("2", "search", r#"{"pattern":"x"}"#),
+            numbered("3", "read", r#"{"path":"missing.txt"}"#),
+            numbered("4", "write", r#"{"path":"a.txt","content":"y"}"#),
+            numbered("5", "read", r#"{"path":"a.txt"}"#),
+        ];
+        let (_control, inbox) = Control::new();
+        let mut results = Vec::new();
+        engine(Autonomy::Edits).run_calls(&calls, &[], &inbox, &mut session, &mut |_, event| {
+            if let AgentEvent::ToolResult { id, output, is_error } = event {
+                results.push((id, output, is_error));
+            }
+        });
+        let ids: Vec<&str> = results.iter().map(|(id, ..)| id.as_str()).collect();
+        assert_eq!(ids, ["1", "2", "3", "4", "5"]);
+        assert!(results[0].1.contains("1  x") && results[1].1.contains("1: x") && results[2].2);
+        assert!(results[4].1.contains("1  y"), "a read after a write sees what was written");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

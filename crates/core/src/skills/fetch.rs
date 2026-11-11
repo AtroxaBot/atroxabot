@@ -259,15 +259,7 @@ pub(super) fn fetch(source: &Source, cache: &Path) -> Result<PathBuf, String> {
             let dest = cache.join(source.cache_key());
             let got = replace(&dest, |tmp| match download(repo, reference, tmp) {
                 // A private repository: Git may have the user's sign-in for it.
-                Err(Failure::NotFound) => {
-                    clone(&format!("https://github.com/{repo}.git"), reference, tmp).map_err(|e| {
-                        if e.contains("cannot run git") {
-                            format!("GitHub has no public repository {repo}.")
-                        } else {
-                            format!("GitHub has no repository {repo} you can reach: {e}")
-                        }
-                    })
-                }
+                Err(Failure::NotFound) => clone_private(repo, reference, tmp),
                 Err(Failure::Other(e)) => Err(e),
                 Ok(()) => Ok(()),
             });
@@ -322,16 +314,80 @@ fn download(repo: &str, reference: &str, dest: &Path) -> Result<(), Failure> {
     }
 }
 
+/// Gets the GitHub repository `repo`, which is not public, with Git: over
+/// HTTPS, where a credential helper may hold the user's sign-in, then over
+/// SSH, where their key does.
+fn clone_private(repo: &str, reference: &str, dest: &Path) -> Result<(), String> {
+    let Err(https) = clone(&format!("https://github.com/{repo}.git"), reference, dest) else { return Ok(()) };
+    if https.contains("cannot run git") {
+        return Err(format!("GitHub has no public repository {repo}."));
+    }
+    // Reached, and something else is wrong (it has no such branch, say): SSH would say the same.
+    if !no_access(&https) {
+        return Err(https);
+    }
+    let Err(ssh) = clone(&format!("git@github.com:{repo}.git"), reference, dest) else { return Ok(()) };
+    Err(if no_access(&ssh) {
+        format!(
+            "GitHub has no repository {repo} that is public or that Git on this computer may read (it tried HTTPS              and SSH)."
+        )
+    } else {
+        ssh
+    })
+}
+
+/// Whether Git's complaint says the repository is not there or not the
+/// user's to read: GitHub does not tell the two apart.
+fn no_access(error: &str) -> bool {
+    [
+        "could not read Username",
+        "could not read Password",
+        "terminal prompts disabled",
+        "Authentication failed",
+        "Permission denied",
+        "Repository not found",
+        "Host key verification failed",
+    ]
+    .iter()
+    .any(|sign| error.contains(sign))
+}
+
 /// Gets the repository at `url`, at `reference` (its default branch when
 /// empty), into the empty folder `dest` with Git: only that one commit.
 fn clone(url: &str, reference: &str, dest: &Path) -> Result<(), String> {
     let wanted = if reference.is_empty() { "HEAD" } else { reference };
     crate::git::git(dest, &["init", "-q"]).map_err(|e| missing_git(&e))?;
-    crate::git::git(dest, &["-c", "protocol.ext.allow=never", "fetch", "-q", "--depth", "1", "--", url, wanted])
-        .map_err(|e| format!("Git could not get {url}: {e}"))?;
+    let mut args = vec!["-c", "protocol.ext.allow=never"];
+    let ssh = batch_ssh(dest);
+    if let Some(ssh) = &ssh {
+        args.extend(["-c", ssh]);
+    }
+    args.extend(["fetch", "-q", "--depth", "1", "--", url, wanted]);
+    crate::git::git(dest, &args).map_err(|e| format!("Git could not get {url}: {e}"))?;
     crate::git::git(dest, &["-c", "advice.detachedHead=false", "checkout", "-q", "FETCH_HEAD"])
         .map_err(|e| format!("Git could not check out {url}: {e}"))?;
     Ok(())
+}
+
+/// The `core.sshCommand` setting that makes SSH fail rather than ask for a
+/// passphrase or about a host's key, in a terminal nobody may be looking
+/// at: the user's own SSH command with `BatchMode`. `None` leaves Git's
+/// choice alone, where the environment names the program or it is `plink`,
+/// which has no such option.
+fn batch_ssh(repository: &Path) -> Option<String> {
+    if std::env::var_os("GIT_SSH_COMMAND").is_some() || std::env::var_os("GIT_SSH").is_some() {
+        return None;
+    }
+    let own = crate::git::git(repository, &["config", "--get", "core.sshCommand"])
+        .ok()
+        .map(|said| String::from_utf8_lossy(&said).trim().to_owned())
+        .filter(|command| !command.is_empty());
+    batch_mode(own.as_deref().unwrap_or("ssh"))
+}
+
+/// `command` with `BatchMode`, as a `core.sshCommand` setting.
+fn batch_mode(command: &str) -> Option<String> {
+    (!command.to_lowercase().contains("plink")).then(|| format!("core.sshCommand={command} -o BatchMode=yes"))
 }
 
 /// Git's failure to start, as the user should read it.
@@ -370,6 +426,35 @@ mod tests {
             assert!(Source::parse(bad).is_err(), "{bad}");
         }
         assert!(Source::parse("https://example.com/marketplace.json").is_err(), "only its repository can be read");
+    }
+
+    #[test]
+    fn tells_no_access_from_other_failures() {
+        let https = "fatal: could not read Username for 'https://github.com': terminal prompts disabled";
+        let ssh = "git@github.com: Permission denied (publickey).
+fatal: Could not read from remote repository.";
+        assert!(no_access(https) && no_access(ssh) && no_access("ERROR: Repository not found."));
+        assert!(!no_access("fatal: couldn't find remote ref v9"));
+        assert!(!no_access("ssh: connect to host github.com port 22: Connection timed out"));
+        assert_eq!(batch_mode("ssh").as_deref(), Some("core.sshCommand=ssh -o BatchMode=yes"));
+        assert_eq!(
+            batch_mode("C:/Windows/System32/OpenSSH/ssh.exe -i key").as_deref(),
+            Some("core.sshCommand=C:/Windows/System32/OpenSSH/ssh.exe -i key -o BatchMode=yes")
+        );
+        assert_eq!(batch_mode("C:/PuTTY/plink.exe"), None);
+    }
+
+    /// Uses the network and the user's Git sign-in: name a private repository
+    /// of theirs in `ATROXABOT_PRIVATE_REPO` (`owner/name`).
+    #[test]
+    #[ignore = "fetches a private repository with the user's Git"]
+    fn fetches_a_private_repository() {
+        let Ok(repo) = std::env::var("ATROXABOT_PRIVATE_REPO") else { return };
+        let cache = std::env::temp_dir().join(format!("atroxabot-private-{}", std::process::id()));
+        let got = fetch(&github(&repo, "", ""), &cache);
+        let listed = got.as_ref().map(|root| fs::read_dir(root).map_or(0, Iterator::count));
+        let _ = crate::skills::remove_tree(&cache);
+        assert!(listed.is_ok_and(|files| files > 0), "{got:?}");
     }
 
     #[test]

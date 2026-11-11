@@ -105,6 +105,14 @@ cargo clippy --workspace --all-targets -- -D warnings
   - **OpenAI-compatible**: OpenRouter, Inworld, OpenAI, Ollama, or any other Chat Completions gateway.
   With an API provider the app runs the agent loop itself, with its own tools: `read`, `write`, `edit`,
   `list`, `search`, `shell` and `fetch` (and, on the Claude API, Anthropic's web search and fetch).
+  They are made to cost the model few steps and few tokens: `search` takes a regular expression, leaves
+  out what `.gitignore` excludes, and can name the matching files alone or show lines around a match;
+  `edit` makes several changes to a file at once (all or none) and answers with the lines that changed,
+  and says when the file was changed on disk since the agent read it, which `write` then refuses to
+  replace; a command's long output is cut to its start and, mostly, its end, and kept whole in a file
+  in the temporary folder that the agent can search (the last twenty; a later run of the app removes
+  those older than a day); and the calls of one reply that only look (`read`, `list`, `search`) run side
+  by side.
   Swapping provider mid-session works: a Claude or Codex account that never saw the conversation is
   handed what was said so far. Swapping to another account of the same kind (one Claude account for
   another) keeps the model and effort, and takes away the notice of the account that was left.
@@ -154,7 +162,8 @@ cargo clippy --workspace --all-targets -- -D warnings
   Claude Code plugin marketplace (`.claude-plugin/marketplace.json`) is read as Claude Code reads it, its
   skills grouped by plugin, and a plugin it lists from another repository opens in turn; any other
   repository is searched for `SKILL.md` files. GitHub repositories come as GitHub's own archive, so they
-  need no Git (a private one is fetched with your Git and its sign-in); other repositories need Git.
+  need no Git (a private one is fetched with your Git and its sign-in, over HTTPS or SSH, whichever has
+  it); other repositories need Git.
   *Install* copies a skill into the library; when its repository has changed it since, the skill offers
   *Update*. An agent on a Claude account gets the library as a plugin for the session (`--plugin-dir`), so
   its skills are also listed as `library:<name>` there; an agent on an API gets a `skill` tool that lists
@@ -312,7 +321,7 @@ are written from Codex's own protocol types and were not run against a signed-in
 | `crates/claude-agent` (`atroxabot-claude-agent`) | Rust port of the Claude Agent SDK's transport and control protocol. Only dependency: `serde_json`. |
 | `crates/codex` (`atroxabot-codex`) | Drives the installed Codex CLI through `codex app-server`: the handshake, threads and turns as a state machine without I/O (`machine.rs`), its messages (`parse.rs`), the process (`session.rs`), finding the binary (`cli.rs`). Only dependency: `serde_json`. |
 | `crates/mcp` (`atroxabot-mcp`) | A small MCP client (stdio and Streamable HTTP): lists a server's tools and calls them. |
-| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Messages and Chat Completions); the agent loop and its tools; the Claude Agent and Codex engines (`claude.rs`, `codex.rs`); usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the sessions' worktrees and their cleaning up (`worktree.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
+| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Messages and Chat Completions); the agent loop and its tools (`engine.rs`, `tools.rs`, and `pattern.rs`, the regular expressions `search` reads); the Claude Agent and Codex engines (`claude.rs`, `codex.rs`); usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the sessions' worktrees and their cleaning up (`worktree.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
 | `crates/voice` (`atroxabot-voice`) | Fish Audio and ElevenLabs speech-to-text and text-to-speech, voice-activity detection, the call loop, and audio devices (`cpal`). |
 | `crates/desktop` | The app (`atroxabot`): winit window, wgpu renderer, text engine, immediate-mode UI. |
 
@@ -378,8 +387,12 @@ saved for.
   rule cleans it up. What git ignores in a worktree (build output, a local `.env`) goes with it. A session
   that has started cannot move into or out of a worktree; start a new one.
 - No agent-to-agent handoff and no scheduled jobs.
-- API agents run their tool calls one after another and have no subagents (Claude accounts have both,
-  from Claude Code). MCP servers behind OAuth are not supported for them: static headers only.
+- API agents have no subagents (Claude accounts have them, from Claude Code), and only their calls that
+  look (`read`, `list`, `search`) run side by side. MCP servers behind OAuth are not supported for them:
+  static headers only.
+- An API agent's `search` reads the usual regular expressions (classes, groups, `|`, repetition, `\b`)
+  but no look-around or back-references: such a pattern is looked for as plain text, and the answer says
+  so. It matches within a line.
 - A selection does not reach into reasoning or a tool's details.
 - An agent's reply shows no pictures: Markdown images are not drawn, so only the pictures you send appear
   in the conversation (and open whole on a click). An opened picture is not zoomed past the window; a GIF
