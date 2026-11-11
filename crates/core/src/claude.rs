@@ -19,7 +19,7 @@ use serde_json::Value;
 use crate::agent::{Agent, Autonomy};
 use crate::attach;
 use crate::config::Connection;
-use crate::engine::{AgentEvent, Ask, LimitWindow, Limits, Verdict};
+use crate::engine::{AgentEvent, Ask, FollowUp, LimitWindow, Limits, Verdict};
 use crate::responses::Usage;
 #[cfg(test)]
 use crate::session::TodoState;
@@ -90,6 +90,8 @@ pub struct ClaudeAgent {
     /// What the user may still approve "for the session", by request id:
     /// the permission rules the binary suggested for it.
     suggestions: Arc<Mutex<HashMap<String, Vec<Value>>>>,
+    /// The follow-ups sent and not taken in yet, by the id they were sent under.
+    follow_ups: Arc<Mutex<HashMap<String, FollowUp>>>,
 }
 
 impl std::fmt::Debug for ClaudeAgent {
@@ -118,6 +120,7 @@ impl ClaudeAgent {
         let pending = Arc::clone(&suggestions);
         // The binary's running total includes what a resumed session cost before.
         let mut mapper = Mapper { total: session.cost(), ..Mapper::default() };
+        let follow_ups = Arc::clone(&mapper.follow_ups);
         let mut options = options(agent, connection, session);
         options.mcp_config = mcp;
         let session = sdk::Session::connect(&options, move |event| {
@@ -130,7 +133,7 @@ impl ClaudeAgent {
                 emit(event);
             }
         })?;
-        Ok(Self { session, suggestions })
+        Ok(Self { session, suggestions, follow_ups })
     }
 
     /// Sends the user's message with the `files` that go with it (pictures
@@ -139,26 +142,30 @@ impl ClaudeAgent {
     /// # Errors
     /// The process has ended.
     pub fn send(&self, text: &str, files: &[String]) -> Result<(), sdk::Error> {
-        let (images, named) = attach::split(files);
-        let text = attach::with_paths(text, &named);
-        if images.is_empty() {
-            return self.session.send(&text);
-        }
-        let picture = |image: &attach::Image| {
-            let source = serde_json::json!({ "type": "base64", "media_type": image.media_type, "data": image.data });
-            serde_json::json!({ "type": "image", "source": source })
-        };
-        let mut content: Vec<Value> = images.iter().map(picture).collect();
-        if !text.trim().is_empty() {
-            content.push(serde_json::json!({ "type": "text", "text": text }));
-        }
-        self.session.send_content(&content.into())
+        self.session.send_content(&content(text, files))
     }
 
-    /// Stops the turn in progress; the session stays usable.
-    pub fn interrupt(&self) {
+    /// Sends a message the user wrote while the turn runs. Claude Code
+    /// takes it in after the tool calls in progress (reported as an
+    /// [`AgentEvent::FollowUp`]), or answers it in a turn of its own right
+    /// after this one ([`AgentEvent::Queued`]).
+    ///
+    /// # Errors
+    /// The process has ended.
+    pub fn follow_up(&self, message: FollowUp) -> Result<(), sdk::Error> {
+        let uuid = wire_uuid(&message.id);
+        let content = content(&message.text, &message.files);
+        if let Ok(mut waiting) = self.follow_ups.lock() {
+            waiting.insert(uuid.clone(), message);
+        }
+        self.session.send_message(&content, Some(&uuid))
+    }
+
+    /// Stops the turn in progress; the session stays usable. Follow-ups not
+    /// taken in yet are dropped when `cancel_queued`, and answered next otherwise.
+    pub fn interrupt(&self, cancel_queued: bool) {
         // Fails only if the process is gone, which ends the turn anyway.
-        let _ = self.session.interrupt();
+        let _ = self.session.interrupt(cancel_queued);
     }
 
     /// Answers the approval `id`.
@@ -186,6 +193,34 @@ impl ClaudeAgent {
     pub fn close(&self) {
         self.session.close();
     }
+}
+
+/// A message's content: pictures as blocks, then the words with the paths
+/// of the other files.
+fn content(text: &str, files: &[String]) -> Value {
+    let (images, named) = attach::split(files);
+    let text = attach::with_paths(text, &named);
+    if images.is_empty() {
+        return text.into();
+    }
+    let picture = |image: &attach::Image| {
+        let source = serde_json::json!({ "type": "base64", "media_type": image.media_type, "data": image.data });
+        serde_json::json!({ "type": "image", "source": source })
+    };
+    let mut content: Vec<Value> = images.iter().map(picture).collect();
+    if !text.trim().is_empty() {
+        content.push(serde_json::json!({ "type": "text", "text": text }));
+    }
+    content.into()
+}
+
+/// The UUID a follow-up is sent under, made from the app's id for it (hex
+/// digits, padded): Claude Code replays the message under the same one.
+fn wire_uuid(id: &str) -> String {
+    let digits: String = id.chars().filter(char::is_ascii_hexdigit).map(|c| c.to_ascii_lowercase()).collect();
+    let tail = digits.get(digits.len().saturating_sub(30)..).unwrap_or_default();
+    let d = format!("{tail:0>30}");
+    format!("{}-{}-4{}-8{}-{}", &d[..8], &d[8..12], &d[12..15], &d[15..18], &d[18..])
 }
 
 /// How the binary is started for `agent` on `connection` in `session`.
@@ -221,8 +256,12 @@ fn options(agent: &Agent, connection: &Connection, session: &Session) -> sdk::Op
         // Claude Code gives a session an app starts its task list tools only when they are named here.
         allowed_tools: TASK_TOOLS.map(str::to_owned).into(),
         env: account_env(connection),
-        // Show a summary of the reasoning rather than nothing.
-        extra_args: vec![("thinking-display".to_owned(), Some("summarized".to_owned()))],
+        extra_args: vec![
+            // Show a summary of the reasoning rather than nothing.
+            ("thinking-display".to_owned(), Some("summarized".to_owned())),
+            // Say when a message sent during a turn is taken in.
+            ("replay-user-messages".to_owned(), None),
+        ],
         ..sdk::Options::default()
     }
 }
@@ -241,7 +280,8 @@ const CLAUDE_TOOLS: &str = "\n\n# Your tools\n\n\
     - For work of three or more steps, keep a task list with TaskCreate and TaskUpdate: mark a task in progress \
     when you start it and completed as soon as it is done. The user sees the list.\n\n\
     The application adds system reminders to this conversation. Treat them as context from the application, not as \
-    messages from the user.";
+    messages from the user. A message introduced as one \"the user sent while you were working\" is the user's: \
+    take it into account and carry on with your task.";
 
 /// A count of tokens, short: `840`, `39.6k`, `1.2M`.
 fn compact(count: u64) -> String {
@@ -288,6 +328,9 @@ struct Mapper {
     /// The subagents (by the call that started each) whose words streamed
     /// since their last complete message, which then repeats them.
     sub_streamed: HashSet<String>,
+    /// The follow-ups sent and not taken in yet, by the id they were sent
+    /// under; shared with [`ClaudeAgent::follow_up`].
+    follow_ups: Arc<Mutex<HashMap<String, FollowUp>>>,
 }
 
 impl Mapper {
@@ -379,6 +422,15 @@ impl Mapper {
                 };
                 out.push(AgentEvent::Note(format!("Earlier messages were summarised to make room{sizes}")));
             }
+            // A follow-up the turn takes in now: the model reads it after the tool results before it.
+            sdk::Event::User { replay: true, uuid, parent_tool_use_id: None, .. } => {
+                let taken = self.follow_ups.lock().ok().and_then(|mut waiting| waiting.remove(&uuid));
+                // Claude Code says itself that it came while the agent worked. Its answer is a
+                // reply after it, or (when the turn it was sent in had ended) a turn of its own.
+                if let Some(FollowUp { id, text, files }) = taken {
+                    out.push(AgentEvent::FollowUp { id, text, note: String::new(), files });
+                }
+            }
             // Tool results carry ids of their own, a subagent's too.
             sdk::Event::User { blocks, .. } => {
                 for block in blocks {
@@ -442,6 +494,9 @@ impl Mapper {
                     out.push(AgentEvent::Window(result.context_window));
                 }
                 out.push(AgentEvent::Status(String::new()));
+                if result.queued_turn_count > 0 {
+                    out.push(AgentEvent::Queued(result.queued_turn_count));
+                }
                 out.push(AgentEvent::TurnEnded { problem });
                 (self.replying, self.shown, self.streamed) = (false, false, false);
             }
@@ -513,7 +568,12 @@ mod tests {
             AgentEvent::Sub { event: second, .. },
         ] if parent == "a1" && **first == AgentEvent::Text("Looking.".into()) && matches!(&**second, AgentEvent::ToolCall(tool) if tool.id == "g1")));
         let result = sdk::Block::ToolResult { tool_use_id: "g1".into(), content: "hello.txt".into(), is_error: false };
-        let answered = mapper.map(sdk::Event::User { blocks: vec![result], parent_tool_use_id: Some("a1".into()) });
+        let answered = mapper.map(sdk::Event::User {
+            blocks: vec![result],
+            parent_tool_use_id: Some("a1".into()),
+            uuid: String::new(),
+            replay: false,
+        });
         assert!(matches!(&answered[..], [AgentEvent::ToolResult { id, .. }] if id == "g1"));
 
         let task = sdk::Task {
@@ -555,6 +615,8 @@ mod tests {
         let replay = sdk::Event::User {
             blocks: vec![sdk::Block::Text("This session is being continued".into())],
             parent_tool_use_id: None,
+            uuid: String::new(),
+            replay: false,
         };
         assert!(mapper.map(replay).is_empty());
     }
@@ -571,6 +633,7 @@ mod tests {
             usage: sdk::Usage { output_tokens: 9, ..sdk::Usage::default() },
             permission_denials: 0,
             context_window: 200_000,
+            queued_turn_count: 0,
             raw: Value::Null,
         })
     }
@@ -598,7 +661,12 @@ mod tests {
             matches!(&called[0], AgentEvent::ToolCall(call) if call.name == "Read" && call.input.contains("file_path"))
         );
         let answered = sdk::Block::ToolResult { tool_use_id: "t".into(), content: "x".into(), is_error: false };
-        let answered = mapper.map(sdk::Event::User { blocks: vec![answered], parent_tool_use_id: None });
+        let answered = mapper.map(sdk::Event::User {
+            blocks: vec![answered],
+            parent_tool_use_id: None,
+            uuid: String::new(),
+            replay: false,
+        });
         assert_eq!(answered, [AgentEvent::ToolResult { id: "t".into(), output: "x".into(), is_error: false }]);
         // A message that did not stream is shown from its blocks.
         assert_eq!(mapper.map(assistant(vec![sdk::Block::Text("Done.".into())])), [AgentEvent::Text("Done.".into())]);
@@ -643,6 +711,61 @@ mod tests {
             mapper.map(sdk::Event::Closed { exit_code: Some(0), error: None }),
             [AgentEvent::Disconnected(None)]
         );
+    }
+
+    #[test]
+    fn follow_ups_are_reported_when_claude_code_takes_them_in() {
+        // As Claude Code 2.1.322 does it: the replay comes right after the tool results it follows.
+        let mut mapper = Mapper::default();
+        let follow_up = |id: &str, text: &str| FollowUp { id: id.into(), text: text.into(), files: Vec::new() };
+        for message in
+            [follow_up("18e6a58ab5fe8230", "Also run the tests."), follow_up("18e6a58ab5fe8231", "Then stop.")]
+        {
+            let uuid = wire_uuid(&message.id);
+            mapper.follow_ups.lock().unwrap().insert(uuid, message);
+        }
+        let replayed = |uuid: &str, text: &str| sdk::Event::User {
+            blocks: vec![sdk::Block::Text(text.into())],
+            parent_tool_use_id: None,
+            uuid: uuid.into(),
+            replay: true,
+        };
+        let _ =
+            mapper.map(assistant(vec![sdk::Block::ToolUse { id: "t".into(), name: "Bash".into(), input: json!({}) }]));
+        // The prompt that started the turn is replayed too, and is not a follow-up.
+        assert!(mapper.map(replayed("11111111-1111-4111-8111-111111111111", "Build it.")).is_empty());
+        let taken = mapper.map(replayed(&wire_uuid("18e6a58ab5fe8230"), "Also run the tests."));
+        assert_eq!(
+            taken,
+            [AgentEvent::FollowUp {
+                id: "18e6a58ab5fe8230".into(),
+                text: "Also run the tests.".into(),
+                note: String::new(),
+                files: Vec::new()
+            }]
+        );
+        assert!(mapper.map(replayed(&wire_uuid("18e6a58ab5fe8230"), "Also run the tests.")).is_empty(), "once");
+        // The turn ends with one still waiting: Claude Code answers it next, in a turn of its own.
+        let mut ended = result(false, Some("Built."), 0.0);
+        if let sdk::Event::Result(result) = &mut ended {
+            result.queued_turn_count = 1;
+        }
+        let ended = mapper.map(ended);
+        assert_eq!(ended[ended.len() - 2..], [AgentEvent::Queued(1), AgentEvent::TurnEnded { problem: None }]);
+        let next = mapper.map(replayed(&wire_uuid("18e6a58ab5fe8231"), "Then stop."));
+        assert!(matches!(&next[..], [AgentEvent::FollowUp { id, .. }] if id == "18e6a58ab5fe8231"));
+        assert_eq!(
+            mapper.map(sdk::Event::TextDelta { text: "OK".into(), parent_tool_use_id: None })[0],
+            AgentEvent::ReplyStarted
+        );
+
+        // The id Claude Code is given is a UUID, the same for the same follow-up, another for another.
+        assert_eq!(wire_uuid("18e6a58ab5fe8230"), "00000000-0000-4001-88e6-a58ab5fe8230");
+        assert_ne!(wire_uuid("18e6a58ab5fe8231"), wire_uuid("18e6a58ab5fe8230"));
+        // Whatever the id holds, the shape stays a UUID's.
+        for id in ["", "x-?", &"f".repeat(64)] {
+            assert_eq!(wire_uuid(id).split('-').map(str::len).collect::<Vec<_>>(), [8, 4, 4, 4, 12]);
+        }
     }
 
     #[test]

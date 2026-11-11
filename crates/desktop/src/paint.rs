@@ -1,7 +1,7 @@
 //! Immediate-mode drawing API on top of [`Instance`]s.
 
 use crate::gpu::Instance;
-use crate::image::{ImageAtlas, ImageKey, Lookup};
+use crate::image::{ImageAtlas, ImageKey, Lookup, MAX_WHOLE};
 use crate::logo::Logo;
 use crate::text::{Align, Fonts, GlyphAtlas, Style, TextLayout};
 use crate::theme::Palette;
@@ -135,7 +135,8 @@ impl<'a> Painter<'a> {
         let (left, top) = ((rect.x * s).round(), (rect.y * s).round());
         // The size alone decides the key: scrolling must not re-decode.
         let (width, height) = ((rect.w * s).round(), (rect.h * s).round());
-        let key = ImageKey { path: path.to_owned(), w: width.max(1.0) as u32, h: height.max(1.0) as u32 };
+        let (w, h) = (width.max(1.0) as u32, height.max(1.0) as u32);
+        let key = ImageKey { path: path.to_owned(), w, h, whole: false };
         let lookup = self.images.lookup(&key);
         if let Lookup::Ready(uv) = lookup {
             // Exactly the thumbnail's pixels, so texels map one to one.
@@ -150,6 +151,35 @@ impl<'a> Painter<'a> {
         lookup
     }
 
+    /// Draws the whole image file at `path` in the middle of `rect`, as
+    /// large as fits it and never larger than the image is, on `backing`
+    /// (which shows where the image is transparent), both with rounded
+    /// corners. Returns where it was drawn; until it is decoded, or if it
+    /// cannot be, nothing is drawn and the result says which.
+    ///
+    /// # Errors
+    /// [`Lookup::Loading`] or [`Lookup::Failed`]: there is nothing to draw (yet).
+    pub fn picture(&mut self, path: &str, rect: Rect, radius: f32, backing: Color) -> Result<Rect, Lookup> {
+        /// The box is asked for in steps, so a window being resized does not decode at every size.
+        const STEP: f32 = 32.0;
+        let s = self.scale;
+        let side = |length: f32, most: u32| ((length * s / STEP).floor() * STEP).clamp(STEP, most as f32) as u32;
+        let key =
+            ImageKey { path: path.to_owned(), w: side(rect.w, MAX_WHOLE.0), h: side(rect.h, MAX_WHOLE.1), whole: true };
+        match self.images.lookup(&key) {
+            Lookup::Ready(uv) => {
+                // Exactly the picture's pixels, so texels map one to one.
+                let left = ((rect.x + rect.w * 0.5) * s - uv[2] * 0.5).round();
+                let top = ((rect.y + rect.h * 0.5) * s - uv[3] * 0.5).round();
+                let drawn = Rect::new(left / s, top / s, uv[2] / s, uv[3] / s);
+                self.rect(drawn, backing, radius);
+                self.push(drawn, [1.0; 4], [1.0; 4], [radius, 0.0, 0.0, KIND_IMAGE], uv);
+                Ok(drawn)
+            }
+            other => Err(other),
+        }
+    }
+
     /// Draws the image at `path` as a soft wash over `rect` (its corners
     /// rounded by `radius`): a thumbnail a few pixels across, stretched so
     /// the GPU's filtering blurs it, faded to `alpha`. One quad, so a
@@ -161,7 +191,7 @@ impl<'a> Painter<'a> {
         } else {
             ((SIDE * rect.w / rect.h).max(2.0), SIDE)
         };
-        let key = ImageKey { path: path.to_owned(), w: w.round() as u32, h: h.round() as u32 };
+        let key = ImageKey { path: path.to_owned(), w: w.round() as u32, h: h.round() as u32, whole: false };
         let lookup = self.images.lookup(&key);
         if let Lookup::Ready(uv) = lookup {
             // Inset half a texel, so filtering never reaches the atlas's

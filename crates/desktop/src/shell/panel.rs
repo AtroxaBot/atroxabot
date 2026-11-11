@@ -1,24 +1,25 @@
 //! The side panel, right of the session: what the session used and how full
-//! its context is, where the Claude account's plan limits stand, and its
-//! folder's git repository (the branch, what
-//! changed, committing and pushing). A changed file opens as a diff, a modal.
+//! its context is, the agent's task list and the turn's subagents, where
+//! the Claude account's plan limits stand, and its folder's git repository
+//! (the branch and what changed: committing and pushing are the agent's to
+//! do). A changed file opens as a diff, a modal.
 
 #![expect(clippy::many_single_char_names, reason = "p, t, x, y and w are the drawing code's names everywhere")]
 
 use atroxabot_core::git::{Change, GitFile, GitStatus, Job, Report};
 use atroxabot_core::stats::Ledger;
-use atroxabot_core::{Limits, TodoState};
+use atroxabot_core::{ConnectionKind, Limits, TodoState};
 use winit::window::CursorIcon;
 
 use super::menu::Menu;
-use super::widgets::{Scroll, dropdown, field_label, line_field, modal};
-use super::{Account, Modal, Shell, compact, money, until};
+use super::thread::{Thread, agent_mark};
+use super::widgets::{Scroll, dropdown, field_label, modal};
+use super::{Modal, Shell, compact, money, until};
 use crate::app::Action;
-use crate::editor::Editor;
 use crate::paint::{Color, Painter, Rect, fade, mix};
 use crate::text::Style;
 use crate::theme::{self, Palette};
-use crate::ui::{ButtonStyle, Ui, button, icon, icon_button, id};
+use crate::ui::{Ui, icon, icon_button, id};
 
 /// The panel's width.
 pub(super) const WIDTH: f32 = 320.0;
@@ -30,6 +31,8 @@ const LINE_H: f32 = 19.0;
 const TAB: &str = "    ";
 /// Most tasks of the agent's list shown at once.
 const TASKS_SHOWN: usize = 8;
+/// Most subagents of a turn listed at once.
+const AGENTS_SHOWN: usize = 8;
 /// The diff's text.
 const MONO: Style = Style::mono(12.5);
 
@@ -42,12 +45,6 @@ pub(super) struct GitView {
     pub status: Option<GitStatus>,
     /// The status is being read.
     loading: bool,
-    /// What git is doing for the user right now.
-    busy: Option<&'static str>,
-    /// The commit message being written.
-    pub message: Editor,
-    /// Whether the commit message has the keyboard.
-    pub focused: bool,
     scroll: Scroll,
 }
 
@@ -245,17 +242,17 @@ impl Shell {
         }
     }
 
-    /// Asks git to do `job` in the session's folder, saying `busy` meanwhile.
-    fn git_job(&mut self, job: Job, busy: Option<&'static str>, actions: &mut Vec<Action>) {
+    /// Asks git to do `job` in the session's folder.
+    fn git_job(&mut self, job: Job, actions: &mut Vec<Action>) {
         self.git.folder = self.work_folder();
-        (self.git.loading, self.git.busy) = (true, busy);
+        self.git.loading = true;
         actions.push(Action::Git { folder: self.git.folder.clone(), job });
     }
 
     /// Reads the repository again, if the panel is there to show it.
     pub(super) fn refresh_git(&mut self, actions: &mut Vec<Action>) {
         if self.config.panel {
-            self.git_job(Job::Refresh, None, actions);
+            self.git_job(Job::Refresh, actions);
         }
     }
 
@@ -265,11 +262,8 @@ impl Shell {
             return;
         }
         match report {
-            Report::Status { status, problem, committed } => {
-                (self.git.status, self.git.loading, self.git.busy) = (status, false, None);
-                if committed {
-                    self.git.message = Editor::default();
-                }
+            Report::Status { status, problem } => {
+                (self.git.status, self.git.loading) = (status, false);
                 if let Some(problem) = problem {
                     self.notify(problem);
                 }
@@ -287,17 +281,8 @@ impl Shell {
     /// Shows or hides the panel.
     pub(super) fn toggle_panel(&mut self, actions: &mut Vec<Action>) {
         self.config.panel = !self.config.panel;
-        self.git.focused = false;
         actions.push(Action::SaveConfig);
         self.refresh_git(actions);
-    }
-
-    /// Commits everything that changed with the message written.
-    pub(super) fn commit(&mut self, actions: &mut Vec<Action>) {
-        let message = self.git.message.text().trim().to_owned();
-        if !message.is_empty() && self.git.busy.is_none() {
-            self.git_job(Job::Commit(message), Some("Committing…"), actions);
-        }
     }
 
     /// Checks out `branch` in the session's folder.
@@ -305,7 +290,7 @@ impl Shell {
         if self.thread().is_some_and(|thread| thread.busy) {
             self.notify("Wait for the reply to finish, or stop it, before switching branch.".into());
         } else if self.git.status.as_ref().is_some_and(|status| status.branch != branch) {
-            self.git_job(Job::Switch(branch.to_owned()), Some("Switching…"), actions);
+            self.git_job(Job::Switch(branch.to_owned()), actions);
         }
     }
 
@@ -402,33 +387,86 @@ impl Shell {
         y + 6.0
     }
 
-    /// Where the plan limits of a Claude account stand, as Claude Code last
-    /// reported them: whose they are, then a bar per window and when it
-    /// starts over. The account is the one the open session's turns ran
-    /// on, or else the one the agent would use. Returns where they end
-    /// (`y` itself when nothing is known yet).
+    /// The subagents of the turn, when it has any: how each is doing and
+    /// what it is for. A click opens one in the conversation's place, a
+    /// click on the open one goes back. With more than fit, the ones from
+    /// the first still at work are shown. Returns where the list ends (`y`
+    /// itself when there are none).
+    fn draw_subagents(&mut self, p: &mut Painter, ui: &mut Ui, (x, mut y, w): (f32, f32, f32)) -> f32 {
+        let t = p.theme;
+        let agents = self.thread().map(Thread::subagents).unwrap_or_default();
+        if agents.is_empty() {
+            return y;
+        }
+        p.rect(Rect::new(x - 16.0, y, w + 32.0, 1.0), t.border, 0.0);
+        y += 18.0;
+        field_label(p, icon::BOT, "SUBAGENTS", x, y);
+        let done = agents.iter().filter(|agent| !agent.running).count();
+        let count = p.layout(&format!("{done} of {}", agents.len()), theme::TINY, None);
+        p.text(&count, x + w - count.width(), y + 1.0, t.text_faint);
+        y += 26.0;
+        let working = agents.iter().position(|agent| agent.running).unwrap_or(agents.len());
+        let first = working.min(agents.len().saturating_sub(AGENTS_SHOWN));
+        let mut pick = None;
+        for agent in agents.iter().skip(first).take(AGENTS_SHOWN) {
+            let row = Rect::new(x - 8.0, y - 4.0, w + 16.0, 26.0);
+            let hovered = ui.hovered(row);
+            let hover = ui.anim(id(("subagent", &agent.id)), f32::from(u8::from(hovered || agent.open)));
+            p.rect(row, fade(t.hover, hover), theme::RADIUS_SM);
+            let ink = mix(if agent.running { t.text } else { t.text_muted }, t.text, hover);
+            agent_mark(p, ui, (x + 7.0, y + 9.0), (agent.running, agent.failed), ink);
+            let mut label = p.layout(&agent.label, theme::SMALL, None);
+            label.truncate(p.fonts, w - 22.0);
+            p.text(&label, x + 22.0, y, ink);
+            if hovered {
+                ui.cursor = CursorIcon::Pointer;
+                if ui.clicked(row) {
+                    pick = Some((!agent.open).then(|| agent.id.clone()));
+                }
+            }
+            y += 26.0;
+        }
+        let hidden = agents.len().saturating_sub(AGENTS_SHOWN);
+        if hidden > 0 {
+            p.label(&format!("{hidden} more"), theme::TINY, x + 22.0, y, t.text_faint);
+            y += 20.0;
+        }
+        if let Some(pick) = pick
+            && let Some(thread) = self.thread_mut()
+        {
+            // It shows with the next frame.
+            thread.open_agent(pick);
+            ui.animating = true;
+        }
+        y + 6.0
+    }
+
+    /// The Claude account whose plan limits the panel shows: the one the top
+    /// bar names, which the next message goes to (whatever account the open
+    /// session ran on before). `None` when that is an API provider.
+    pub(super) fn limits_account(&self) -> Option<String> {
+        let connection = self.selected_agent().and_then(|agent| self.connection(agent))?;
+        (connection.kind == ConnectionKind::ClaudeAgent).then_some(connection.id)
+    }
+
+    /// Where the plan limits of the Claude account the top bar names stand,
+    /// as Claude Code last reported them: a bar per window and when it
+    /// starts over, or a line saying they come with its next reply. Who is
+    /// signed in to it is not put on screen here. Returns where they end
+    /// (`y` itself for an API provider).
     fn draw_limits(&self, p: &mut Painter, (x, mut y, w): (f32, f32, f32)) -> f32 {
         let t = p.theme;
-        let ran_on = self.thread().map(|thread| thread.session.account.clone()).filter(|account| !account.is_empty());
-        let Some(account) = ran_on.or_else(|| self.selected_agent().map(|agent| agent.connection.clone())) else {
-            return y;
-        };
-        let Some(limits) = self.limits.get(&account).filter(|limits| !limits.windows.is_empty()) else { return y };
+        let Some(account) = self.limits_account() else { return y };
         p.rect(Rect::new(x - 16.0, y, w + 32.0, 1.0), t.border, 0.0);
         y += 18.0;
         field_label(p, icon::ACTIVITY, "PLAN USAGE", x, y);
-        y += 24.0;
-        // Whose limits these are: the account's name here, and who Claude Code says is signed in to it.
-        let name = self.config.connection(&account).map(|connection| connection.name).unwrap_or_default();
-        let whose = match self.claude.get(&account) {
-            Some(Account::Ready(info)) if !info.account.email.is_empty() => format!("{name} · {}", info.account.email),
-            _ => name,
-        };
-        let mut whose = p.layout(&whose, theme::TINY, None);
-        whose.truncate(p.fonts, w);
-        p.text(&whose, x, y, t.text_faint);
-        y += 26.0;
-        limit_bars(p, limits, (x, y, w))
+        y += 28.0;
+        if let Some(limits) = self.limits.get(&account).filter(|limits| !limits.windows.is_empty()) {
+            return limit_bars(p, limits, (x, y, w));
+        }
+        let note = p.layout("Known after this account's next reply.", theme::SMALL, Some(w));
+        p.text(&note, x, y, t.text_faint);
+        y + note.height() + 16.0
     }
 
     /// Draws the panel in `rect`.
@@ -445,6 +483,7 @@ impl Shell {
         field_label(p, icon::LAYERS, "SESSION", x, rect.y + 20.0);
         let mut y = self.draw_usage(p, (x, rect.y + 48.0, w)) + 8.0;
         y = self.draw_todos(p, (x, y, w));
+        y = self.draw_subagents(p, ui, (x, y, w));
         y = self.draw_limits(p, (x, y, w));
         p.rect(Rect::new(rect.x, y, rect.w, 1.0), t.border, 0.0);
         y += 18.0;
@@ -465,7 +504,7 @@ impl Shell {
         p.set_clip(clip);
     }
 
-    /// The repository: its branch, what changed, and the commit box at the foot.
+    /// The repository: its branch and what changed.
     fn draw_git(
         &mut self,
         p: &mut Painter,
@@ -500,9 +539,8 @@ impl Shell {
         counts(p, total, x + w, y);
         y += 24.0;
 
-        // The commit box holds the foot; the files scroll in what is left.
-        let foot = bottom - 96.0;
-        let list = Rect::new(x - 8.0, y, w + 16.0, (foot - y - 8.0).max(0.0));
+        // The files scroll in what is left of the panel.
+        let list = Rect::new(x - 8.0, y, w + 16.0, (bottom - y - 10.0).max(0.0));
         let offset = self.git.scroll.update(ui, ui.hovered(list));
         let clip = p.push_clip(list);
         if status.files.is_empty() {
@@ -544,37 +582,6 @@ impl Shell {
             actions.push(Action::Git { folder: self.git.folder.clone(), job: Job::Diff(file.clone()) });
             self.modal = Some(Modal::Diff(Box::new(DiffView::new(file))));
         }
-
-        // The message, then commit and push.
-        let field = Rect::new(x, foot, w, 36.0);
-        let focus = ui.anim(id("commit-focus"), f32::from(u8::from(self.git.focused)));
-        p.bordered(field, t.surface, theme::RADIUS_SM, 1.0, mix(t.border_strong, t.border_focus, focus));
-        let inner = Rect::new(field.x + 11.0, field.y, field.w - 22.0, field.h);
-        line_field(
-            p,
-            ui,
-            inner,
-            &mut self.git.message,
-            ("Message for everything changed", theme::SMALL),
-            self.git.focused,
-        );
-        if ui.hovered(field) {
-            ui.cursor = CursorIcon::Text;
-        }
-        if ui.pressed {
-            self.git.focused = ui.hovered(field);
-            ui.last_edit = ui.time;
-        }
-        let ready = self.git.busy.is_none() && !status.files.is_empty() && !self.git.message.text().trim().is_empty();
-        let can_push = self.git.busy.is_none() && (status.ahead > 0 || status.upstream.is_empty());
-        let buttons = field.bottom() + 8.0;
-        let commit = Rect::new(x, buttons, w - 88.0, 34.0);
-        if button(p, ui, commit, self.git.busy.unwrap_or("Commit"), ButtonStyle::Primary, ready) {
-            self.commit(actions);
-        }
-        if button(p, ui, Rect::new(x + w - 80.0, buttons, 80.0, 34.0), "Push", ButtonStyle::Secondary, can_push) {
-            self.git_job(Job::Push, Some("Pushing…"), actions);
-        }
     }
 }
 
@@ -602,22 +609,12 @@ mod tests {
         assert!(actions.iter().any(|a| matches!(a, Action::Git { folder, job: Job::Refresh } if folder == "/work")));
 
         let status = GitStatus { branch: "main".into(), ..GitStatus::default() };
-        let report =
-            |status: &GitStatus, committed| Report::Status { status: Some(status.clone()), problem: None, committed };
-        shell.git_report("/elsewhere", report(&status, false));
+        let report = |status: &GitStatus| Report::Status { status: Some(status.clone()), problem: None };
+        shell.git_report("/elsewhere", report(&status));
         assert!(shell.git.status.is_none(), "an answer about another folder is dropped");
-        shell.git_report("/work", report(&status, false));
+        shell.git_report("/work", report(&status));
         assert_eq!(shell.git.status.as_ref().map(|s| s.branch.as_str()), Some("main"));
-
-        // A commit needs a message, and a commit that went through clears it.
-        actions.clear();
-        shell.commit(&mut actions);
-        assert!(actions.is_empty());
-        shell.git.message.insert("Fix the parser");
-        shell.commit(&mut actions);
-        assert!(matches!(&actions[..], [Action::Git { job: Job::Commit(message), .. }] if message == "Fix the parser"));
-        shell.git_report("/work", report(&status, true));
-        assert!(shell.git.message.text().is_empty() && shell.git.busy.is_none());
+        assert!(!shell.git.loading);
 
         actions.clear();
         shell.switch_branch("main", &mut actions);

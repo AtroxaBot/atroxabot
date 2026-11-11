@@ -7,6 +7,9 @@
 //! evicted from the atlas is decoded again when it scrolls back into view,
 //! so memory stays bounded by the atlas.
 //!
+//! A picture opened to be looked at is a thumbnail too, a large one: the
+//! whole image, as large as fits a box ([`ImageKey::whole`]).
+//!
 //! PNG, JPEG and WebP are decoded: the formats portraits are accepted in.
 
 use std::collections::{HashMap, HashSet};
@@ -22,6 +25,9 @@ const MAX_FILE: u64 = 32 << 20;
 const MAX_PIXELS: usize = 48_000_000;
 /// Largest thumbnail side, in pixels.
 const MAX_THUMB: u32 = 1024;
+/// Largest whole picture, in pixels: as wide as the atlas takes, and short
+/// enough to leave the thumbnails under it their room.
+pub const MAX_WHOLE: (u32, u32) = (ATLAS_SIZE - 1, 1536);
 
 /// A thumbnail: the file and the exact size it is drawn at.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -32,7 +38,13 @@ pub struct ImageKey {
     pub w: u32,
     /// Height in physical pixels.
     pub h: u32,
+    /// The whole image, as large as fits `w`×`h` and no larger than it is,
+    /// instead of one that covers `w`×`h` and is cropped to it.
+    pub whole: bool,
 }
+
+/// Straight-alpha RGBA pixels, with their width and height.
+pub type Pixels = (Vec<u8>, u32, u32);
 
 /// What [`ImageAtlas::lookup`] found.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -86,7 +98,8 @@ impl ImageAtlas {
         if self.failed.contains(&key.path) {
             return Lookup::Failed;
         }
-        if key.w == 0 || key.h == 0 || key.w > MAX_THUMB || key.h > MAX_THUMB {
+        let most = if key.whole { MAX_WHOLE } else { (MAX_THUMB, MAX_THUMB) };
+        if key.w == 0 || key.h == 0 || key.w > most.0 || key.h > most.1 {
             return Lookup::Failed;
         }
         if self.pending.insert(key.clone()) {
@@ -100,45 +113,55 @@ impl ImageAtlas {
         std::mem::take(&mut self.wanted)
     }
 
-    /// Stores a decoded thumbnail (`key.w`×`key.h` straight-alpha RGBA), or
-    /// remembers that the file could not be decoded.
-    pub fn insert(&mut self, key: ImageKey, pixels: Result<Vec<u8>, String>) {
+    /// Stores a decoded thumbnail (`key.w`×`key.h`, or for a whole picture
+    /// whatever of that it fills), or remembers that the file could not be
+    /// decoded.
+    pub fn insert(&mut self, key: ImageKey, pixels: Result<Pixels, String>) {
         self.pending.remove(&key);
-        let pixels = match pixels {
-            Ok(pixels) if pixels.len() == key.w as usize * key.h as usize * 4 => pixels,
-            Ok(_) => return,
+        let (pixels, w, h) = match pixels {
+            Ok((pixels, w, h)) => {
+                let sized = if key.whole { w <= key.w && h <= key.h } else { (w, h) == (key.w, key.h) };
+                if !sized || w == 0 || h == 0 || pixels.len() != w as usize * h as usize * 4 {
+                    return;
+                }
+                (pixels, w, h)
+            }
             Err(e) => {
                 eprintln!("atroxabot: no thumbnail for {}: {e}", key.path);
                 self.failed.insert(key.path);
                 return;
             }
         };
-        // Everything on screen is in use; it is decoded again when drawn.
-        let Some(slot) = self.shelves.alloc(key.w + 1, key.h + 1) else {
-            return;
+        let slot = match self.shelves.alloc(w + 1, h + 1) {
+            Some(slot) => slot,
+            // No shelf tall enough for a whole picture is free: the atlas starts over, and
+            // what else is on screen is decoded again as it is drawn.
+            None if key.whole => {
+                self.shelves = Shelves::new(ATLAS_SIZE);
+                self.entries.clear();
+                let Some(slot) = self.shelves.alloc(w + 1, h + 1) else { return };
+                slot
+            }
+            // Everything on screen is in use; it is decoded again when drawn.
+            None => return,
         };
         if let Some(shelf) = slot.evicted {
             self.entries.retain(|_, (_, s)| *s != shelf);
         }
-        self.uploads.push(Upload {
-            x: slot.x,
-            y: slot.y,
-            w: key.w + 1,
-            h: key.h + 1,
-            data: pad(&pixels, key.w, key.h, 4),
-        });
-        let uv = [slot.x as f32, slot.y as f32, key.w as f32, key.h as f32];
+        self.uploads.push(Upload { x: slot.x, y: slot.y, w: w + 1, h: h + 1, data: pad(&pixels, w, h, 4) });
+        let uv = [slot.x as f32, slot.y as f32, w as f32, h as f32];
         self.entries.insert(key, (uv, slot.shelf));
     }
 }
 
 /// Decodes the image at `key.path` and scales it to cover `key.w`×`key.h`,
-/// cropping the overflow evenly. Slow: run it on a worker thread.
+/// cropping the overflow evenly; or, for a whole picture, to fit inside
+/// that, never larger than it is. Slow: run it on a worker thread.
 ///
 /// # Errors
 /// A human-readable reason: unreadable, too large, or not a PNG, JPEG or
 /// WebP.
-pub fn thumbnail(key: &ImageKey) -> Result<Vec<u8>, String> {
+pub fn thumbnail(key: &ImageKey) -> Result<Pixels, String> {
     let mut bytes = Vec::new();
     fs::File::open(&key.path).and_then(|f| f.take(MAX_FILE + 1).read_to_end(&mut bytes)).map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_FILE {
@@ -148,8 +171,19 @@ pub fn thumbnail(key: &ImageKey) -> Result<Vec<u8>, String> {
     // Orientations 5–8 swap the axes: scale for the transposed size.
     let swap = orientation >= 5;
     let (tw, th) = if swap { (key.h, key.w) } else { (key.w, key.h) };
+    let (tw, th) = if key.whole { fit((w, h), (tw, th)) } else { (tw, th) };
     let small = cover(&rgba, w, h, tw, th);
-    Ok(orient(&small, tw, th, orientation))
+    let upright = orient(&small, tw, th, orientation);
+    Ok(if swap { (upright, th, tw) } else { (upright, tw, th) })
+}
+
+/// The size of an image of `size` made as large as fits `within`, its
+/// proportions kept, and never larger than it is.
+fn fit(size: (u32, u32), within: (u32, u32)) -> (u32, u32) {
+    let scale = (f64::from(within.0) / f64::from(size.0.max(1))).min(f64::from(within.1) / f64::from(size.1.max(1)));
+    let scale = scale.min(1.0);
+    let scaled = |length: u32, most: u32| ((f64::from(length) * scale).round() as u32).clamp(1, most.max(1));
+    (scaled(size.0, within.0), scaled(size.1, within.1))
 }
 
 /// Decodes a PNG, JPEG or WebP to straight-alpha RGBA, with its EXIF
@@ -375,14 +409,20 @@ mod tests {
         let red_blue: Vec<u8> = (0..8).flat_map(|i| if i % 4 < 2 { [255, 0, 0] } else { [0, 0, 255] }).collect();
         let path = dir.join("a.png");
         fs::write(&path, png(4, 2, &red_blue)).unwrap();
-        let key = |w, h| ImageKey { path: path.to_string_lossy().into_owned(), w, h };
+        let key = |w, h| ImageKey { path: path.to_string_lossy().into_owned(), w, h, whole: false };
 
         // Covering 2×2 keeps the middle: half red, half blue.
-        let square = thumbnail(&key(2, 2)).unwrap();
+        let (square, ..) = thumbnail(&key(2, 2)).unwrap();
         assert_eq!(&square[..4], [255, 0, 0, 255]);
         assert_eq!(&square[4..8], [0, 0, 255, 255]);
         // Upscaling repeats pixels.
-        assert_eq!(thumbnail(&key(8, 4)).unwrap().len(), 8 * 4 * 4);
+        assert_eq!(thumbnail(&key(8, 4)).unwrap().0.len(), 8 * 4 * 4);
+        // The whole picture is all of it: as it is where there is room, smaller where there is not.
+        let whole = |w, h| thumbnail(&ImageKey { whole: true, ..key(w, h) }).unwrap();
+        let (all, w, h) = whole(100, 100);
+        assert_eq!((w, h, &all[..4], &all[12..16]), (4, 2, &[255, 0, 0, 255][..], &[0, 0, 255, 255][..]));
+        let (half, w, h) = whole(2, 100);
+        assert_eq!((w, h, &half[..]), (2, 1, &[255, 0, 0, 255, 0, 0, 255, 255][..]));
 
         fs::write(&path, b"\x89PNG\r\n\x1a\ngarbage").unwrap();
         assert!(thumbnail(&key(2, 2)).is_err());
@@ -397,9 +437,18 @@ mod tests {
         let mut webp = Vec::new();
         image_webp::WebPEncoder::new(&mut webp).encode(&red_blue, 4, 2, image_webp::ColorType::Rgb8).unwrap();
         fs::write(&path, &webp).unwrap();
-        let square = thumbnail(&key(2, 2)).unwrap();
+        let (square, ..) = thumbnail(&key(2, 2)).unwrap();
         assert_eq!(&square[..8], [255, 0, 0, 255, 0, 0, 255, 255]);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_whole_picture_fits_its_box_and_is_never_enlarged() {
+        assert_eq!(fit((4000, 2000), (1000, 1000)), (1000, 500));
+        assert_eq!(fit((2000, 4000), (1000, 1000)), (500, 1000));
+        assert_eq!(fit((300, 200), (1000, 1000)), (300, 200));
+        assert_eq!(fit((10_000, 1), (100, 100)), (100, 1), "a sliver keeps a pixel");
+        assert_eq!(fit((0, 0), (100, 100)), (1, 1));
     }
 
     #[test]
@@ -429,16 +478,45 @@ mod tests {
     #[test]
     fn atlas_queues_each_miss_once() {
         let mut atlas = ImageAtlas::default();
-        let key = ImageKey { path: "x".into(), w: 2, h: 2 };
+        let key = ImageKey { path: "x".into(), w: 2, h: 2, whole: false };
         assert_eq!(atlas.lookup(&key), Lookup::Loading);
         assert_eq!(atlas.lookup(&key), Lookup::Loading);
         assert_eq!(atlas.take_wanted(), std::slice::from_ref(&key));
         assert!(atlas.take_wanted().is_empty());
-        atlas.insert(key.clone(), Ok(vec![0; 16]));
+        atlas.insert(key.clone(), Ok((vec![0; 16], 2, 2)));
         assert!(matches!(atlas.lookup(&key), Lookup::Ready(_)));
         assert_eq!(atlas.uploads.len(), 1);
-        let broken = ImageKey { path: "y".into(), w: 2, h: 2 };
+        let broken = ImageKey { path: "y".into(), w: 2, h: 2, whole: false };
         atlas.insert(broken.clone(), Err("bad".into()));
         assert_eq!(atlas.lookup(&broken), Lookup::Failed);
+    }
+
+    #[test]
+    fn a_whole_picture_is_stored_at_the_size_it_came_out() {
+        let mut atlas = ImageAtlas::default();
+        let key = ImageKey { path: "x".into(), w: 1000, h: 800, whole: true };
+        assert_eq!(atlas.lookup(&key), Lookup::Loading);
+        // Pixels that are not the size they say, or larger than was asked for, are dropped.
+        atlas.insert(key.clone(), Ok((vec![0; 16], 3, 2)));
+        atlas.insert(key.clone(), Ok((vec![0; 1001 * 4], 1001, 1)));
+        assert_eq!(atlas.lookup(&key), Lookup::Loading);
+        atlas.insert(key.clone(), Ok((vec![0; 300 * 200 * 4], 300, 200)));
+        assert!(matches!(atlas.lookup(&key), Lookup::Ready([_, _, 300.0, 200.0])));
+        // One that is larger than the atlas takes is not asked for at all.
+        let huge = ImageKey { w: MAX_WHOLE.0 + 1, ..key.clone() };
+        assert_eq!(atlas.lookup(&huge), Lookup::Failed);
+        assert_eq!(atlas.lookup(&ImageKey { whole: false, ..key }), Lookup::Loading, "a thumbnail of its own");
+
+        // With the atlas full of thumbnails in use, a whole picture has it started over.
+        let mut full = ImageAtlas::default();
+        let thumb = |index: u32| ImageKey { path: index.to_string(), w: 1023, h: 1023, whole: false };
+        for index in 0..4 {
+            full.insert(thumb(index), Ok((vec![0; 1023 * 1023 * 4], 1023, 1023)));
+        }
+        assert!(matches!(full.lookup(&thumb(0)), Lookup::Ready(_)));
+        let tall = ImageKey { path: "tall".into(), w: 1200, h: 1500, whole: true };
+        full.insert(tall.clone(), Ok((vec![0; 1200 * 1500 * 4], 1200, 1500)));
+        assert!(matches!(full.lookup(&tall), Lookup::Ready(_)));
+        assert_eq!(full.lookup(&thumb(0)), Lookup::Loading, "and the thumbnails are decoded again");
     }
 }

@@ -177,9 +177,15 @@ pub fn pick_image() -> io::Result<Option<PathBuf>> {
 /// at `picture`. None when the clipboard holds neither.
 ///
 /// # Errors
-/// No helper could be started.
+/// No helper could be started, or the picture could not be written.
 // ponytail: copied files are only read on Windows; elsewhere only a copied picture is.
 pub fn clipboard_files(picture: &Path) -> io::Result<Vec<PathBuf>> {
+    // Windows is asked directly: a helper takes a second or two to start and
+    // takes the keyboard from the window meanwhile.
+    #[cfg(target_os = "windows")]
+    if let Some(files) = clipboard_native(picture)? {
+        return Ok(files);
+    }
     let out = picture.display().to_string();
     let lines = if cfg!(target_os = "windows") {
         let script = "Add-Type -AssemblyName System.Drawing; $c = [System.Windows.Forms.Clipboard]; \
@@ -216,6 +222,161 @@ pub fn clipboard_files(picture: &Path) -> io::Result<Vec<PathBuf>> {
         }
     };
     Ok(lines.into_iter().map(PathBuf::from).collect())
+}
+
+/// What the Windows clipboard holds that is not text, read from it
+/// directly: copied files, or else a copied picture, saved as a PNG at
+/// `picture`; nothing when it holds neither. `None` when its picture is a
+/// bitmap of a kind [`dib_rgb`] does not read, which is left to PowerShell.
+#[cfg(target_os = "windows")]
+fn clipboard_native(picture: &Path) -> io::Result<Option<Vec<PathBuf>>> {
+    let copied = arboard::Clipboard::new().and_then(|mut clipboard| clipboard.get().file_list()).unwrap_or_default();
+    if !copied.is_empty() {
+        return Ok(Some(copied));
+    }
+    match win_clipboard::picture() {
+        None => Ok(Some(Vec::new())),
+        // A PNG as its copier wrote it: its transparency included.
+        Some(win_clipboard::Picture::Png(png)) => {
+            std::fs::write(picture, png)?;
+            Ok(Some(vec![picture.to_path_buf()]))
+        }
+        Some(win_clipboard::Picture::Bitmap(dib)) => {
+            let Some((rgb, width, height)) = dib_rgb(&dib) else { return Ok(None) };
+            let mut encoder = png::Encoder::new(io::BufWriter::new(std::fs::File::create(picture)?), width, height);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().map_err(io::Error::other)?;
+            writer.write_image_data(&rgb).map_err(io::Error::other)?;
+            writer.finish().map_err(io::Error::other)?;
+            Ok(Some(vec![picture.to_path_buf()]))
+        }
+    }
+}
+
+/// A clipboard bitmap (`CF_DIB`: a `BITMAPINFOHEADER` or a later header,
+/// then the pixels) as opaque RGB, with its width and height. It reads what
+/// screenshots and copied pictures are: 24 or 32 bits a pixel, uncompressed,
+/// blue first. `None` for anything else, and for data shorter than its
+/// header says. The fourth byte of a pixel is not read: it is rarely alpha,
+/// and a copier that has transparency offers a PNG beside the bitmap.
+#[cfg(any(target_os = "windows", test))]
+fn dib_rgb(dib: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
+    let field = |at: usize| dib.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
+    let header = field(0)? as usize;
+    let (width, height) = (field(4)?.cast_signed(), field(8)?.cast_signed());
+    // Planes in the low half, bits a pixel in the high one.
+    let bits = (field(12)? >> 16) as usize;
+    if header < 40 || width <= 0 || height == 0 || !matches!(bits, 24 | 32) {
+        return None;
+    }
+    // Uncompressed, or `BI_BITFIELDS` naming the same order of bytes. Its three masks follow a
+    // 40-byte header and are fields of a longer one, at the same place either way.
+    let masks = match field(16)? {
+        0 => 0,
+        3 if bits == 32 && (field(40)?, field(44)?, field(48)?) == (0x00FF_0000, 0x0000_FF00, 0x0000_00FF) => {
+            if header == 40 { 12 } else { 0 }
+        }
+        _ => return None,
+    };
+    let (w, h) = (usize::try_from(width).ok()?, usize::try_from(height.unsigned_abs()).ok()?);
+    // A colour table may sit before the pixels even when they do not index it.
+    let table = usize::try_from(field(32)?).ok()?.checked_mul(4)?;
+    let start = header.checked_add(masks)?.checked_add(table)?;
+    // Rows are padded to four bytes.
+    let stride = w.checked_mul(bits)?.checked_add(31)? / 32 * 4;
+    let pixels = dib.get(start..start.checked_add(stride.checked_mul(h)?)?)?;
+    let step = bits / 8;
+    let mut rgb = Vec::with_capacity(w * h * 3);
+    for row in 0..h {
+        // The bottom row comes first, unless the height is negative.
+        let line = if height > 0 { h - 1 - row } else { row } * stride;
+        for pixel in pixels[line..line + w * step].chunks_exact(step) {
+            rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+        }
+    }
+    Some((rgb, u32::try_from(w).ok()?, u32::try_from(h).ok()?))
+}
+
+/// The clipboard's picture, through Win32: `user32` and `kernel32`, which
+/// every Windows GUI process loads.
+#[cfg(target_os = "windows")]
+mod win_clipboard {
+    use std::ffi::c_void;
+    use std::time::Duration;
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenClipboard(owner: *mut c_void) -> i32;
+        fn CloseClipboard() -> i32;
+        fn GetClipboardData(format: u32) -> *mut c_void;
+        fn RegisterClipboardFormatW(name: *const u16) -> u32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalLock(memory: *mut c_void) -> *mut c_void;
+        fn GlobalUnlock(memory: *mut c_void) -> i32;
+        fn GlobalSize(memory: *const c_void) -> usize;
+    }
+    /// A device-independent bitmap: what Windows makes of any copied picture.
+    const CF_DIB: u32 = 8;
+
+    /// A picture as the clipboard holds it.
+    pub enum Picture {
+        /// A PNG file's bytes: browsers, image editors and the snipping tool offer one.
+        Png(Vec<u8>),
+        /// A `CF_DIB` bitmap: a header, then the pixels.
+        Bitmap(Vec<u8>),
+    }
+
+    /// The picture on the clipboard, if it holds one (and no other program
+    /// is holding the clipboard open for longer than a moment).
+    pub fn picture() -> Option<Picture> {
+        let opened = (0..5).any(|attempt| {
+            if attempt > 0 {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // SAFETY: a null owner is allowed; it ties the open clipboard to this thread.
+            unsafe { OpenClipboard(std::ptr::null_mut()) != 0 }
+        });
+        if !opened {
+            return None;
+        }
+        let name = super::wide("PNG");
+        // SAFETY: the name is NUL-terminated UTF-16 that outlives the call, and the clipboard is
+        // open on this thread from here until it is closed, as `data` needs.
+        unsafe {
+            let png = RegisterClipboardFormatW(name.as_ptr());
+            let found = data(png).map(Picture::Png).or_else(|| data(CF_DIB).map(Picture::Bitmap));
+            CloseClipboard();
+            found
+        }
+    }
+
+    /// A copy of what the clipboard holds in `format`, if anything.
+    ///
+    /// # Safety
+    /// This thread must have the clipboard open, and `format` must be one
+    /// whose data is a global memory block (`CF_DIB` and registered formats are).
+    unsafe fn data(format: u32) -> Option<Vec<u8>> {
+        // SAFETY: the clipboard is open (the caller's promise), so the handle stays the
+        // clipboard's and valid until it is closed; a null one is checked for.
+        let memory = unsafe { GetClipboardData(format) };
+        if memory.is_null() {
+            return None;
+        }
+        // SAFETY: `memory` is a global memory block (the caller's promise). While it is locked,
+        // `bytes` points to at least `GlobalSize` readable bytes, which are copied before the unlock.
+        unsafe {
+            let bytes = GlobalLock(memory).cast::<u8>();
+            if bytes.is_null() {
+                return None;
+            }
+            let copy = std::slice::from_raw_parts(bytes, GlobalSize(memory)).to_vec();
+            GlobalUnlock(memory);
+            Some(copy)
+        }
+    }
 }
 
 /// Asks the user for files of any kind; none when cancelled.
@@ -425,5 +586,63 @@ mod tests {
         let _ = Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output();
         let _ = std::fs::remove_file(&out);
         assert_eq!(written.trim(), "it works", "the program ran in the terminal, with the variable");
+    }
+
+    /// A `BITMAPINFOHEADER` for `width` by `height` at `bits` a pixel, compressed as `compression` says.
+    fn dib_header(width: i32, height: i32, bits: u16, compression: u32) -> Vec<u8> {
+        let mut dib = Vec::new();
+        dib.extend_from_slice(&40u32.to_le_bytes());
+        dib.extend_from_slice(&width.to_le_bytes());
+        dib.extend_from_slice(&height.to_le_bytes());
+        dib.extend_from_slice(&1u16.to_le_bytes());
+        dib.extend_from_slice(&bits.to_le_bytes());
+        dib.extend_from_slice(&compression.to_le_bytes());
+        dib.extend_from_slice(&[0; 20]);
+        dib
+    }
+
+    #[test]
+    fn a_clipboard_bitmap_becomes_rgb_and_a_broken_one_nothing() {
+        // Two by two at 24 bits: blue first, the bottom row first, rows padded to four bytes.
+        let mut dib = dib_header(2, 2, 24, 0);
+        dib.extend_from_slice(&[1, 2, 3, 4, 5, 6, 0, 0]);
+        dib.extend_from_slice(&[7, 8, 9, 10, 11, 12, 0, 0]);
+        assert_eq!(dib_rgb(&dib), Some((vec![9, 8, 7, 12, 11, 10, 3, 2, 1, 6, 5, 4], 2, 2)));
+        // At 32 bits, the top row first, with the masks that name the usual order.
+        let mut dib = dib_header(1, -2, 32, 3);
+        for mask in [0x00FF_0000u32, 0x0000_FF00, 0x0000_00FF] {
+            dib.extend_from_slice(&mask.to_le_bytes());
+        }
+        dib.extend_from_slice(&[1, 2, 3, 0, 4, 5, 6, 0]);
+        assert_eq!(dib_rgb(&dib), Some((vec![3, 2, 1, 6, 5, 4], 1, 2)));
+        // Other masks, a palette, pixels that are not all there, a size no memory holds: nothing.
+        let mut odd = dib.clone();
+        odd[40] = 0xFF;
+        assert_eq!(dib_rgb(&odd), None);
+        assert_eq!(dib_rgb(&dib_header(2, 2, 8, 0)), None);
+        assert_eq!(dib_rgb(&dib[..dib.len() - 1]), None);
+        assert_eq!(dib_rgb(&dib_header(i32::MAX, i32::MIN, 32, 0)), None);
+        assert_eq!(dib_rgb(&dib_header(0, 1, 24, 0)), None);
+        assert_eq!(dib_rgb(&[40, 0, 0]), None);
+        assert_eq!(dib_rgb(&[]), None);
+    }
+
+    /// Reads the picture that is on the real clipboard (copy one first: a screenshot will do)
+    /// and leaves the clipboard as it is: `cargo test -p atroxabot clipboard -- --ignored --nocapture`.
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "needs a picture on the clipboard"]
+    fn a_copied_picture_is_read_without_a_helper() {
+        let out = std::env::temp_dir().join(format!("atroxabot-clipboard-{}.png", std::process::id()));
+        let started = std::time::Instant::now();
+        let files = clipboard_native(&out).unwrap();
+        let took = started.elapsed();
+        assert_eq!(files, Some(vec![out.clone()]), "copy a picture first");
+        let decoded = crate::image::decode_png(&std::fs::read(&out).unwrap());
+        let _ = std::fs::remove_file(&out);
+        let (rgba, width, height) = decoded.unwrap();
+        assert!(width > 0 && height > 0 && rgba.len() == (width * height * 4) as usize);
+        println!("{width} by {height} read and saved in {took:?}");
+        assert!(took < std::time::Duration::from_secs(1), "a paste should not be waited for: {took:?}");
     }
 }

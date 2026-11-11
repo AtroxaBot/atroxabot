@@ -1,6 +1,6 @@
 //! Drop-down lists: the model (and effort) under the message box, the
 //! provider and folder in the top bar, the branch in the side panel, and the
-//! dropdowns of the agent editor. One list is open at a
+//! dropdowns of the agent editor and the settings. One list is open at a
 //! time, over everything else.
 
 use arboard::Clipboard;
@@ -19,6 +19,7 @@ use crate::image::Lookup;
 use crate::logo::Logo;
 use crate::paint::{Color, Painter, Rect, fade};
 use crate::theme;
+use crate::tray::CloseAction;
 use crate::ui::{Ui, edit_key, icon, id};
 
 /// Which list is open.
@@ -38,6 +39,8 @@ pub(super) enum Menu {
     FormAutonomy,
     /// The agent editor's voice provider.
     FormVoice,
+    /// What closing the window does, in the settings.
+    Close,
 }
 
 impl Menu {
@@ -492,6 +495,17 @@ impl Shell {
                     ..Item::default()
                 })
                 .collect(),
+            Menu::Close => {
+                let current = CloseAction::from_key(self.config.close.as_deref());
+                let action = |&action: &CloseAction| Item {
+                    value: action.key().to_owned(),
+                    label: action.label().to_owned(),
+                    detail: action.detail().to_owned(),
+                    selected: action == current,
+                    ..Item::default()
+                };
+                CloseAction::offered().iter().map(action).collect()
+            }
         }
     }
 
@@ -556,6 +570,12 @@ impl Shell {
                     value.clone_into(&mut form.voice);
                 }
             }
+            Menu::Close => {
+                if self.config.close.as_deref() != Some(value) {
+                    self.config.close = Some(value.to_owned());
+                    actions.push(Action::SaveConfig);
+                }
+            }
         }
     }
 
@@ -588,12 +608,15 @@ impl Shell {
             Menu::Folder => 400.0,
             Menu::Provider => 340.0,
             Menu::FormAutonomy => anchor.w.max(460.0),
+            Menu::Close => anchor.w.max(360.0),
             _ => anchor.w.max(260.0),
         };
         let view = p.clip();
         let room = if menu.below() { view.bottom() - anchor.bottom() - 16.0 } else { anchor.y - view.y - 16.0 };
         let height = (content + search_h + foot_h + 12.0).min(440.0).min(room.max(120.0));
-        let x = anchor.x.min(view.right() - width - 12.0).max(view.x + 12.0);
+        // A list wider than a button at a page's right edge ends where the button does.
+        let start = if menu == Menu::Close { anchor.right() - width } else { anchor.x };
+        let x = start.min(view.right() - width - 12.0).max(view.x + 12.0);
         let y = if menu.below() { anchor.bottom() + 6.0 } else { anchor.y - 8.0 - height };
         let rect = Rect::new(x, y, width, height);
         let appear = ui.appear(id(("menu", menu)));
@@ -772,6 +795,22 @@ mod tests {
     use atroxabot_core::{Agent, ClaudeInfo, ClaudeModel, Config, Model};
 
     use super::*;
+
+    #[test]
+    fn the_close_choice_is_listed_kept_and_saved_once() {
+        let mut shell = Shell::new(Config::default(), Vec::new(), Vec::new());
+        let items = shell.menu_items(Menu::Close, "");
+        assert_eq!(items.len(), CloseAction::offered().len());
+        assert!(items[0].selected, "the platform's default is the one in use");
+        let mut actions = Vec::new();
+        shell.choose(Menu::Close, "quit", &mut actions);
+        assert_eq!(shell.config.close.as_deref(), Some("quit"));
+        assert!(matches!(&actions[..], [Action::SaveConfig]));
+        assert!(shell.menu_items(Menu::Close, "").iter().any(|item| item.selected && item.value == "quit"));
+        actions.clear();
+        shell.choose(Menu::Close, "quit", &mut actions);
+        assert!(actions.is_empty(), "the same choice again saves nothing");
+    }
 
     #[test]
     fn every_model_thinks_at_an_effort_of_its_own() {

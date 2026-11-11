@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::agent::Autonomy;
+use crate::agent::{Autonomy, FOLLOW_UP};
 use crate::attach;
 use crate::client::{Client, Model};
 use crate::error::Error;
@@ -109,6 +109,22 @@ pub enum AgentEvent {
     Limits(Limits),
     /// The Claude Agent's own session id, to resume it later.
     Remote(String),
+    /// The turn took in a message the user sent while it ran: the model
+    /// reads it here, after its latest tool results, and carries on.
+    FollowUp {
+        /// The id it was sent under ([`FollowUp::id`]).
+        id: String,
+        /// What the user wrote.
+        text: String,
+        /// The app's line before it, for the model; empty when there is none.
+        note: String,
+        /// The files that go with it.
+        files: Vec<String>,
+    },
+    /// How many messages the user sent during the turn are still to be
+    /// answered, in turns of their own that follow at once. Comes just
+    /// before [`AgentEvent::TurnEnded`], and only when there are some.
+    Queued(u64),
     /// The turn is over; `problem` says why if it did not end well.
     TurnEnded {
         /// What went wrong, if anything.
@@ -116,6 +132,18 @@ pub enum AgentEvent {
     },
     /// The Claude Agent's process ended; the next message starts it again.
     Disconnected(Option<String>),
+}
+
+/// A message the user sent while a turn was running, for the engine to
+/// read at its next step.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FollowUp {
+    /// Its id, which the app follows it by until the turn takes it in.
+    pub id: String,
+    /// What the user wrote.
+    pub text: String,
+    /// The files that go with it.
+    pub files: Vec<String>,
 }
 
 /// Where an account's plan limits stand, as its provider reports them.
@@ -226,7 +254,11 @@ impl Session {
                 self.entries.insert(at, Entry::Summary { text: text.clone() });
             }
             AgentEvent::Remote(id) => self.remote.clone_from(id),
-            AgentEvent::Permission(_)
+            AgentEvent::FollowUp { text, note, files, .. } => {
+                self.entries.push(Entry::User { text: text.clone(), note: note.clone(), files: files.clone() });
+            }
+            AgentEvent::Queued(_)
+            | AgentEvent::Permission(_)
             | AgentEvent::PermissionGone(_)
             | AgentEvent::Status(_)
             | AgentEvent::Limits(_)
@@ -257,11 +289,13 @@ impl Session {
     }
 }
 
-/// Lets the app stop a turn and answer its approvals from another thread.
+/// Lets the app stop a turn, answer its approvals and hand it the user's
+/// follow-ups from another thread.
 #[derive(Debug, Clone)]
 pub struct Control {
     cancel: Arc<AtomicBool>,
     verdicts: mpsc::Sender<(String, Verdict)>,
+    follow_ups: Arc<Mutex<Vec<FollowUp>>>,
 }
 
 impl Control {
@@ -270,7 +304,16 @@ impl Control {
     pub fn new() -> (Self, Inbox) {
         let (verdicts, inbox) = mpsc::channel();
         let cancel = Arc::new(AtomicBool::new(false));
-        (Self { cancel: Arc::clone(&cancel), verdicts }, Inbox { cancel, verdicts: inbox })
+        let follow_ups = Arc::default();
+        let control = Self { cancel: Arc::clone(&cancel), verdicts, follow_ups: Arc::clone(&follow_ups) };
+        (control, Inbox { cancel, verdicts: inbox, follow_ups })
+    }
+
+    /// Hands the turn a message the user sent while it runs. It reads it
+    /// after the tool calls in progress, as an [`AgentEvent::FollowUp`]; one
+    /// it never reached is not reported, and the app sends it again.
+    pub fn follow_up(&self, message: FollowUp) {
+        self.follow_ups.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(message);
     }
 
     /// Stops the turn: the request is dropped and a running command killed.
@@ -290,11 +333,17 @@ impl Control {
 pub struct Inbox {
     cancel: Arc<AtomicBool>,
     verdicts: mpsc::Receiver<(String, Verdict)>,
+    follow_ups: Arc<Mutex<Vec<FollowUp>>>,
 }
 
 impl Inbox {
     fn stopped(&self) -> bool {
         self.cancel.load(Ordering::Relaxed)
+    }
+
+    /// The follow-ups handed over so far, oldest first; they are the turn's from here on.
+    fn take_follow_ups(&self) -> Vec<FollowUp> {
+        std::mem::take(&mut *self.follow_ups.lock().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     /// Waits for the answer to approval `id`; `None` if the turn was stopped.
@@ -449,6 +498,10 @@ impl ApiEngine {
                 return Err(problem);
             }
             if calls.is_empty() && !completion.paused {
+                // What the user sent meanwhile is answered in this turn.
+                if Self::take_follow_ups(session, inbox, emit) {
+                    continue;
+                }
                 return Ok(());
             }
             // ponytail: calls run one after another; run the read-only ones
@@ -460,8 +513,25 @@ impl ApiEngine {
                 };
                 emit(session, AgentEvent::ToolResult { id: call.call_id.clone(), output, is_error });
             }
+            // What the user sent while the tools ran goes after their results.
+            Self::take_follow_ups(session, inbox, emit);
         }
         Err(format!("Stopped after {MAX_ROUNDS} steps in one turn. Say \"continue\" to let it go on."))
+    }
+
+    /// Takes the user's follow-ups into the conversation, after what is
+    /// there, unless the turn was stopped (the app then sends them again).
+    /// Returns whether there were any.
+    fn take_follow_ups(session: &mut Session, inbox: &Inbox, emit: &mut dyn FnMut(&mut Session, AgentEvent)) -> bool {
+        if inbox.stopped() {
+            return false;
+        }
+        let taken = inbox.take_follow_ups();
+        for FollowUp { id, text, files } in &taken {
+            let (id, text, files) = (id.clone(), text.clone(), files.clone());
+            emit(session, AgentEvent::FollowUp { id, text, note: FOLLOW_UP.to_owned(), files });
+        }
+        !taken.is_empty()
     }
 
     /// One streamed response, retried while the provider asks for patience.
@@ -891,6 +961,38 @@ mod tests {
         control.stop();
         assert_eq!(inbox.verdict("t2"), None);
         assert!(!inbox.pause(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn a_follow_up_is_read_after_the_tool_results_it_waited_for() {
+        let (control, inbox) = Control::new();
+        let mut session = Session::new("a");
+        session.prompt("Fix the bug", "");
+        session.apply(&AgentEvent::ReplyStarted);
+        session.apply(&AgentEvent::ToolCall(ToolUse { id: "t1".into(), name: "read".into(), ..ToolUse::default() }));
+        // Handed over while the tool runs.
+        control.follow_up(FollowUp { id: "f1".into(), text: "Also check the tests.".into(), files: Vec::new() });
+        session.apply(&AgentEvent::ToolResult { id: "t1".into(), output: "fn main".into(), is_error: false });
+        let mut seen = Vec::new();
+        let mut emit = |session: &mut Session, event: AgentEvent| {
+            session.apply(&event);
+            seen.push(event);
+        };
+        assert!(ApiEngine::take_follow_ups(&mut session, &inbox, &mut emit));
+        assert!(!ApiEngine::take_follow_ups(&mut session, &inbox, &mut emit), "taken once");
+        // A stopped turn takes nothing in: the app sends it again.
+        control.follow_up(FollowUp { id: "f2".into(), ..FollowUp::default() });
+        control.stop();
+        assert!(!ApiEngine::take_follow_ups(&mut session, &inbox, &mut emit));
+        assert!(matches!(&seen[..], [AgentEvent::FollowUp { id, note, .. }] if id == "f1" && note == FOLLOW_UP));
+        // The model reads it after the result, with the note that says when it came; nothing before changed.
+        for messages in [true, false] {
+            let input = history(&session.entries, messages);
+            let n = input.len();
+            assert!(matches!(&input[n - 2], InputItem::ToolOutput { call_id, .. } if call_id == "t1"));
+            let InputItem::Message { role: Role::User, text } = &input[n - 1] else { panic!("the follow-up is last") };
+            assert_eq!(text, &format!("{FOLLOW_UP}\n\nAlso check the tests."));
+        }
     }
 
     #[test]

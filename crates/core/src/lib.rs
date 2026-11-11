@@ -27,14 +27,14 @@ mod sse;
 pub mod stats;
 pub mod tools;
 
-pub use agent::{Agent, AgentVoice, Autonomy, CALL_ENDED, CALL_STARTED, Records};
+pub use agent::{Agent, AgentVoice, Autonomy, CALL_ENDED, CALL_STARTED, FOLLOW_UP, INTERRUPTING, Records};
 pub use atroxabot_claude_agent::{
     Error as ClaudeError, Info as ClaudeInfo, ModelInfo as ClaudeModel, SlashCommand as ClaudeCommand,
 };
 pub use claude::{ClaudeAgent, TerminalCommand, claude_info, claude_login, find_claude};
 pub use client::{Client, Model};
 pub use config::{Config, Connection, ConnectionKind, McpServer, VoiceSettings, lock_instance};
-pub use engine::{AgentEvent, ApiEngine, Ask, Control, Inbox, LimitWindow, Limits, Verdict};
+pub use engine::{AgentEvent, ApiEngine, Ask, Control, FollowUp, Inbox, LimitWindow, Limits, Verdict};
 pub use error::{Error, Result};
 pub use mcp::{McpHub, claude_mcp_config};
 pub use responses::{Completion, InputItem, ResponseRequest, Role, StreamEvent, ToolCall, ToolChoice, ToolSpec, Usage};

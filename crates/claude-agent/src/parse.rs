@@ -82,7 +82,12 @@ pub(crate) fn parse_line(line: &str) -> Parsed {
                 error,
             }
         }
-        "user" => Event::User { blocks: blocks(take(&mut take(&mut data, "message"), "content")), parent_tool_use_id },
+        "user" => Event::User {
+            uuid: text(&data, "uuid"),
+            replay: flag(&data, "isReplay"),
+            blocks: blocks(take(&mut take(&mut data, "message"), "content")),
+            parent_tool_use_id,
+        },
         "result" => Event::Result(TurnResult {
             subtype: text(&data, "subtype"),
             is_error: flag(&data, "is_error"),
@@ -97,6 +102,7 @@ pub(crate) fn parse_line(line: &str) -> Parsed {
                 .as_object()
                 .and_then(|models| models.values().map(|model| number(model, "contextWindow")).max())
                 .unwrap_or(0),
+            queued_turn_count: number(&data, "queued_turn_count"),
             raw: data,
         }),
         "control_request" => return control_request(&data),
@@ -528,8 +534,10 @@ mod tests {
              "content":[{"type":"text","text":"line 1"},{"type":"image","source":{}},{"type":"text","text":"line 2"},"bare",{}]},
             {"type":"tool_result","tool_use_id":"toolu_3"},
             {"type":"tool_result","content":{"odd":true}}]},"parent_tool_use_id":null}"#;
-        let Event::User { blocks, parent_tool_use_id } = event(&line.replace('\n', " ")) else { panic!("not user") };
-        assert_eq!(parent_tool_use_id, None);
+        let Event::User { blocks, parent_tool_use_id, replay, .. } = event(&line.replace('\n', " ")) else {
+            panic!("not user")
+        };
+        assert_eq!((parent_tool_use_id, replay), (None, false));
         let result = |id: &str, content: &str, is_error| Block::ToolResult {
             tool_use_id: id.into(),
             content: content.into(),
@@ -554,10 +562,21 @@ mod tests {
             event(line),
             Event::User {
                 blocks: vec![Block::Text("do the thing".into())],
-                parent_tool_use_id: Some("toolu_9".into())
+                parent_tool_use_id: Some("toolu_9".into()),
+                uuid: String::new(),
+                replay: false,
             }
         );
-        assert_eq!(event(r#"{"type":"user"}"#), Event::User { blocks: Vec::new(), parent_tool_use_id: None });
+        let empty = Event::User { blocks: Vec::new(), parent_tool_use_id: None, uuid: String::new(), replay: false };
+        assert_eq!(event(r#"{"type":"user"}"#), empty);
+        // The caller's own message, replayed when a turn takes it in, under the id it was sent with.
+        let replayed = r#"{"type":"user","message":{"role":"user","content":"Also: check the tests."},
+            "parent_tool_use_id":null,"isReplay":true,"uuid":"22222222-2222-4222-8222-222222222222"}"#;
+        let Event::User { blocks, uuid, replay, .. } = event(&replayed.replace('\n', " ")) else { panic!("not user") };
+        assert_eq!(blocks, [Block::Text("Also: check the tests.".into())]);
+        assert_eq!((uuid.as_str(), replay), ("22222222-2222-4222-8222-222222222222", true));
+        let odd = event(r#"{"type":"user","isReplay":"yes","uuid":7}"#);
+        assert!(matches!(odd, Event::User { replay: false, ref uuid, .. } if uuid.is_empty()));
     }
 
     #[test]
@@ -637,7 +656,8 @@ mod tests {
     fn result() {
         let line = r#"{"type":"result","subtype":"success","is_error":false,"duration_ms":1234,"duration_api_ms":1000,
             "num_turns":1,"result":"pong","session_id":"s1","total_cost_usd":0.0125,
-            "usage":{"input_tokens":10,"output_tokens":4},"permission_denials":[{"tool_name":"Bash"},{}]}"#;
+            "usage":{"input_tokens":10,"output_tokens":4},"permission_denials":[{"tool_name":"Bash"},{}],
+            "queued_turn_count":1}"#;
         let Event::Result(result) = event(&line.replace('\n', " ")) else { panic!("not a result") };
         assert_eq!(
             (result.subtype.as_str(), result.is_error, result.result.as_deref()),
@@ -646,7 +666,7 @@ mod tests {
         assert_eq!((result.session_id.as_str(), result.duration_ms, result.num_turns), ("s1", 1234, 1));
         assert_eq!(result.total_cost_usd, Some(0.0125));
         assert_eq!(result.usage, Usage { input_tokens: 10, output_tokens: 4, ..Usage::default() });
-        assert_eq!(result.permission_denials, 2);
+        assert_eq!((result.permission_denials, result.queued_turn_count), (2, 1));
         assert_eq!(result.raw["duration_api_ms"], 1000);
     }
 

@@ -19,7 +19,9 @@ cargo clippy --workspace --all-targets -- -D warnings
   an agent's row edits it.
 - **Files and pictures.** The paperclip under the message box picks files to send along; so does dropping
   them on the window, or pasting (Ctrl/Cmd+V) a copied picture or copied files. They ride under the
-  message as pills (a click takes one off) and show in the conversation with it. A picture (PNG, JPEG,
+  message as pills (a click takes one off) and show in the conversation with it; a click on a picture
+  there opens it whole over the screen (as large as fits, never larger than it is), and a click beside
+  it, the cross or Esc puts it away. A picture (PNG, JPEG,
   GIF or WebP, up to 3.5 MB) goes to the model as content, so it sees it; any other file is named to the
   agent by path, which reads it with its own tools. Typing `@` in the message box lists the files of the
   session's folder (what git tracks or would; without a repository, what is there short of hidden and
@@ -30,21 +32,35 @@ cargo clippy --workspace --all-targets -- -D warnings
   press its number to pick, type to answer in your own words, Enter goes on and sends when every question
   is answered, Tab moves between questions, Esc dismisses.
 - **Subagents.** An agent that delegates shows each subagent as a card in the conversation (what it is
-  for, what it is doing now, and what it took) and as a tab over it: the tab is the subagent's own
-  conversation, with what it was asked, what it said and every tool it called.
+  for, what it is doing now, and what it took), and the side panel lists the turn's subagents under the
+  tasks, each with how it is doing. A click on either opens the subagent's own conversation in the
+  session's place (what it was asked, what it said and every tool it called), under a bar that leads back.
 - **Tasks.** When an agent keeps a task list (Claude Code's `TaskCreate` and `TaskUpdate`, or `TodoWrite`),
   the side panel shows it: what is done, what it is doing now and what is still to do; while it works,
   the conversation names the task in hand. Claude Code gives a session an app starts those tools only
   when they are named as allowed (`--allowedTools`), so AtroxaBot names them.
-- **Commands and skills.** Type `/` in the message box for the list: `/clear` starts a new session,
-  `/compact` has a Claude account summarise its context, and every command and skill Claude Code offers
+- **Commands and skills.** Type `/` in the message box for the list: `/clear` empties the session (its
+  messages are deleted and the agent starts over with an empty context, while the session keeps its place,
+  its name in the sidebar until the next message names it, and its folder), `/compact` has a Claude
+  account summarise its context, and every command and skill Claude Code offers
   (yours included) is there by name. Arrows move, Tab or Enter takes one.
 - **Sessions.** Every agent has as many sessions as you like (Ctrl/Cmd+N starts one). A session shows the
   agent's answer as Markdown (code highlighted, with a copy button), its reasoning folded away, and every
   tool call as a row that opens to its input and output. Text can be selected with the mouse, across
   messages too, and copied.
   Sessions are saved as they go and reopen where they were. Click a session's title in the top bar to
-  rename it: Enter or a click elsewhere keeps the new name, Esc the old one.
+  rename it: Enter or a click elsewhere keeps the new name, Esc the old one. In the sidebar a session
+  stays where it is, however busy it gets: a new one starts on top, and you drag one up or down to put
+  it where you want it. That order is remembered.
+- **Messages while it works.** The message box stays open while the agent works: Enter puts what you
+  wrote in line, in a tray above the message box, and the agent reads it at its next step, as soon as the
+  tools it is running are done, then carries on with what it was doing (the message appears in the
+  conversation where it was read). If the turn ends first, it is the next message; several waiting are
+  sent as one. Until the agent has it, a waiting message can be edited (the pen puts it back in the
+  message box) or removed. *Send now* (or Ctrl/Cmd+Enter) stops the step in progress so the agent reads
+  it at once, with everything it did so far; Stop (or Esc) stops the turn and puts what waits back in the
+  message box. A command (`/compact`) waits for the turn to end. On a Claude account this is Claude Code's
+  own queue: the app hands a message over while a tool runs, and Claude Code says when it takes it in.
 - **A folder per session.** The folder chip at the right of the top bar says where the session works;
   click it for the folders used lately, or to choose another. A new session starts in the folder the
   agent's last one worked in.
@@ -78,13 +94,16 @@ cargo clippy --workspace --all-targets -- -D warnings
   Enter opens, Esc closes.
 - **The side panel** (the last icon of the top bar) shows what the session used and how full its context
   is, and the git repository of its folder: the branch (a click switches it), how far it is from what it
-  tracks, the changed files with their added and removed lines (a click opens the diff), a message box
-  that commits everything changed, and Push. It uses the `git` you have installed and reads the
-  repository again when a turn ends and when you come back to the window. For a Claude account it also
+  tracks, and the changed files with their added and removed lines (a click opens the diff). Committing
+  and pushing are left to the agent: the panel only shows. It uses the `git` you have installed and reads
+  the repository again when a turn ends and when you come back to the window. For a Claude account it also
   shows where the plan's limits stand (the 5-hour and weekly windows, the week's limit for Fable once a
-  turn ran on it, and when each starts over), under the name and address of the account they belong to.
-  They are what Claude Code reports for that account with each turn, the same numbers its own `/usage`
-  prints; reaching a limit is said in a notice.
+  turn ran on it, and when each starts over); the account is the one the top bar names, so picking
+  another there shows its numbers at once, and its address is not put on screen here. They are what
+  Claude Code reports for that account with each turn, the same numbers its own `/usage` prints (an
+  account that has not replied yet says so); reaching a limit is said in a notice. A message after the
+  account was switched goes to a Claude Code started for the new account, even if the old one was still
+  answering when it was switched.
 - **Statistics** (the chart at the foot of the sidebar, beside the settings; counted from a usage log of
   their own, so deleting a session does not lose what it used): tokens, cost, sessions, tool
   calls, cache hits, active days, streaks and the busiest day over the last 7, 30 or 90 days, a year or
@@ -111,9 +130,14 @@ cargo clippy --workspace --all-targets -- -D warnings
   so it keeps its reasoning between tool calls. Long conversations are summarised: by Anthropic's
   server-side compaction on its own API, by a request of the app's elsewhere. The side panel shows how
   full the context is and what the session cost.
+- **Closing the window** keeps the app running by default, so agents and calls go on (Settings, General,
+  *When you close the window*). On Windows the window goes to the tray: a click on the icon by the clock
+  opens it again, and its menu opens it or quits; starting AtroxaBot again also brings the window back. On
+  macOS the app hides as with Cmd+H, and its Dock icon brings it back. Linux has no tray here, so there the
+  window is minimised. The other choices are to minimise or to quit. Ctrl+Q quits (Cmd+Q on macOS).
 - **Looks.** The app draws its own title bar, the sidebar sits on the window and the session floats beside
   it on a rounded canvas, with the side panel on one of its own; the agent editor, the settings, the
-  statistics, the spotlight and a file's diff open over them as modals. Three themes: Black
+  statistics, the spotlight, a file's diff and a picture open over them as modals. Three themes: Black
   (the default), White and Amber. Zoom with Ctrl/Cmd + and -. Scrolling eases and never overshoots.
 
 ## Claude accounts and Anthropic's terms
@@ -152,7 +176,12 @@ its [authentication page](https://code.claude.com/docs/en/authentication) and th
 inside a product has conditions (the Commercial Terms, among them), and they can change.
 
 The `crates/claude-agent` crate is the port of the Agent SDK's transport: one process per open session,
-newline-delimited JSON on its standard input and output, permission prompts answered from the app.
+newline-delimited JSON on its standard input and output, permission prompts answered from the app. Every
+message is sent as typed by a person (`origin`), and `--replay-user-messages` has Claude Code say when a
+message sent during a turn is taken in (under the `uuid` it was sent with). How such a message is read (after
+the running tool calls, or as a turn of its own right after; `queued_turn_count` in the result says so),
+how an interrupt keeps or drops it (`cancel_queued`) and how `/clear` resets the context were checked
+against Claude Code 2.1.322.
 
 ## Layout
 
@@ -170,8 +199,9 @@ those into the saved transcript, so the app shows a Claude session and an API se
 `crates/desktop/src`: `gpu.rs` + `shader.wgsl` (one instanced pipeline, one draw call per frame),
 `text.rs`/`font.rs`/`raster.rs` (text), `markdown.rs` → `doc.rs` (laid-out Markdown), `paint.rs`/`ui.rs`
 (drawing and widgets), `orb.rs` (the agents' faces), `logo.rs` (the app's own mark, three bodies in a line, and the platforms' marks, from the outlines in
-`assets/logos/`), `shell/` (the screen: `sidebar.rs`, `thread.rs`, `composer.rs`, `question.rs`,
-`menu.rs`, `panel.rs`, `spotlight.rs`, `stats.rs`, `agent_form.rs`, `settings.rs`, `call.rs`,
+`assets/logos/`), `tray.rs` (what closing the window does, and the Windows tray icon, through Win32 directly),
+`shell/` (the screen: `sidebar.rs`, `thread.rs`, `composer.rs`, `queue.rs`, `question.rs`,
+`menu.rs`, `panel.rs`, `picture.rs`, `spotlight.rs`, `stats.rs`, `agent_form.rs`, `settings.rs`, `call.rs`,
 `widgets.rs`), `app.rs` (events, threads, engines).
 
 The app redraws only when something changes. Model requests, tools, the Claude Agent's process, calls and
@@ -186,7 +216,8 @@ To look at the design without opening the app, draw every screen offscreen in ev
 Everything lives in `~/.atroxabot/`:
 
 - `config.json`: providers (with their API keys), voice providers (with theirs), MCP servers, recent
-  folders, the theme, window and zoom, and whether the side panel is open.
+  folders, the theme, window and zoom, what closing the window does, whether the side panel is open, and the order you dragged the
+  sessions into.
 - `usage.jsonl`: what every reply used (when, which agent, session, provider and model, its tokens, cost
   and tool calls), a line each. The statistics are counted from it; it is started once from the saved
   sessions and only added to after that. `limits.json`: each Claude account's plan limits as last
@@ -209,8 +240,11 @@ saved for.
 - API agents run their tool calls one after another and have no subagents (Claude accounts have both,
   from Claude Code). MCP servers behind OAuth are not supported for them: static headers only.
 - A selection does not reach into reasoning or a tool's details.
-- Git: a commit takes everything changed (there is no staging of single files), branches are switched but
-  not created, and there is no pull. A diff's long lines scroll sideways (a sideways wheel, or Shift and
+- An agent's reply shows no pictures: Markdown images are not drawn, so only the pictures you send appear
+  in the conversation (and open whole on a click). An opened picture is not zoomed past the window; a GIF
+  is not decoded, so it shows as a placeholder.
+- Git: the side panel shows the repository and switches branches; it does not commit, push, pull or
+  create a branch (ask the agent). A diff's long lines scroll sideways (a sideways wheel, or Shift and
   the wheel) by columns of one width, so a long line of wide characters drifts.
 - Statistics count by UTC day, and a reply saved before replies were dated counts on the day its session
   was last changed. What a session used before the usage log existed is only counted if the session was
@@ -219,7 +253,10 @@ saved for.
   outside its folder. A picture is read from where it is each time it is sent, so one that was moved or
   deleted later is only named. Pasting copied files works on Windows; elsewhere only a copied picture.
 - Questions, subagents, skills, the task list, `/compact` and the plan's limits are Claude Code's, so they
-  exist on Claude accounts only. A turn's file changes cannot be undone (rewound) yet. A subagent's
+  exist on Claude accounts only. A message sent while an agent works is read after the tool calls in
+  progress: one long call (a test run, a subagent) keeps it waiting until it is done, unless you use
+  *Send now*, which stops that call. A Claude Code older than about 2.1.219 cannot drop a message it was
+  handed when you press Stop: it answers it after all. A turn's file changes cannot be undone (rewound) yet. A subagent's
   words show when Claude Code sends them: piece by piece if it streams them, but Claude Code 2.1.322 sent
   none of a subagent's text before its result when this was checked.
 - A file named with `@` is read into the message by Claude Code on a Claude account; an API provider's
@@ -230,6 +267,8 @@ saved for.
 - An API key shows as stars while it is typed and is never shown again once saved; the headers and
   variables of an MCP server are shown as typed.
 - An agent's picture is used from where it is on disk; move the file and the drawn face comes back.
+- While the window is in the tray (or hidden on macOS) nothing says that an agent finished or waits for an
+  approval: there are no system notifications yet. Linux has no tray icon (that needs a D-Bus client).
 - Release builds are unsigned and there are no installers.
 
 ## License

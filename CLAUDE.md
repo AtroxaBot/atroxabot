@@ -62,16 +62,21 @@ which platform a provider is. Never use one as the app's own branding.
 
 - The shell: the app draws its own title bar (`titlebar.rs`). The sidebar sits on the window
   (`Palette::panel`); the session floats beside it on a rounded canvas (`Palette::bg`), and the side
-  panel (`shell/panel.rs`: usage and git) on another. The agent editor, the settings, the statistics and
-  a diff are modals (`widgets::modal`), the spotlight one of its own shape; menus, the approval card and
+  panel (`shell/panel.rs`: usage, tasks, subagents, plan limits and git, which it shows but does not
+  commit or push: that is the agent's) on another. The agent editor, the settings, the statistics and
+  a diff are modals (`widgets::modal`), the spotlight and an opened picture (`shell/picture.rs`) ones of
+  their own shape; menus, the approval card and
   the composer float on `Palette::surface` with a soft shadow. The top bar holds only what belongs to
   the session; the sidebar holds the app's as icons: search and a new agent over the agents, settings
   and statistics at its foot. Under the message box: the paperclip at the left, the model at the right.
 - An agent has no model or effort in its editor: both are chosen under the message box. There is no
   "auto" effort; `Shell::effort_in_use` gives every model a level of its own.
 - What the agent needs from the user rides on a card over the message box: an approval (`draw_ask`) or a
-  question (`shell/question.rs`). A subagent is a card in the conversation and a tab over it
-  (`shell/thread.rs`), never a separate window.
+  question (`shell/question.rs`). What the user sends while the agent works waits in a tray just above the
+  message box until the agent reads it at its next step (`shell/queue.rs`); it is never a separate list or
+  window. A subagent is a card in the conversation and a row in the side
+  panel's list under the tasks; either opens it in the conversation's place (`shell/thread.rs`), never as
+  tabs or a separate window.
 - An agent's system prompt is its own (`Agent::system_prompt`, plus `CLAUDE_TOOLS` on a Claude account),
   not Claude Code's preset: keep it short, and add to it only what an agent here needs.
 - Say it with a control, not a sentence: a dropdown for one of many (`widgets::dropdown` + `Menu`), option

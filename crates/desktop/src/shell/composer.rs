@@ -80,6 +80,19 @@ impl Composer {
         self.preedit = None;
         self.editor.insert(text);
     }
+
+    /// Puts a message that was not sent back, before what is being written.
+    pub fn restore(&mut self, text: &str, files: Vec<String>) {
+        let draft = self.editor.take();
+        let joined = match (text.trim().is_empty(), draft.trim().is_empty()) {
+            (_, true) => text.to_owned(),
+            (true, false) => draft,
+            (false, false) => format!("{text}\n\n{draft}"),
+        };
+        self.editor.insert(&joined);
+        let files: Vec<String> = files.into_iter().filter(|file| !self.files.contains(file)).collect();
+        self.files.splice(0..0, files);
+    }
 }
 
 impl Shell {
@@ -98,7 +111,7 @@ impl Shell {
         let x = canvas.x + ((canvas.w - width) * 0.5).round();
         let (pad, top_pad, toolbar_h) = (16.0, 14.0, 48.0);
         let text_w = width - 2.0 * pad;
-        let elsewhere = self.git.focused || self.renaming.is_some() || self.answering();
+        let elsewhere = self.renaming.is_some() || self.answering();
         let typing = ui.focused && self.menu.is_none() && self.modal.is_none() && !elsewhere;
         let composer = &mut self.composer;
 
@@ -137,7 +150,6 @@ impl Shell {
         // Mouse: click to place the caret, drag to select.
         let hit = |ui: &Ui| layout.hit(ui.mouse.0 - origin.0, ui.mouse.1 - origin.1);
         let text_zone = Rect::new(card.x, text_area.y - 4.0, card.w, text_area.h + 8.0);
-        let mut took_focus = false;
         if ui.hovered(text_zone) {
             ui.cursor = CursorIcon::Text;
             if ui.pressed && preedit.is_none() {
@@ -146,7 +158,6 @@ impl Shell {
                     composer.editor.select_word();
                 }
                 composer.selecting = true;
-                took_focus = true;
                 ui.last_edit = ui.time;
             }
         }
@@ -156,9 +167,6 @@ impl Shell {
             } else if !ui.down {
                 composer.selecting = false;
             }
-        }
-        if took_focus {
-            self.git.focused = false;
         }
 
         let focus = ui.anim(id("composer-focus"), f32::from(u8::from(typing)));
@@ -215,9 +223,9 @@ impl Shell {
         }
         self.draw_attached(p, ui, (card.x + 44.0, item_y, room));
 
-        // Send, or stop while the agent works.
-        let busy = self.thread().is_some_and(|thread| thread.busy);
+        // Send, or stop while the agent works. What is written then waits for its next step.
         let ready = !self.composer.editor.text().trim().is_empty() || !self.composer.files.is_empty();
+        let busy = self.thread().is_some_and(|thread| thread.busy) && !ready;
         let hovered = ui.hovered(send) && (busy || ready);
         let hover = ui.anim(id("send"), f32::from(u8::from(hovered)));
         let center = (send.x + 15.0, send.y + 15.0);
@@ -243,20 +251,22 @@ impl Shell {
             }
         }
 
-        // A waiting approval rides on top of the composer.
+        // What was sent while the agent works waits on top of the composer, and a waiting approval on top of that.
+        let waiting = self.draw_queue(p, ui, (x, card.y - 8.0, width), actions);
+        let top = if waiting < card.y - 8.0 { waiting } else { card.y };
         match self.thread().and_then(|thread| thread.asks.first()).cloned() {
             // A question is answered on a card of its own.
             Some(ask) if self.asks_question(&ask) => {
-                let Some(mut form) = self.question.take() else { return card.y };
-                let (top, verdict) = form.draw(p, ui, (x, card.y - 10.0, width), &ask.input, &agent.name);
+                let Some(mut form) = self.question.take() else { return top };
+                let (top, verdict) = form.draw(p, ui, (x, waiting - 2.0, width), &ask.input, &agent.name);
                 match verdict {
                     Some(verdict) => self.decide(verdict, actions),
                     None => self.question = Some(form),
                 }
                 top
             }
-            Some(ask) => self.draw_ask(p, ui, (x, card.y - 10.0, width), &ask, &agent.name, actions),
-            None => card.y,
+            Some(ask) => self.draw_ask(p, ui, (x, waiting - 2.0, width), &ask, &agent.name, actions),
+            None => top,
         }
     }
 
@@ -343,7 +353,7 @@ impl Shell {
             return Vec::new();
         }
         let needle = needle.to_lowercase();
-        let mut commands = vec![("clear".to_owned(), "Start a new session with this agent".to_owned())];
+        let mut commands = vec![("clear".to_owned(), "Empty this session and start with a fresh context".to_owned())];
         let connection = self.selected_agent().and_then(|agent| self.connection(agent));
         if let Some(connection) = connection.filter(|connection| connection.kind == ConnectionKind::ClaudeAgent) {
             commands.push(("compact".to_owned(), "Summarise the conversation to free up its context".to_owned()));

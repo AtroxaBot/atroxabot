@@ -104,7 +104,10 @@ impl Spotlight {
             kind: "Session",
         };
         let most = if needle.is_empty() { RECENT } else { MOST };
-        let titled = shell.sessions.iter().filter(|s| fits(&s.title)).take(most);
+        // The latest first, whatever order the sidebar has them in.
+        let mut titled: Vec<_> = shell.sessions.iter().filter(|s| fits(&s.title)).collect();
+        titled.sort_by_key(|s| std::cmp::Reverse(s.updated));
+        let titled = titled.into_iter().take(most);
         let mut entries: Vec<Entry> = titled.map(|s| session(&s.agent, &s.id, &s.title, &s.preview)).collect();
         for hit in &self.hits {
             let listed = |e: &Entry| matches!(&e.target, Target::Session { session, .. } if *session == hit.session);

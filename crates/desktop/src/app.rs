@@ -19,8 +19,8 @@ use atroxabot_core::stats::{self, Ledger, Record};
 use atroxabot_core::tools::Workspace;
 use atroxabot_core::{
     Agent, AgentEvent, ApiEngine, ClaudeAgent, ClaudeError, ClaudeInfo, Client, Config, Connection, ConnectionKind,
-    Control, Error, Limits, McpHub, McpServer, Model, Records, SearchHit, Session, SessionStore, SessionSummary,
-    Verdict,
+    Control, Error, FollowUp, Limits, McpHub, McpServer, Model, Records, SearchHit, Session, SessionStore,
+    SessionSummary, Verdict,
 };
 use atroxabot_voice::{Call, CallEvent, CallOptions, VoiceConfig};
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -38,6 +38,7 @@ use crate::shell::Shell;
 use crate::text::{Fonts, GlyphAtlas};
 use crate::theme::{Palette, Scheme};
 use crate::titlebar::{self, Command, Grab};
+use crate::tray::{CloseAction, Tray, TrayEvent};
 use crate::ui::{Ui, copy};
 
 /// Length of the cross-fade when the colour scheme changes.
@@ -59,6 +60,8 @@ pub enum WorkerEvent {
     Agent {
         /// The session's id.
         session: String,
+        /// Which of the session's engines it came from ([`App::renew`]).
+        generation: u64,
         /// What happened.
         event: AgentEvent,
     },
@@ -115,9 +118,11 @@ pub enum WorkerEvent {
         files: Vec<String>,
     },
     /// A thumbnail was decoded (or could not be).
-    Thumbnail(ImageKey, Result<Vec<u8>, String>),
+    Thumbnail(ImageKey, Result<image::Pixels, String>),
     /// Something went wrong out of sight: what to tell the user.
     Problem(String),
+    /// The tray icon was clicked, or another start of the app asks for the window.
+    Tray(TrayEvent),
 }
 
 /// Something the interface wants done that needs a thread, a file or a device.
@@ -135,8 +140,18 @@ pub enum Action {
         /// The prompt as the Claude Agent is sent it.
         text: String,
     },
-    /// Stop the turn of this session.
+    /// Stop the turn of this session, with what was sent to it meanwhile.
     Stop(String),
+    /// Stop the step in progress in this session, so the agent reads at once
+    /// what was sent to it meanwhile (it is answered next).
+    Interrupt(String),
+    /// Hand a message the user sent while it works to the turn of a session.
+    FollowUp {
+        /// The session's id.
+        session: String,
+        /// The message.
+        message: Box<FollowUp>,
+    },
     /// Answer an approval of a session's turn.
     Decide {
         /// The session's id.
@@ -280,6 +295,11 @@ pub struct App {
     live: HashMap<String, ClaudeAgent>,
     /// The running API turn of each session that has one.
     turns: HashMap<String, Control>,
+    /// The engine (a Claude process, an API turn) each session hears from,
+    /// by a number given to each: what one it replaced still says is dropped.
+    generations: HashMap<String, u64>,
+    /// The number the next engine gets.
+    next_generation: u64,
     /// Tools approved for the rest of each API session.
     approved: HashMap<String, Arc<Mutex<HashSet<String>>>>,
     /// The user's MCP servers, connected for API sessions, and the settings they were made from.
@@ -299,8 +319,13 @@ pub struct App {
     ime_area: Option<Rect>,
     /// Interface zoom in percent, on top of the display's scale.
     zoom: u16,
-    /// The title bar's close button was clicked: the app exits.
-    quit: bool,
+    /// The title bar's close button was clicked: the window closes as the
+    /// settings say ([`CloseAction`]) once the frame is drawn.
+    closing: bool,
+    /// The tray icon that brings the window back (Windows only).
+    tray: Option<Tray>,
+    /// The window is hidden, its icon in the tray.
+    hidden: bool,
     /// When the title bar strip was last pressed, to maximize on a second press.
     title_press: Option<f32>,
 }
@@ -378,6 +403,18 @@ impl App {
                     .into(),
             );
         }
+        // Started now, not when first needed: another start of the app finds
+        // this one by the tray's window.
+        let tray_proxy = proxy.clone();
+        let tray = Tray::start(move |event| {
+            let _ = tray_proxy.send_event(WorkerEvent::Tray(event));
+        })
+        .inspect_err(|e| {
+            if cfg!(windows) {
+                log::error(format!("there will be no tray icon: {e}"));
+            }
+        })
+        .ok();
         let now = Instant::now();
         let mut app = Self {
             window,
@@ -399,6 +436,8 @@ impl App {
             writer,
             live: HashMap::new(),
             turns: HashMap::new(),
+            generations: HashMap::new(),
+            next_generation: 1,
             approved: HashMap::new(),
             mcp: None,
             call: None,
@@ -409,7 +448,9 @@ impl App {
             cursor: CursorIcon::Default,
             ime_area: None,
             zoom,
-            quit: false,
+            closing: false,
+            tray,
+            hidden: false,
             title_press: None,
         };
         app.ui.focused = true;
@@ -466,9 +507,18 @@ impl App {
     /// Something to post a session's engine events to the event loop with.
     fn emitter(&self, session: &str) -> impl FnMut(AgentEvent) + Send + 'static {
         let (proxy, session) = (self.proxy.clone(), session.to_owned());
+        let generation = self.generations.get(&session).copied().unwrap_or_default();
         move |event| {
-            let _ = proxy.send_event(WorkerEvent::Agent { session: session.clone(), event });
+            let _ = proxy.send_event(WorkerEvent::Agent { session: session.clone(), generation, event });
         }
+    }
+
+    /// A new engine answers `session` from now on: the one it replaces (a
+    /// process being closed, say) is no longer heard, so that its last words
+    /// cannot end or close the new one.
+    fn renew(&mut self, session: &str) {
+        self.generations.insert(session.to_owned(), self.next_generation);
+        self.next_generation += 1;
     }
 
     /// Routes a window event.
@@ -476,11 +526,11 @@ impl App {
         let scale = self.scale();
         let mut actions = Vec::new();
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.close(event_loop),
             WindowEvent::RedrawRequested => {
                 self.frame();
-                if self.quit {
-                    event_loop.exit();
+                if std::mem::take(&mut self.closing) {
+                    self.close(event_loop);
                 }
                 return;
             }
@@ -536,6 +586,11 @@ impl App {
             WindowEvent::KeyboardInput { event, is_synthetic: false, .. } if event.state == ElementState::Pressed => {
                 let primary =
                     if cfg!(target_os = "macos") { self.ui.mods.super_key() } else { self.ui.mods.control_key() };
+                // Quitting when closing does not: Cmd+Q is the macOS menu's own.
+                if primary && !cfg!(target_os = "macos") && is_key(&event.logical_key, "q") {
+                    event_loop.exit();
+                    return;
+                }
                 if primary && let Some(zoom) = zoomed(self.zoom, &event.logical_key) {
                     if zoom != self.zoom {
                         self.zoom = zoom;
@@ -565,12 +620,64 @@ impl App {
         self.window.request_redraw();
     }
 
+    /// Closes the window as the settings say: into the tray (or behind the
+    /// Dock icon), minimised, or by quitting.
+    fn close(&mut self, event_loop: &ActiveEventLoop) {
+        match CloseAction::from_key(self.shell.config.close.as_deref()) {
+            CloseAction::Quit => event_loop.exit(),
+            CloseAction::Minimize => self.window.set_minimized(true),
+            CloseAction::Background => self.go_to_background(event_loop),
+        }
+    }
+
+    /// Takes the window off the screen while the app keeps running.
+    #[cfg_attr(target_os = "macos", allow(clippy::unused_self, reason = "macOS hides the whole app"))]
+    fn go_to_background(&mut self, event_loop: &ActiveEventLoop) {
+        #[cfg(target_os = "macos")]
+        {
+            use winit::platform::macos::ActiveEventLoopExtMacOS;
+            event_loop.hide_application();
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = event_loop;
+            match &self.tray {
+                Some(tray) => {
+                    tray.show();
+                    self.window.set_visible(false);
+                    self.hidden = true;
+                }
+                // Without a tray icon a hidden window could not be found again.
+                None => self.window.set_minimized(true),
+            }
+        }
+    }
+
+    /// Brings the window back to the front, from the tray or minimised.
+    fn restore(&mut self) {
+        if std::mem::take(&mut self.hidden) {
+            self.window.set_visible(true);
+            if let Some(tray) = &self.tray {
+                tray.hide();
+            }
+        }
+        if self.window.is_minimized() == Some(true) {
+            self.window.set_minimized(false);
+        }
+        self.window.focus_window();
+        self.window.request_redraw();
+    }
+
     /// Applies a result from another thread.
-    pub fn worker_event(&mut self, event: WorkerEvent) {
+    pub fn worker_event(&mut self, event_loop: &ActiveEventLoop, event: WorkerEvent) {
         let mut actions = Vec::new();
         match event {
+            WorkerEvent::Tray(TrayEvent::Open) => self.restore(),
+            WorkerEvent::Tray(TrayEvent::Quit) => event_loop.exit(),
             WorkerEvent::Thumbnail(key, pixels) => self.images.insert(key, pixels),
-            WorkerEvent::Agent { session, event } => {
+            // From an engine that was replaced: nothing it says matters any more.
+            WorkerEvent::Agent { session, generation, .. } if self.generations.get(&session) != Some(&generation) => {}
+            WorkerEvent::Agent { session, event, .. } => {
                 if matches!(event, AgentEvent::TurnEnded { .. }) {
                     self.turns.remove(&session);
                 }
@@ -624,7 +731,24 @@ impl App {
                     turn.stop();
                 }
                 if let Some(live) = self.live.get(&session) {
-                    live.interrupt();
+                    live.interrupt(true);
+                }
+            }
+            Action::Interrupt(session) => {
+                // An API turn ends; the shell sends what it had not read as the next message.
+                if let Some(turn) = self.turns.get(&session) {
+                    turn.stop();
+                }
+                if let Some(live) = self.live.get(&session) {
+                    live.interrupt(false);
+                }
+            }
+            Action::FollowUp { session, message } => {
+                if let Some(live) = self.live.get(&session) {
+                    // Fails only if the process is gone, which ends the turn.
+                    let _ = live.follow_up(*message);
+                } else if let Some(turn) = self.turns.get(&session) {
+                    turn.follow_up(*message);
                 }
             }
             Action::Decide { session, ask, verdict } => {
@@ -833,6 +957,9 @@ impl App {
             _ => Vec::new(),
         };
         if connection.kind == ConnectionKind::ClaudeAgent {
+            if !self.live.contains_key(&id) {
+                self.renew(&id);
+            }
             let mut emit = self.emitter(&id);
             // One process serves the session until it is closed or its agent changes.
             let mcp = atroxabot_core::claude_mcp_config(&self.shell.config.mcp);
@@ -867,6 +994,7 @@ impl App {
         };
         let (control, inbox) = Control::new();
         self.turns.insert(id.clone(), control);
+        self.renew(&id);
         let mut emit = self.emitter(&id);
         let spawned = std::thread::Builder::new().name("atroxabot-turn".into()).spawn(move || {
             let mut session = session;
@@ -955,7 +1083,7 @@ impl App {
         match command {
             Some(Command::Minimize) => self.window.set_minimized(true),
             Some(Command::Maximize) => self.window.set_maximized(!maximized),
-            Some(Command::Close) => self.quit = true,
+            Some(Command::Close) => self.closing = true,
             None => {}
         }
         let drawn = self.renderer.render(
@@ -1101,6 +1229,11 @@ fn zoomed(zoom: u16, key: &Key) -> Option<u16> {
         _ => return None,
     };
     Some(zoom.clamp(ZOOM.0, ZOOM.1))
+}
+
+/// Whether `key` is the letter `letter`, in either case.
+fn is_key(key: &Key, letter: &str) -> bool {
+    matches!(key, Key::Character(c) if c.eq_ignore_ascii_case(letter))
 }
 
 /// Logical size and maximized state of the window from the config's

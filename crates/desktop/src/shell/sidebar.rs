@@ -1,6 +1,7 @@
 //! The sidebar: the agents, each with its face, and under the selected one
-//! its sessions, newest first; the search and a new agent are icons over
-//! them, the settings and the statistics icons at the foot.
+//! its sessions, in the order the user drags them into (a new one starts
+//! on top, and none moves by itself); the search and a new agent are icons
+//! over them, the settings and the statistics icons at the foot.
 
 use atroxabot_core::{Agent, unix_now};
 use winit::window::CursorIcon;
@@ -20,6 +21,8 @@ const AGENT_H: f32 = 54.0;
 const SESSION_H: f32 = 30.0;
 /// Space between the sidebar's edge and its rows.
 const INSET: f32 = theme::GAP;
+/// How far a held session moves before it is dragged and not clicked.
+const DRAG_SLACK: f32 = 4.0;
 
 impl Shell {
     pub(super) fn draw_sidebar(&mut self, p: &mut Painter, ui: &mut Ui, area: Rect, actions: &mut Vec<Action>) {
@@ -55,6 +58,9 @@ impl Shell {
         let clip = p.push_clip(list);
         let mut y = list.y - offset;
         let (mut select, mut open, mut delete, mut fresh, mut edit) = (None, None, None, false, None::<Agent>);
+        // The session being dragged, the one a press just took hold of, and the place the drag is over.
+        let dragged = self.drag.as_ref().filter(|(_, moved)| *moved).map(|(session, _)| session.clone());
+        let (mut held, mut place) = (None, None);
         for agent in &self.agents {
             let selected = self.agent.as_deref() == Some(agent.id.as_str());
             let row = Rect::new(list.x + INSET, y, width, AGENT_H - 2.0);
@@ -68,7 +74,7 @@ impl Shell {
                 let mood = if busy { Mood::Thinking } else { Mood::Idle };
                 let face = (row.x + 27.0, row.y + row.h * 0.5);
                 orb::agent(p, &agent.portrait, face, 32.0, Self::color_of(agent), mood, ui.time);
-                let latest = sessions.clone().next();
+                let latest = self.latest_session(&agent.id);
                 // Right: how long ago, or an edit button while hovered.
                 let pen = Rect::new(row.right() - 30.0, row.y + 6.0, 24.0, 24.0);
                 let on_pen = hovered && pen.contains(ui.mouse);
@@ -127,21 +133,36 @@ impl Shell {
                     fresh |= ui.clicked(fresh_row);
                 }
             }
+            // A dragged session goes where the mouse is level with: the others make room as it
+            // passes. With the mouse off to the side (or out of the window) it stays where it is.
+            if dragged.is_some() && (list.x..list.right()).contains(&ui.mouse.0) {
+                let end = sessions.clone().count().saturating_sub(1);
+                place = Some((((ui.mouse.1 - y) / SESSION_H).max(0.0) as usize).min(end));
+            }
             for session in sessions {
                 let row = Rect::new(list.x + INSET + 28.0, y, width - 28.0, SESSION_H - 2.0);
                 y += SESSION_H;
                 if row.bottom() < list.y || row.y > list.bottom() {
                     continue;
                 }
-                let hovered = ui.hovered(row) && list.contains(ui.mouse);
+                let carried = dragged.as_deref() == Some(session.id.as_str());
+                // While one is dragged, the others do not answer the mouse.
+                let hovered = ui.hovered(row) && list.contains(ui.mouse) && (carried || dragged.is_none());
                 let hover = ui.anim(id(("session", &session.id)), f32::from(u8::from(hovered)));
                 let current = self.current.as_deref() == Some(session.id.as_str());
-                p.rect(row, if current { t.hover } else { fade(t.hover, hover) }, theme::RADIUS_SM);
+                let fill = if carried {
+                    t.active
+                } else if current {
+                    t.hover
+                } else {
+                    fade(t.hover, hover)
+                };
+                p.rect(row, fill, theme::RADIUS_SM);
                 let confirming = self.confirm_delete.as_deref() == Some(session.id.as_str());
                 let working = self.threads.get(&session.id).is_some_and(|thread| thread.busy);
                 // Right: a delete button while hovered, a pulse while it works.
                 let mut on_control = false;
-                let right = if hovered || confirming {
+                let right = if (hovered && !carried) || confirming {
                     let bin = Rect::new(row.right() - 26.0, row.y + 3.0, 22.0, 22.0);
                     on_control = bin.contains(ui.mouse);
                     let color = if confirming {
@@ -176,8 +197,13 @@ impl Shell {
                 let color =
                     if confirming { t.danger } else { mix(t.text_muted, t.text, if current { 1.0 } else { hover }) };
                 p.text(&title, row.x + 10.0, row.y + (row.h - title.height()) * 0.5, color);
-                if hovered {
+                if carried {
+                    ui.cursor = CursorIcon::Grabbing;
+                } else if hovered {
                     ui.cursor = CursorIcon::Pointer;
+                    if !on_control && ui.pressed {
+                        held = Some(session.id.clone());
+                    }
                     if !on_control && ui.clicked(row) {
                         open = Some(session.id.clone());
                     }
@@ -196,6 +222,23 @@ impl Shell {
             p.gradient(Rect::new(list.x, list.bottom() - 16.0, list.w, 16.0), fade(t.panel, 0.0), t.panel, 0.0);
         }
         p.set_clip(clip);
+
+        // A press takes hold of a session; moved far enough it is dragged, and where it is let go
+        // is its place from then on.
+        if let Some(session) = held {
+            self.drag = Some((session, false));
+        }
+        if let Some((session, moved)) = self.drag.take() {
+            if let Some(place) = place {
+                self.move_session(&session, place);
+            }
+            if ui.down {
+                let moved = moved || (ui.mouse.1 - ui.press_pos.1).abs() > DRAG_SLACK;
+                self.drag = Some((session, moved));
+            } else if moved {
+                self.keep_order(actions);
+            }
+        }
 
         // A click that is not on the armed delete button disarms it.
         if ui.released && delete.is_none() {

@@ -1,7 +1,7 @@
 //! The app's one screen: agents and their sessions in the sidebar, the open
 //! session on the canvas beside it, the side panel (usage and git) right of
-//! that, and the agent editor, the settings, the statistics, the spotlight
-//! and a file's diff as modals over all of it.
+//! that, and the agent editor, the settings, the statistics, the spotlight,
+//! a file's diff and a picture opened whole as modals over all of it.
 //!
 //! The shell owns what the user sees and edits (the config, the agents, the
 //! open sessions) and asks the app for everything that needs a thread, a
@@ -13,7 +13,9 @@ mod call;
 mod composer;
 mod menu;
 mod panel;
+mod picture;
 mod question;
+mod queue;
 mod settings;
 mod sidebar;
 #[cfg(test)]
@@ -72,6 +74,8 @@ enum Modal {
     Stats(Box<StatsView>),
     /// A changed file's diff.
     Diff(Box<DiffView>),
+    /// A picture of the conversation, whole: the file it is.
+    Picture(String),
 }
 
 /// The models an API connection offers, as far as the app knows.
@@ -104,7 +108,8 @@ pub struct Shell {
     /// The user's settings; the app saves them when asked to.
     pub config: Config,
     agents: Vec<Agent>,
-    /// Every saved session, newest first.
+    /// Every saved session, in the order the sidebar lists them: the
+    /// user's own, a new one on top.
     sessions: Vec<SessionSummary>,
     /// Sessions opened since the app started, by id.
     threads: HashMap<String, Thread>,
@@ -139,12 +144,19 @@ pub struct Shell {
     was_on_call: bool,
     /// The folder the next new session will work in.
     pending_folder: String,
+    /// The session the mouse holds in the sidebar, and whether it has been
+    /// moved far enough to be a drag and not a click.
+    drag: Option<(String, bool)>,
 }
 
 impl Shell {
-    /// The interface over the saved `config`, `agents` and `sessions`.
-    pub fn new(config: Config, mut agents: Vec<Agent>, sessions: Vec<SessionSummary>) -> Self {
+    /// The interface over the saved `config`, `agents` and `sessions`
+    /// (newest first, as the store lists them).
+    pub fn new(config: Config, mut agents: Vec<Agent>, mut sessions: Vec<SessionSummary>) -> Self {
         agents.sort_by_key(|a| a.created);
+        // The order the user dragged them into; one started since stays before them, newest first.
+        let places: HashMap<&str, usize> = config.session_order.iter().map(String::as_str).zip(1..).collect();
+        sessions.sort_by_key(|session| places.get(session.id.as_str()).copied().unwrap_or(0));
         let agent = config.last_agent.clone().filter(|id| agents.iter().any(|a| a.id == *id));
         let agent = agent.or_else(|| agents.first().map(|a| a.id.clone()));
         // With nobody to talk to yet, the first thing to do is make someone.
@@ -172,6 +184,7 @@ impl Shell {
             confirm_delete: None,
             was_on_call: false,
             pending_folder: String::new(),
+            drag: None,
         }
     }
 
@@ -318,7 +331,7 @@ impl Shell {
             actions.push(Action::SaveConfig);
         }
         self.pending_folder = self.selected_agent().map(|agent| agent.workdir.clone()).unwrap_or_default();
-        match self.sessions.iter().find(|s| s.agent == agent).map(|s| s.id.clone()) {
+        match self.latest_session(agent).map(|session| session.id.clone()) {
             Some(latest) => self.open_session(&latest, actions),
             None => self.current = None,
         }
@@ -458,40 +471,75 @@ impl Shell {
 
     /// Sends `text`, with the `files` that go with it, to the selected agent
     /// in the open session, starting one if none is open. `spoken` when it
-    /// was said on a call.
+    /// was said on a call. While the agent works, a typed message waits to
+    /// be read at its next step (`queue.rs`).
     fn send(&mut self, text: &str, spoken: bool, files: Vec<String>, actions: &mut Vec<Action>) {
         let text = text.trim();
-        let Some(mut agent) = self.selected_agent().cloned() else { return };
         if text.is_empty() && files.is_empty() {
             return;
         }
+        let session = match self.current.clone() {
+            Some(session) => session,
+            // Nothing to clear, and no session for a message that cannot go anywhere yet.
+            None if text == "/clear" => return,
+            None => {
+                let Some(agent) = self.selected_agent().cloned() else { return };
+                let owner = agent.id.clone();
+                if self.ready(agent).is_none() {
+                    return;
+                }
+                let mut session = Session::new(&owner);
+                session.workdir.clone_from(&self.pending_folder);
+                let id = session.id.clone();
+                self.sessions.insert(0, session.summary());
+                self.threads.insert(id.clone(), Thread::new(session));
+                self.current = Some(id.clone());
+                id
+            }
+        };
+        if let Some(call) = &mut self.call {
+            call.hold = false;
+            if spoken {
+                call.session.clone_from(&session);
+            }
+        }
+        let Some(thread) = self.threads.get_mut(&session) else { return };
+        if thread.busy {
+            if spoken || thread.stopping {
+                // Said while the agent was still stopping: sent once it has.
+                thread.queued = Some((text.to_owned(), spoken, files));
+            } else if text == "/clear" {
+                // Once the turn has stopped.
+                self.stop(actions);
+                if let Some(thread) = self.threads.get_mut(&session) {
+                    thread.queued = Some((text.to_owned(), false, Vec::new()));
+                }
+            } else {
+                self.follow_up(&session, text, files, actions);
+            }
+            return;
+        }
+        self.send_to(&session, text, &files, (spoken, false), actions);
+    }
+
+    /// The agent ready to answer, with the model and effort it answers
+    /// with, and its connection; `None` (with a notice) when it cannot.
+    fn ready(&mut self, mut agent: Agent) -> Option<(Agent, Connection)> {
         let Some(connection) = self.connection(&agent) else {
             self.notify(format!("{}'s provider no longer exists. Pick another in the top bar.", agent.name));
-            return;
+            return None;
         };
-        // The app's own commands; every other one is the provider's to run.
-        if !spoken && text == "/clear" {
-            self.new_session(actions);
-            return;
-        }
-        if !spoken && text.starts_with("/compact") && connection.kind != ConnectionKind::ClaudeAgent {
-            self.notify(format!(
-                "{} summarises the conversation by itself when its context fills up.",
-                connection.name
-            ));
-            return;
-        }
         if connection.kind == ConnectionKind::ClaudeAgent {
             match self.claude.get(&connection.id) {
                 Some(Account::Missing) => {
                     self.notify(
                         "Claude Code is not installed. Install it and sign in, or pick an API provider.".into(),
                     );
-                    return;
+                    return None;
                 }
                 Some(Account::Ready(info)) if info.account.email.is_empty() => {
                     self.notify(format!("{} is not signed in. Sign in under Settings, Providers.", connection.name));
-                    return;
+                    return None;
                 }
                 _ => {}
             }
@@ -506,43 +554,60 @@ impl Shell {
                         "Pick a model for {} first: the model menu is under the message box.",
                         agent.name
                     ));
-                    return;
+                    return None;
                 }
             }
         }
         // It thinks as hard as was chosen, or as its model usually does.
         agent.effort =
             Self::effort_in_use(connection.kind, &self.model_in_use(&connection, &agent.model), &agent.effort);
-        let session = self.current.clone().unwrap_or_else(|| {
-            let mut session = Session::new(&agent.id);
-            session.workdir.clone_from(&self.pending_folder);
-            let id = session.id.clone();
-            self.sessions.insert(0, session.summary());
-            self.threads.insert(id.clone(), Thread::new(session));
-            self.current = Some(id.clone());
-            id
-        });
-        if let Some(call) = &mut self.call {
-            call.hold = false;
-            if spoken {
-                call.session.clone_from(&session);
-            }
+        Some((agent, connection))
+    }
+
+    /// Starts a turn in `session`, whose agent is free, answering `text`
+    /// and the `files` that go with it: `spoken` when it was said on a call,
+    /// `interrupted` when the agent was stopped for it. Returns whether it
+    /// went (a notice says why not).
+    fn send_to(
+        &mut self,
+        session: &str,
+        text: &str,
+        files: &[String],
+        (spoken, interrupted): (bool, bool),
+        actions: &mut Vec<Action>,
+    ) -> bool {
+        // The app's own command; every other one is the provider's to run.
+        if text == "/clear" {
+            self.clear_session(session, actions);
+            return true;
+        }
+        let Some(thread) = self.threads.get(session) else { return false };
+        // A session still loading has no agent named yet: it is the selected one's.
+        let owner = Some(thread.session.agent.as_str()).filter(|agent| !agent.is_empty()).or(self.agent.as_deref());
+        let Some(agent) = self.agents.iter().find(|agent| Some(agent.id.as_str()) == owner).cloned() else {
+            return false;
+        };
+        let Some((agent, connection)) = self.ready(agent) else { return false };
+        if text.starts_with("/compact") && connection.kind != ConnectionKind::ClaudeAgent {
+            self.notify(format!(
+                "{} summarises the conversation by itself when its context fills up.",
+                connection.name
+            ));
+            return true;
         }
         let model = self.model_info(&connection.id, &agent.model).cloned();
-        let Some(thread) = self.threads.get_mut(&session) else { return };
-        if thread.busy {
-            // Said while the agent was still stopping: sent once it has.
-            thread.queued = Some((text.to_owned(), spoken, files));
-            return;
-        }
+        let Some(thread) = self.threads.get_mut(session) else { return false };
         // The agent is told once when a call begins and once when it is over.
         let announced = self.call.as_mut().is_some_and(|call| std::mem::replace(&mut call.announced, true));
-        let note = match (spoken, announced, self.was_on_call) {
+        let call_note = match (spoken, announced, self.was_on_call) {
             (true, false, _) => CALL_STARTED,
             (false, _, true) => CALL_ENDED,
             _ => "",
         };
         self.was_on_call = spoken;
+        let stopped_note = if interrupted { Self::interrupting_note(connection.kind, text) } else { "" };
+        let note =
+            [call_note, stopped_note].into_iter().filter(|note| !note.is_empty()).collect::<Vec<_>>().join("\n\n");
         let mut sent = if note.is_empty() { text.to_owned() } else { format!("{note}\n\n{text}") };
         // A Claude account that never saw this conversation is told what was said.
         let foreign = thread.session.remote.is_empty() || thread.session.account != connection.id;
@@ -553,11 +618,17 @@ impl Shell {
                     "(You are taking over a conversation. What was said so far:)\n\n{earlier}\n\n(Now the user says:)\n\n{sent}"
                 );
             }
+            // A process may still run on the account it started with (it was
+            // busy when the account was switched): this message, and the
+            // limits it reports, belong to the new one, which starts its own.
+            if !thread.session.account.is_empty() && thread.session.account != connection.id {
+                actions.push(Action::CloseLive(session.to_owned()));
+            }
             thread.session.remote.clear();
             thread.session.account.clone_from(&connection.id);
         }
-        thread.session.prompt(text, note);
-        thread.session.attach(&files);
+        thread.session.prompt(text, &note);
+        thread.session.attach(files);
         thread.begin_turn();
         actions.push(Action::SaveSession(Box::new(thread.session.clone())));
         actions.push(Action::Send {
@@ -567,14 +638,65 @@ impl Shell {
             session: Box::new(thread.session.clone()),
             text: sent,
         });
-        self.touch_summary(&session);
+        self.touch_summary(session);
+        true
     }
 
-    /// Refreshes the sidebar's entry for `session` from its messages.
+    /// `/clear`: the session keeps its place, its name in the sidebar and
+    /// its folder, and starts over: its messages are deleted and the agent
+    /// begins with an empty context (a Claude account's process too).
+    fn clear_session(&mut self, session: &str, actions: &mut Vec<Action>) {
+        let Some(thread) = self.threads.get_mut(session).filter(|thread| thread.loaded && !thread.busy) else {
+            return;
+        };
+        let old = &thread.session;
+        let fresh = Session {
+            id: old.id.clone(),
+            agent: old.agent.clone(),
+            created: old.created,
+            workdir: old.workdir.clone(),
+            window: old.window,
+            ..Session::new(&old.agent)
+        };
+        *thread = Thread::new(fresh);
+        actions.push(Action::CloseLive(session.to_owned()));
+        actions.push(Action::SaveSession(Box::new(thread.session.clone())));
+        self.touch_summary(session);
+    }
+
+    /// Refreshes the sidebar's entry for `session` from its messages. It
+    /// stays where it is: sessions at work must not trade places.
     fn touch_summary(&mut self, session: &str) {
         let Some(summary) = self.threads.get(session).map(|thread| thread.session.summary()) else { return };
-        self.sessions.retain(|s| s.id != session);
-        self.sessions.insert(0, summary);
+        match self.sessions.iter_mut().find(|known| known.id == session) {
+            Some(known) => *known = summary,
+            None => self.sessions.insert(0, summary),
+        }
+    }
+
+    /// The session of `agent` that changed last.
+    fn latest_session(&self, agent: &str) -> Option<&SessionSummary> {
+        self.sessions.iter().filter(|session| session.agent == agent).max_by_key(|session| session.updated)
+    }
+
+    /// Moves `session` to the `place`th spot among its agent's sessions, as a drag in the sidebar does.
+    fn move_session(&mut self, session: &str, place: usize) {
+        let Some(from) = self.sessions.iter().position(|s| s.id == session) else { return };
+        let agent = &self.sessions[from].agent;
+        let mut spots = self.sessions.iter().enumerate().filter(|(_, s)| s.agent == *agent).map(|(index, _)| index);
+        // Taken out and put in where the one at that spot is: before it going up, after it going down.
+        if let Some(to) = spots.clone().nth(place).or_else(|| spots.next_back())
+            && to != from
+        {
+            let moved = self.sessions.remove(from);
+            self.sessions.insert(to, moved);
+        }
+    }
+
+    /// The sessions' order is the user's from now on: it is kept with the settings.
+    fn keep_order(&mut self, actions: &mut Vec<Action>) {
+        self.config.session_order = self.sessions.iter().map(|session| session.id.clone()).collect();
+        actions.push(Action::SaveConfig);
     }
 
     /// Stops the open session's turn, and what it was saying.
@@ -628,7 +750,11 @@ impl Shell {
             record.provider_name = self.config.connection(&record.provider).map(|c| c.name).unwrap_or_default();
             actions.push(Action::LogUsage(Box::new(record)));
         }
-        let mut resend = None;
+        // Claude Code started a turn by itself: a follow-up of its own queue, or a background task that ended.
+        if !thread.busy && matches!(event, AgentEvent::ReplyStarted | AgentEvent::FollowUp { .. }) {
+            thread.begin_turn();
+        }
+        let (mut resend, mut give_back, mut send_waiting) = (None, false, None);
         let ended = matches!(event, AgentEvent::TurnEnded { .. });
         match event {
             AgentEvent::Text(text) if speaking => actions.push(Action::Say(text)),
@@ -657,17 +783,46 @@ impl Shell {
             AgentEvent::Status(status) => thread.status = status,
             AgentEvent::Summarized(_) => thread.invalidate(),
             AgentEvent::Remote(_) => actions.push(Action::SaveSession(Box::new(thread.session.clone()))),
+            // Taken in: it is in the conversation now.
+            AgentEvent::FollowUp { id, .. } => thread.follow_ups.retain(|waiting| waiting.message.id != id),
+            AgentEvent::Queued(count) => thread.more = count,
             AgentEvent::TurnEnded { problem } => {
+                let (hurried, stopped) = (std::mem::take(&mut thread.hurry), thread.stopping);
                 thread.end_turn(problem);
                 actions.push(Action::SaveSession(Box::new(thread.session.clone())));
-                actions.push(Action::Attention);
                 if speaking {
                     actions.push(Action::FinishReply);
                 }
                 resend = thread.queued.take();
+                if std::mem::take(&mut thread.more) > 0 {
+                    // Claude Code answers what was sent meanwhile next, in a turn of its own.
+                    thread.begin_turn();
+                } else {
+                    actions.push(Action::Attention);
+                    // What the turn did not take in was not read: it goes again, or back to the user.
+                    for waiting in &mut thread.follow_ups {
+                        waiting.sent = false;
+                    }
+                    if !thread.follow_ups.is_empty() {
+                        if stopped && !hurried { give_back = true } else { send_waiting = Some(hurried) }
+                    }
+                }
             }
-            AgentEvent::Disconnected(_) => actions.push(Action::CloseLive(session.to_owned())),
+            AgentEvent::Disconnected(_) => {
+                actions.push(Action::CloseLive(session.to_owned()));
+                // Gone while a turn of its queue was to come: it never will.
+                if thread.busy {
+                    thread.end_turn(Some("The Claude Agent stopped unexpectedly.".to_owned()));
+                    thread.more = 0;
+                    for waiting in &mut thread.follow_ups {
+                        waiting.sent = false;
+                    }
+                }
+            }
             _ => {}
+        }
+        if give_back {
+            self.restore_follow_ups(session);
         }
         self.touch_summary(session);
         // The turn may have changed files: the side panel reads the repository again.
@@ -679,6 +834,11 @@ impl Shell {
         {
             self.send(&text, spoken, files, actions);
         }
+        if let Some(interrupted) = send_waiting {
+            self.send_follow_ups(session, interrupted, actions);
+        }
+        // While its tools run, the agent is handed what the user sent meanwhile.
+        self.hand_over(session, actions);
     }
 
     /// Stores a changed agent; sessions of it that are idle start their
@@ -782,8 +942,6 @@ impl Shell {
         if side > 0.0 {
             let panel = Rect::new(canvas.right() + theme::GAP, canvas.y, panel::WIDTH, canvas.h);
             self.draw_panel(p, ui, panel, actions);
-        } else {
-            self.git.focused = false;
         }
 
         ui.blocker = list;
@@ -823,6 +981,7 @@ impl Shell {
             },
             Modal::Stats(stats) => !stats.draw(p, ui, view, self),
             Modal::Diff(diff) => !diff.draw(p, ui, view),
+            Modal::Picture(path) => !picture::draw(p, ui, view, path),
         };
         // Closing it puts away a list it opened; `delete_agent` may have opened another modal.
         if keep {
@@ -859,6 +1018,10 @@ impl Shell {
             && let Some(thread) = self.threads.get_mut(&session)
         {
             thread.draw(p, ui, area, (&agent.name, color), actions);
+            // A picture that was clicked opens whole, over the screen.
+            if let Some(picture) = thread.clicked_picture.take() {
+                self.modal = Some(Modal::Picture(picture));
+            }
         }
         p.set_clip(clip);
         self.draw_slash(p, ui);
@@ -975,7 +1138,6 @@ impl Shell {
                 editor.insert(&title);
                 editor.select_all();
                 self.renaming = Some(editor);
-                self.git.focused = false;
                 ui.last_edit = ui.time;
             }
         }
@@ -1094,7 +1256,7 @@ impl Shell {
                         true
                     }
                 },
-                Modal::Stats(_) | Modal::Diff(_) => escape,
+                Modal::Stats(_) | Modal::Diff(_) | Modal::Picture(_) => escape,
             };
             if !close {
                 self.modal = Some(modal);
@@ -1132,15 +1294,6 @@ impl Shell {
                 self.finish_rename(enter, actions);
             } else {
                 edit_key(editor, event, mods, clipboard);
-            }
-        } else if self.git.focused {
-            // The commit message in the side panel.
-            if escape {
-                self.git.focused = false;
-            } else if enter {
-                self.commit(actions);
-            } else {
-                edit_key(&mut self.git.message, event, mods, clipboard);
             }
         } else if self.call.is_some() {
             if escape {
@@ -1202,12 +1355,18 @@ impl Shell {
             Key::Named(NamedKey::Enter) if asking && empty => self.decide(Verdict::Allow, actions),
             Key::Named(NamedKey::Escape) if asking => self.decide(Verdict::Deny(String::new()), actions),
             Key::Named(NamedKey::Escape) => self.stop(actions),
+            // While the agent works, Enter puts the message in line for its next step,
+            // and Ctrl/Cmd+Enter has it read at once.
             Key::Named(NamedKey::Enter) if !mods.shift_key() => {
-                if self.thread().is_some_and(|thread| thread.busy) {
-                    return;
-                }
+                let busy = self.thread().is_some_and(|thread| thread.busy);
                 let (text, files) = self.take_draft();
                 self.send(&text, false, files, actions);
+                if busy
+                    && primary
+                    && let Some(session) = self.current.clone()
+                {
+                    self.hurry(&session, actions);
+                }
             }
             _ => self.composer.key(event, mods, clipboard),
         }
@@ -1221,10 +1380,9 @@ impl Shell {
             Some(Modal::Agent(form)) => form.commit(text),
             Some(Modal::Settings(settings)) => settings.commit(text),
             Some(Modal::Spotlight(spotlight)) => spotlight.insert(text, actions),
-            Some(Modal::Stats(_) | Modal::Diff(_)) => {}
+            Some(Modal::Stats(_) | Modal::Diff(_) | Modal::Picture(_)) => {}
             None => match &mut self.renaming {
                 Some(editor) => editor.insert(text),
-                None if self.git.focused => self.git.message.insert(text),
                 None if answering => {
                     if let Some(form) = &mut self.question {
                         form.insert(text);
@@ -1238,7 +1396,7 @@ impl Shell {
 
     /// Text an input method is composing, with its cursor.
     pub fn ime_preedit(&mut self, text: String, cursor: Option<(usize, usize)>) {
-        if self.modal.is_none() && self.renaming.is_none() && !self.git.focused {
+        if self.modal.is_none() && self.renaming.is_none() {
             self.composer.preedit = if text.is_empty() { None } else { Some((text, cursor)) };
         }
     }
@@ -1342,6 +1500,8 @@ fn folder_label(folder: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use atroxabot_core::Entry;
+
     use super::*;
 
     #[test]
@@ -1406,19 +1566,125 @@ mod tests {
         assert!(shell.sessions.is_empty() && matches!(shell.modal, Some(Modal::Agent(_))), "nobody left: make someone");
     }
 
+    #[test]
+    fn sessions_keep_their_place_until_the_user_moves_them() {
+        let (scout, other) = (Agent::new("Scout"), Agent::new("Other"));
+        let summary = |id: &str, agent: &Agent, updated| SessionSummary {
+            id: id.into(),
+            agent: agent.id.clone(),
+            updated,
+            ..SessionSummary::default()
+        };
+        // As the store lists them: newest first.
+        let saved = vec![
+            summary("c", &scout, 30),
+            summary("x", &other, 25),
+            summary("b", &scout, 20),
+            summary("a", &scout, 10),
+        ];
+        let order = |shell: &Shell| shell.sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>().join(" ");
+        let mut shell = Shell::new(Config::default(), vec![scout.clone(), other.clone()], saved.clone());
+        let mut actions = Vec::new();
+        signed_in(&mut shell);
+        shell.start(&mut actions);
+        assert_eq!(shell.current.as_deref(), Some("c"), "the one that changed last opens");
+
+        // A session at work stays where it is, however much it says.
+        shell
+            .threads
+            .insert("a".into(), Thread::new(Session { id: "a".into(), agent: scout.id.clone(), ..Session::default() }));
+        shell.agent_event("a", AgentEvent::Text("Still here.".into()), &mut actions);
+        assert_eq!(order(&shell), "c x b a");
+        assert_eq!(shell.sessions[3].preview, "Still here.", "though what it shows is current");
+
+        // A drag moves one among its agent's sessions only, down or up, and never past the ends.
+        shell.move_session("c", 2);
+        assert_eq!(order(&shell), "x b a c");
+        shell.move_session("c", 0);
+        assert_eq!(order(&shell), "x c b a");
+        shell.move_session("b", 9);
+        assert_eq!(order(&shell), "x c a b");
+        shell.move_session("gone", 0);
+        actions.clear();
+        shell.keep_order(&mut actions);
+        assert!(matches!(&actions[..], [Action::SaveConfig]));
+        assert_eq!(shell.config.session_order, ["x", "c", "a", "b"]);
+
+        // The next start has them in that order, with one started since on top; the latest still opens.
+        let mut saved = saved;
+        saved.insert(0, summary("new", &scout, 40));
+        saved[1].updated = 5;
+        let mut again = Shell::new(shell.config.clone(), vec![scout, other], saved);
+        assert_eq!(order(&again), "new x c a b");
+        again.start(&mut Vec::new());
+        assert_eq!(again.current.as_deref(), Some("new"));
+    }
+
     /// Draws one frame of `shell` at 1440 by 900 with the mouse at `mouse`,
     /// released there this frame when `click`.
     fn frame(shell: &mut Shell, ui: &mut Ui, mouse: (f32, f32), click: bool) {
+        (ui.mouse, ui.press_pos, ui.released) = (mouse, mouse, click);
+        paint(shell, ui);
+    }
+
+    /// Draws one frame of `shell` at 1440 by 900 with the mouse as `ui` has it.
+    fn paint(shell: &mut Shell, ui: &mut Ui) {
         let fonts = crate::text::Fonts::load();
         let (mut atlas, mut images) = (crate::text::GlyphAtlas::default(), crate::image::ImageAtlas::default());
         let mut instances = Vec::new();
         let view = Rect::new(0.0, 0.0, 1440.0, 900.0);
         let palette = Scheme::Black.palette();
         ui.begin(0.016, 1.0);
-        (ui.mouse, ui.press_pos, ui.released) = (mouse, mouse, click);
         let mut p = Painter::new(&fonts, (&mut atlas, &mut images), &mut instances, 1.0, view, palette);
         shell.draw(&mut p, ui, view, Scheme::Black, &mut Vec::new());
         ui.end();
+    }
+
+    #[test]
+    fn a_session_is_dragged_to_its_place_and_a_click_still_opens_one() {
+        let scout = Agent::new("Scout");
+        let summary = |id: &str, updated| SessionSummary {
+            id: id.into(),
+            agent: scout.id.clone(),
+            title: id.into(),
+            updated,
+            ..SessionSummary::default()
+        };
+        let saved = vec![summary("c", 30), summary("b", 20), summary("a", 10)];
+        let mut shell = Shell::new(Config::default(), vec![scout.clone()], saved);
+        let order = |shell: &Shell| shell.sessions.iter().map(|s| s.id.clone()).collect::<Vec<_>>().join(" ");
+        let mut ui = Ui::default();
+        // The sessions hang under their agent and "New session": rows of 30, the first from 154 down.
+        let row = |index: u8| (120.0, 168.0 + 30.0 * f32::from(index));
+
+        // Held and moved a hair, it is still a click: nothing moves.
+        ui.mouse = row(0);
+        ui.press(1.0);
+        paint(&mut shell, &mut ui);
+        ui.mouse.1 += 2.0;
+        paint(&mut shell, &mut ui);
+        assert!(matches!(&shell.drag, Some((session, false)) if session == "c"));
+        // Carried down two rows, the others make room; let go, that is its place.
+        ui.mouse = row(2);
+        paint(&mut shell, &mut ui);
+        paint(&mut shell, &mut ui);
+        assert_eq!(order(&shell), "b a c");
+        ui.mouse = row(1);
+        paint(&mut shell, &mut ui);
+        assert_eq!(order(&shell), "b c a");
+        (ui.down, ui.released) = (false, true);
+        paint(&mut shell, &mut ui);
+        assert_eq!(shell.config.session_order, ["b", "c", "a"], "the order is kept with the settings");
+        assert!(shell.drag.is_none() && shell.current.is_none(), "letting go opens nothing");
+
+        // A plain click opens the session under it, and leaves the order alone.
+        ui.mouse = row(0);
+        ui.press(3.0);
+        paint(&mut shell, &mut ui);
+        (ui.down, ui.released) = (false, true);
+        paint(&mut shell, &mut ui);
+        assert_eq!((shell.current.as_deref(), order(&shell).as_str()), (Some("b"), "b c a"));
+        assert!(shell.drag.is_none());
     }
 
     #[test]
@@ -1588,5 +1854,218 @@ mod tests {
         let (text, remote, account) = taken_over.expect("the message is sent");
         assert!(text.contains("User: Hello") && text.contains("You: Hi there.") && text.ends_with("And now?"));
         assert_eq!((remote.as_str(), account.as_str()), ("", "work"));
+    }
+
+    /// A shell whose agent (on a Claude account) is answering "Fix the bug": the session's id.
+    fn working(shell: &mut Shell, actions: &mut Vec<Action>) -> String {
+        signed_in(shell);
+        shell.send("Fix the bug", false, Vec::new(), actions);
+        let session = shell.current.clone().expect("a session");
+        shell.agent_event(&session, AgentEvent::Remote("r1".into()), actions);
+        session
+    }
+
+    fn sent_texts(actions: &[Action]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| if let Action::Send { text, .. } = a { Some(text.clone()) } else { None })
+            .collect()
+    }
+
+    fn handed(actions: &[Action]) -> Vec<String> {
+        actions
+            .iter()
+            .filter_map(|a| if let Action::FollowUp { message, .. } = a { Some(message.text.clone()) } else { None })
+            .collect()
+    }
+
+    fn call(id: &str) -> AgentEvent {
+        AgentEvent::ToolCall(atroxabot_core::ToolUse { id: id.into(), name: "Bash".into(), ..Default::default() })
+    }
+
+    fn result(id: &str) -> AgentEvent {
+        AgentEvent::ToolResult { id: id.into(), output: "ok".into(), is_error: false }
+    }
+
+    fn taken(shell: &Shell, session: &str, text: &str) -> AgentEvent {
+        let id = shell.threads[session].follow_ups[0].message.id.clone();
+        AgentEvent::FollowUp { id, text: text.into(), note: String::new(), files: Vec::new() }
+    }
+
+    #[test]
+    fn a_message_sent_while_the_agent_works_is_read_at_its_next_step() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        let session = working(&mut shell, &mut actions);
+        actions.clear();
+        // Written while it thinks: it waits, and nothing is started.
+        shell.send("Also run the tests", false, Vec::new(), &mut actions);
+        assert!(sent_texts(&actions).is_empty() && handed(&actions).is_empty());
+        assert_eq!(shell.threads[&session].follow_ups.len(), 1);
+        // Its tools run: the agent is handed it, to read once they are done.
+        shell.agent_event(&session, AgentEvent::ReplyStarted, &mut actions);
+        shell.agent_event(&session, call("t1"), &mut actions);
+        assert_eq!(handed(&actions), ["Also run the tests"]);
+        actions.clear();
+        shell.agent_event(&session, result("t1"), &mut actions);
+        shell.agent_event(&session, call("t2"), &mut actions);
+        assert!(handed(&actions).is_empty(), "handed over once");
+        // Taken in: it leaves the line and stands in the conversation where the agent read it.
+        let event = taken(&shell, &session, "Also run the tests");
+        shell.agent_event(&session, event, &mut actions);
+        let thread = &shell.threads[&session];
+        assert!(thread.follow_ups.is_empty() && thread.busy);
+        assert!(
+            matches!(thread.session.entries.last(), Some(Entry::User { text, .. }) if text == "Also run the tests")
+        );
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        assert!(sent_texts(&actions).is_empty() && !shell.threads[&session].busy);
+    }
+
+    #[test]
+    fn what_was_not_read_goes_next_or_back_to_the_message_box() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        let session = working(&mut shell, &mut actions);
+        // The turn ends before a tool ran: what waits is the next message, two as one.
+        shell.send("First", false, Vec::new(), &mut actions);
+        shell.send("Second", false, vec!["C:\\shots\\a.png".into()], &mut actions);
+        actions.clear();
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        assert_eq!(sent_texts(&actions), ["First\n\nSecond"]);
+        assert!(shell.threads[&session].busy && shell.threads[&session].follow_ups.is_empty());
+        let last = shell.threads[&session].session.entries.last();
+        assert!(matches!(last, Some(Entry::User { files, .. }) if files.len() == 1));
+
+        // Claude Code answers one it was handed after this turn: the agent stays at work for it.
+        shell.agent_event(&session, call("t1"), &mut actions);
+        shell.send("Then commit", false, Vec::new(), &mut actions);
+        actions.clear();
+        shell.agent_event(&session, AgentEvent::Queued(1), &mut actions);
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        assert!(sent_texts(&actions).is_empty() && shell.threads[&session].busy, "not sent twice");
+        let event = taken(&shell, &session, "Then commit");
+        shell.agent_event(&session, event, &mut actions);
+        assert!(shell.threads[&session].follow_ups.is_empty());
+
+        // Stopped: one handed over and one still waiting both come back to be edited, and nothing runs.
+        shell.agent_event(&session, call("t2"), &mut actions);
+        shell.send("Use the other branch", false, Vec::new(), &mut actions);
+        shell.agent_event(&session, result("t2"), &mut actions);
+        shell.send("and rebase", false, Vec::new(), &mut actions);
+        shell.composer.editor.insert("half-written");
+        actions.clear();
+        shell.stop(&mut actions);
+        assert!(actions.iter().any(|a| matches!(a, Action::Stop(_))));
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: Some("aborted".into()) }, &mut actions);
+        assert!(sent_texts(&actions).is_empty() && !shell.threads[&session].busy);
+        assert_eq!(shell.composer.editor.text(), "Use the other branch\n\nand rebase\n\nhalf-written");
+        assert!(shell.threads[&session].follow_ups.is_empty());
+    }
+
+    #[test]
+    fn send_now_stops_the_step_and_the_agent_reads_it_at_once() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        let session = working(&mut shell, &mut actions);
+        shell.agent_event(&session, AgentEvent::Text("Thinking it over".into()), &mut actions);
+        shell.send("Stop, use the other file", false, Vec::new(), &mut actions);
+        actions.clear();
+        shell.hurry(&session, &mut actions);
+        assert_eq!(handed(&actions), ["Stop, use the other file"]);
+        assert!(actions.iter().any(|a| matches!(a, Action::Interrupt(s) if *s == session)));
+        assert!(!actions.iter().any(|a| matches!(a, Action::Stop(_))), "what was sent is kept");
+        // Claude Code answers it right after the interrupted step.
+        shell.agent_event(&session, AgentEvent::Queued(1), &mut actions);
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: Some("aborted".into()) }, &mut actions);
+        let thread = &shell.threads[&session];
+        assert!(thread.busy && !thread.hurry && !thread.stopping);
+        let reply =
+            thread.session.entries.iter().rev().find_map(|e| if let Entry::Reply(r) = e { Some(r) } else { None });
+        assert!(reply.is_some_and(|reply| reply.problem.is_empty()), "being stopped is no failure");
+
+        // When the engine only stopped (an API turn), the shell sends it as the next message.
+        let event = taken(&shell, &session, "Stop, use the other file");
+        shell.agent_event(&session, event, &mut actions);
+        shell.send("Quick", false, Vec::new(), &mut actions);
+        shell.hurry(&session, &mut actions);
+        actions.clear();
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        assert_eq!(sent_texts(&actions), ["Quick"], "a Claude account is not told: Claude Code marks it");
+    }
+
+    #[test]
+    fn clear_empties_the_session_in_place() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        let session = working(&mut shell, &mut actions);
+        shell.agent_event(&session, AgentEvent::Remote("r1".into()), &mut actions);
+        shell.agent_event(&session, AgentEvent::Text("Found it.".into()), &mut actions);
+        // Asked while it works: the turn stops first.
+        actions.clear();
+        shell.send("/clear", false, Vec::new(), &mut actions);
+        assert!(actions.iter().any(|a| matches!(a, Action::Stop(_))));
+        assert!(!shell.threads[&session].session.entries.is_empty());
+        actions.clear();
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        let thread = &shell.threads[&session];
+        assert!(
+            thread.session.entries.is_empty() && thread.session.remote.is_empty() && thread.session.title.is_empty()
+        );
+        assert_eq!((shell.current.as_deref(), shell.sessions.len()), (Some(session.as_str()), 1), "the same session");
+        assert!(actions.iter().any(|a| matches!(a, Action::CloseLive(s) if *s == session)), "a fresh context");
+        let saved =
+            |a: &Action| matches!(a, Action::SaveSession(saved) if saved.id == session && saved.entries.is_empty());
+        assert!(actions.iter().any(saved));
+        // The next message starts the conversation over, in that session.
+        actions.clear();
+        shell.send("Hello again", false, Vec::new(), &mut actions);
+        assert_eq!(sent_texts(&actions), ["Hello again"]);
+        assert_eq!(shell.threads[&session].session.title, "Hello again");
+    }
+
+    #[test]
+    fn the_plan_usage_is_of_the_account_the_top_bar_names() {
+        let mut config = Config::default();
+        config.connections.push(Connection {
+            id: "work".into(),
+            config_dir: "/accounts/work".into(),
+            ..Connection::claude_agent()
+        });
+        let mut shell = Shell::new(config, vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        shell.start(&mut actions);
+        signed_in(&mut shell);
+        let mut info = ClaudeInfo::default();
+        info.account.email = "me@work.example".into();
+        shell.claude_info("work", Ok(info));
+        shell.send("Hello", false, Vec::new(), &mut actions);
+        let session = shell.current.clone().unwrap();
+        assert_eq!(shell.limits_account().as_deref(), Some(Connection::CLAUDE_AGENT));
+
+        // Switched while the reply runs: the panel follows at once, before any message goes to it.
+        let mut agent = shell.selected_agent().unwrap().clone();
+        agent.connection = "work".into();
+        actions.clear();
+        shell.update_agent(agent, &mut actions);
+        assert_eq!(shell.limits_account().as_deref(), Some("work"));
+        assert!(!actions.iter().any(|a| matches!(a, Action::CloseLive(_))), "a busy session's process may finish");
+        // What the running reply reports is still the first account's.
+        let limits = Limits { at: 5, status: "allowed".into(), ..Limits::default() };
+        shell.agent_event(&session, AgentEvent::Limits(limits), &mut actions);
+        assert!(shell.limits.contains_key(Connection::CLAUDE_AGENT) && !shell.limits.contains_key("work"));
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+
+        // The next message does not go to the process still on the first account.
+        actions.clear();
+        shell.send("And now?", false, Vec::new(), &mut actions);
+        let closed = actions.iter().position(|a| matches!(a, Action::CloseLive(closed) if *closed == session));
+        let sent = actions.iter().position(|a| matches!(a, Action::Send { .. }));
+        assert!(matches!((closed, sent), (Some(closed), Some(sent)) if closed < sent), "closed, then sent");
+        // On the same account it simply carries on.
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        actions.clear();
+        shell.send("More", false, Vec::new(), &mut actions);
+        assert!(!actions.iter().any(|a| matches!(a, Action::CloseLive(_))));
     }
 }

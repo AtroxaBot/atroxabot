@@ -2,8 +2,8 @@
 //! as bubbles (with what they sent along), the agent's answer as Markdown,
 //! its reasoning folded away, and every tool call as a row that opens to
 //! show what went in and out. A subagent is a card in the conversation and
-//! a tab over it, where what it said and did reads like a conversation of
-//! its own.
+//! a row in the side panel's list: either opens what it said and did, which
+//! reads like a conversation of its own under a bar that leads back.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -16,6 +16,7 @@ use winit::window::CursorIcon;
 
 use super::elapsed;
 use super::menu::folder_name;
+use super::queue::Waiting;
 use super::widgets::Scroll;
 use crate::app::Action;
 use crate::doc::{Doc, DocPos, INK_MUTED, INK_TEXT};
@@ -54,20 +55,66 @@ fn agents<'a>(blocks: &'a [Block], out: &mut Vec<&'a ToolUse>) {
     }
 }
 
-/// The subagents that get a tab: those of the reply the open tab is in, or
-/// of the latest reply.
-fn tab_calls<'a>(entries: &'a [Entry], tab: Option<&str>) -> Vec<&'a ToolUse> {
-    let of = |entry: &'a Entry| {
-        let mut found = Vec::new();
-        if let Entry::Reply(reply) = entry {
-            agents(&reply.blocks, &mut found);
+/// The subagents of one turn (what the agent did between two of the user's
+/// messages): the turn the `open` one is in, or the latest.
+fn turn_agents<'a>(entries: &'a [Entry], open: Option<&str>) -> Vec<&'a ToolUse> {
+    let mut turns = vec![Vec::new()];
+    for entry in entries {
+        match entry {
+            Entry::User { .. } => turns.push(Vec::new()),
+            Entry::Reply(reply) => {
+                if let Some(turn) = turns.last_mut() {
+                    agents(&reply.blocks, turn);
+                }
+            }
+            _ => {}
         }
-        found
-    };
-    let replies = entries.iter().rev().filter(|entry| matches!(entry, Entry::Reply(_)));
-    match tab {
-        Some(tab) => replies.map(of).find(|calls| calls.iter().any(|call| call.id == tab)).unwrap_or_default(),
-        None => replies.map(of).next().unwrap_or_default(),
+    }
+    let holds = |turn: &Vec<&ToolUse>| open.is_some_and(|open| turn.iter().any(|call| call.id == open));
+    let at = turns.iter().position(holds).unwrap_or(turns.len() - 1);
+    turns.swap_remove(at)
+}
+
+/// Whether the subagent `call` started is still at work: its call has not
+/// returned or, for one sent to the background (whose call returns at
+/// once), its latest news is not of an end. The words are the ones
+/// `atroxabot_core`'s Claude engine writes into `activity`.
+fn at_work(call: &ToolUse) -> bool {
+    let ended = ["Done", "Failed", "Stopped"].iter().any(|end| call.activity.starts_with(end));
+    !ended && (call.output.is_none() || !call.activity.is_empty())
+}
+
+/// What a subagent is listed as: what it was started for, or else its kind.
+fn agent_label(call: &ToolUse) -> String {
+    let (kind, description, _) = agent_brief(call);
+    if description.is_empty() { kind } else { description }
+}
+
+/// A subagent of the turn, as the side panel lists it.
+pub(super) struct Subagent {
+    /// The id of the call that started it.
+    pub id: String,
+    /// What it was started for.
+    pub label: String,
+    /// Whether it is still at work.
+    pub running: bool,
+    /// Whether it failed.
+    pub failed: bool,
+    /// Whether it is the one open in the conversation's place.
+    pub open: bool,
+}
+
+/// How a subagent is doing, as a small mark centred on `at`: a pulsing dot
+/// while it works, a warning when it failed, its icon in `ink` otherwise.
+pub(super) fn agent_mark(p: &mut Painter, ui: &Ui, at: (f32, f32), (running, failed): (bool, bool), ink: Color) {
+    let t = p.theme;
+    if running {
+        let pulse = 0.5 + 0.5 * (ui.time * 4.0).sin();
+        p.rect(Rect::new(at.0 - 3.0, at.1 - 3.0, 6.0, 6.0), fade(t.text, 0.35 + 0.65 * pulse), 3.0);
+    } else if failed {
+        icon::draw(p, icon::ALERT, at, 12.0, t.danger);
+    } else {
+        icon::draw(p, icon::BOT, at, 12.0, ink);
     }
 }
 
@@ -155,15 +202,22 @@ pub(super) struct Thread {
     /// A message to send once the running turn has stopped: its words, whether
     /// it was spoken, and the files that go with it.
     pub queued: Option<(String, bool, Vec<String>)>,
+    /// Messages the user sent while the agent worked, oldest first, until
+    /// it takes them in (`queue.rs`).
+    pub follow_ups: Vec<Waiting>,
+    /// How many of them Claude Code answers next, in turns of their own.
+    pub more: u64,
+    /// The turn is being stopped so that the agent reads them at once.
+    pub hurry: bool,
     /// When the running turn started.
     pub started: Option<Instant>,
     /// The user stopped the running turn: how it ends is not a problem.
     pub stopping: bool,
-    /// The subagent whose tab is open, by the id of the call that started it.
-    pub tab: Option<String>,
-    /// The open tab's view, and whether it stays at the subagent's newest words.
-    tab_scroll: Scroll,
-    tab_follow: bool,
+    /// The subagent shown in the conversation's place, by the id of the call that started it.
+    pub sub: Option<String>,
+    /// That subagent's view, and whether it stays at its newest words.
+    sub_scroll: Scroll,
+    sub_follow: bool,
     scroll: Scroll,
     /// Not drawn yet: its first frame only measures, so it opens at its end.
     fresh: bool,
@@ -185,6 +239,8 @@ pub(super) struct Thread {
     drawn: usize,
     /// What the agent's task list says it is doing, while a turn runs.
     doing: String,
+    /// A picture of the conversation that was just clicked, for the shell to open whole.
+    pub clicked_picture: Option<String>,
 }
 
 impl Thread {
@@ -197,11 +253,14 @@ impl Thread {
             status: String::new(),
             asks: Vec::new(),
             queued: None,
+            follow_ups: Vec::new(),
+            more: 0,
+            hurry: false,
             started: None,
             stopping: false,
-            tab: None,
-            tab_scroll: Scroll::default(),
-            tab_follow: true,
+            sub: None,
+            sub_scroll: Scroll::default(),
+            sub_follow: true,
             scroll: Scroll::default(),
             fresh: true,
             follow: true,
@@ -213,6 +272,7 @@ impl Thread {
             order: Vec::new(),
             drawn: 0,
             doing: String::new(),
+            clicked_picture: None,
         }
     }
 
@@ -221,6 +281,13 @@ impl Thread {
         let mut thread = Self::new(Session { id: id.to_owned(), ..Session::default() });
         thread.loaded = false;
         thread
+    }
+
+    /// Whether a tool call of the agent's own is running (or waits for the
+    /// user's approval): what the user sends now, it reads once it is done.
+    pub fn tools_running(&self) -> bool {
+        let Some(Entry::Reply(reply)) = self.session.entries.last() else { return false };
+        reply.blocks.iter().any(|block| matches!(block, Block::Tool(call) if call.output.is_none()))
     }
 
     /// A turn starts: the view follows it.
@@ -354,8 +421,8 @@ impl Thread {
     }
 
     /// Draws the conversation in `area` and handles scrolling and clicks:
-    /// the whole of it, or the subagent whose tab is open. `agent` is the
-    /// agent's name and colour.
+    /// the whole of it, or the subagent that is open in its place. `agent`
+    /// is the agent's name and colour.
     pub fn draw(&mut self, p: &mut Painter, ui: &mut Ui, area: Rect, agent: (&str, Color), actions: &mut Vec<Action>) {
         let t = p.theme;
         if !self.loaded {
@@ -374,87 +441,71 @@ impl Thread {
         // The entries are taken out while they are drawn: drawing needs the
         // layout cache, which lives beside them.
         let entries = std::mem::take(&mut self.session.entries);
-        let calls = tab_calls(&entries, self.tab.as_deref());
-        let open = self.tab.as_deref().and_then(|tab| calls.iter().find(|call| call.id == tab).copied());
-        if open.is_none() {
-            self.tab = None;
+        let calls = turn_agents(&entries, self.sub.as_deref());
+        let open = self.sub.as_deref().and_then(|sub| calls.iter().find(|call| call.id == sub).copied());
+        if let Some(call) = open {
+            let body = self.draw_bar(p, ui, area, call);
+            let clip = p.push_clip(body);
+            self.draw_sub(p, ui, body, call, agent, actions);
+            p.set_clip(clip);
+        } else {
+            self.sub = None;
+            self.draw_main(p, ui, area, &entries, agent, actions);
         }
-        let body = if calls.is_empty() { area } else { self.draw_tabs(p, ui, area, &calls) };
-        let clip = p.push_clip(body);
-        match open {
-            Some(call) if self.tab.is_some() => self.draw_sub(p, ui, body, call, agent, actions),
-            _ => self.draw_main(p, ui, body, &entries, agent, actions),
-        }
-        p.set_clip(clip);
         self.session.entries = entries;
         self.order.truncate(self.drawn);
     }
 
-    /// Opens the tab of the subagent started by the call `id`; `None` goes back to the conversation.
-    fn open_tab(&mut self, id: Option<String>) {
-        self.tab = id;
-        self.tab_scroll.reset();
-        (self.tab_follow, self.selection) = (true, None);
+    /// Shows the subagent started by the call `id` in the conversation's place; `None` goes back to it.
+    pub fn open_agent(&mut self, id: Option<String>) {
+        self.sub = id;
+        self.sub_scroll.reset();
+        (self.sub_follow, self.selection) = (true, None);
     }
 
-    /// The tabs over the conversation: the conversation itself, then each
-    /// subagent of the turn. Returns what is left of `area` under them.
-    fn draw_tabs(&mut self, p: &mut Painter, ui: &mut Ui, area: Rect, calls: &[&ToolUse]) -> Rect {
+    /// The subagents of the turn (the open one's, or the latest), in the
+    /// order they were started, for the side panel's list.
+    pub fn subagents(&self) -> Vec<Subagent> {
+        let calls = turn_agents(&self.session.entries, self.sub.as_deref());
+        let listed = |call: &ToolUse| Subagent {
+            id: call.id.clone(),
+            label: agent_label(call),
+            running: self.busy && at_work(call),
+            failed: call.is_error,
+            open: self.sub.as_deref() == Some(call.id.as_str()),
+        };
+        calls.into_iter().map(listed).collect()
+    }
+
+    /// The bar over an open subagent: the way back to the conversation,
+    /// then which subagent this is and how it is doing. Returns what is
+    /// left of `area` under it.
+    fn draw_bar(&mut self, p: &mut Painter, ui: &mut Ui, area: Rect, call: &ToolUse) -> Rect {
         let t = p.theme;
         let strip = Rect::new(area.x, area.y, area.w, 40.0);
         let width = theme::COLUMN_WIDTH.min(area.w - 48.0);
-        let mut x = area.x + ((area.w - width) * 0.5).round() - 8.0;
-        let right = x + width + 16.0;
-        let mut pick = None;
-        let tabs = std::iter::once(None).chain(calls.iter().map(|call| Some(*call)));
-        for (index, call) in tabs.enumerate() {
-            let label = call.map_or_else(
-                || "Conversation".to_owned(),
-                |call| {
-                    let (kind, description, _) = agent_brief(call);
-                    if description.is_empty() { kind } else { description }
-                },
-            );
-            let mut label = p.layout(&label, theme::SMALL, None);
-            label.truncate(p.fonts, 170.0);
-            let running = call.is_some_and(|call| self.busy && call.output.is_none());
-            let chip = Rect::new(x, strip.y + 6.0, label.width() + if call.is_some() { 38.0 } else { 22.0 }, 28.0);
-            if chip.right() > right - 34.0 && index > 0 {
-                // No room for the rest: how many more there are.
-                let more = format!("+{}", calls.len() + 1 - index);
-                p.label(&more, theme::TINY, x + 6.0, strip.y + 13.0, t.text_faint);
-                break;
-            }
-            let selected = self.tab.as_deref() == call.map(|call| call.id.as_str());
-            let hovered = ui.hovered(chip);
-            let hover = ui.anim(id(("tab", index)), f32::from(u8::from(hovered)));
-            p.rect(chip, if selected { t.hover } else { fade(t.hover, hover * 0.7) }, theme::RADIUS_SM);
-            let ink = mix(t.text_faint, t.text, if selected { 1.0 } else { 0.35 + 0.65 * hover });
-            let mut left = chip.x + 11.0;
-            if let Some(call) = call {
-                let mark = (left + 5.0, chip.y + 14.0);
-                if running {
-                    let pulse = 0.5 + 0.5 * (ui.time * 4.0).sin();
-                    p.rect(Rect::new(mark.0 - 3.0, mark.1 - 3.0, 6.0, 6.0), fade(t.text, 0.35 + 0.65 * pulse), 3.0);
-                } else if call.is_error {
-                    icon::draw(p, icon::ALERT, mark, 12.0, t.danger);
-                } else {
-                    icon::draw(p, icon::BOT, mark, 12.0, ink);
-                }
-                left += 16.0;
-            }
-            p.text(&label, left, chip.y + (chip.h - label.height()) * 0.5, ink);
-            if hovered {
-                ui.cursor = CursorIcon::Pointer;
-                if ui.clicked(chip) {
-                    pick = Some(call.map(|call| call.id.clone()));
-                }
-            }
-            x = chip.right() + 4.0;
-        }
+        let x = area.x + ((area.w - width) * 0.5).round() - 8.0;
+        let back = p.layout("Conversation", theme::SMALL, None);
+        let chip = Rect::new(x, strip.y + 6.0, back.width() + 37.0, 28.0);
+        let hovered = ui.hovered(chip);
+        let hover = ui.anim(id("subagent-back"), f32::from(u8::from(hovered)));
+        p.rect(chip, fade(t.hover, hover), theme::RADIUS_SM);
+        let ink = mix(t.text_muted, t.text, hover);
+        icon::draw(p, icon::CHEVRON_LEFT, (chip.x + 14.0, chip.y + 14.0), 14.0, ink);
+        p.text(&back, chip.x + 26.0, chip.y + (chip.h - back.height()) * 0.5, ink);
+        let mark = (chip.right() + 19.0, chip.y + 14.0);
+        agent_mark(p, ui, mark, (self.busy && at_work(call), call.is_error), t.text_muted);
+        let mut label = p.layout(&agent_label(call), theme::SMALL, None);
+        label.truncate(p.fonts, (x + width + 16.0 - mark.0 - 11.0).max(0.0));
+        p.text(&label, mark.0 + 11.0, chip.y + (chip.h - label.height()) * 0.5, t.text);
         p.rect(Rect::new(area.x, strip.bottom() - 1.0, area.w, 1.0), t.border, 0.0);
-        if let Some(tab) = pick {
-            self.open_tab(tab);
+        if hovered {
+            ui.cursor = CursorIcon::Pointer;
+            if ui.clicked(chip) {
+                // The conversation is back with the next frame.
+                self.open_agent(None);
+                ui.animating = true;
+            }
         }
         Rect::new(area.x, strip.bottom(), area.w, area.h - strip.h)
     }
@@ -475,13 +526,13 @@ impl Thread {
         let x = area.x + ((area.w - width) * 0.5).round();
         let hovered = ui.hovered(area);
         if hovered && ui.scroll < 0.0 {
-            self.tab_follow = false;
+            self.sub_follow = false;
         }
         if self.selecting && ui.down && drag_past(ui, area) != 0.0 {
-            self.tab_scroll.nudge(drag_past(ui, area));
-            (self.tab_follow, ui.animating) = (false, true);
+            self.sub_scroll.nudge(drag_past(ui, area));
+            (self.sub_follow, ui.animating) = (false, true);
         }
-        let offset = self.tab_scroll.update(ui, hovered);
+        let offset = self.sub_scroll.update(ui, hovered);
         if ui.pressed && hovered {
             self.selection = None;
         }
@@ -495,7 +546,7 @@ impl Thread {
         if !brief.trim().is_empty() {
             y = self.draw_prompt(p, ui, ((base, BRIEF_KEY), &brief, &[]), (x, y, width));
         }
-        let live = self.busy && call.output.is_none();
+        let live = self.busy && at_work(call);
         y = self.draw_blocks(p, ui, (base, &call.sub, live), (x, y, width), agent, actions);
         if live && call.sub.is_empty() {
             y = self.draw_working(p, ui, (x, y), agent.1);
@@ -506,18 +557,18 @@ impl Thread {
             y += 28.0;
         }
         let content = y - top + 24.0 + 24.0;
-        self.tab_scroll.finish(ui, content, area.h);
-        if hovered && ui.scroll > 0.0 && self.tab_scroll.at_end() {
-            self.tab_follow = true;
+        self.sub_scroll.finish(ui, content, area.h);
+        if hovered && ui.scroll > 0.0 && self.sub_scroll.at_end() {
+            self.sub_follow = true;
         }
-        if live && self.tab_follow && !self.tab_scroll.at_end() {
-            self.tab_scroll.follow_end();
+        if live && self.sub_follow && !self.sub_scroll.at_end() {
+            self.sub_scroll.follow_end();
             ui.animating = true;
         }
         if self.busy {
             ui.animating = true;
         }
-        self.tab_scroll.bar(p, area, content);
+        self.sub_scroll.bar(p, area, content);
     }
 
     /// The whole conversation.
@@ -596,9 +647,9 @@ impl Thread {
         self.scroll.bar(p, area, content);
     }
 
-    /// The user's message: what they sent along (pictures as thumbnails,
-    /// other files as pills), then their words in a bubble, all on the
-    /// right. Returns where it ends.
+    /// The user's message: what they sent along (pictures as thumbnails, a
+    /// click on one opens it whole; other files as pills), then their words
+    /// in a bubble, all on the right. Returns where it ends.
     fn draw_prompt(
         &mut self,
         p: &mut Painter,
@@ -619,6 +670,11 @@ impl Thread {
                 if !matches!(p.image(file, frame, theme::RADIUS), Lookup::Ready(_)) {
                     p.bordered(frame, t.surface, theme::RADIUS, 1.0, t.border);
                     icon::draw(p, icon::IMAGE, (frame.x + wide * 0.5, frame.y + tall * 0.5), 18.0, t.text_faint);
+                } else if ui.hovered(frame) && p.clip().contains(ui.mouse) {
+                    ui.cursor = CursorIcon::Pointer;
+                    if ui.clicked(frame) {
+                        self.clicked_picture = Some((*file).clone());
+                    }
                 }
                 left += wide + gap;
             }
@@ -752,7 +808,7 @@ impl Thread {
 
     /// A subagent, as a card in the conversation: its kind, what it was
     /// started for, and what it is doing now or how it ended. A click opens
-    /// its tab.
+    /// it in the conversation's place.
     fn draw_agent(
         &mut self,
         p: &mut Painter,
@@ -778,7 +834,7 @@ impl Thread {
         let mut about = p.layout(&description, theme::SMALL, None);
         about.truncate(p.fonts, (card.w - name_w - 104.0).max(0.0));
         p.text(&about, card.x + 44.0 + name_w + 10.0, card.y + 9.0, t.text_muted);
-        let running = live && call.output.is_none();
+        let running = live && at_work(call);
         let doing = match (call.activity.as_str(), running, &call.output) {
             ("", true, _) => "Working…",
             ("", false, Some(_)) => "Done",
@@ -799,7 +855,8 @@ impl Thread {
         if hovered {
             ui.cursor = CursorIcon::Pointer;
             if ui.clicked(card) {
-                self.open_tab(Some(call.id.clone()));
+                self.open_agent(Some(call.id.clone()));
+                ui.animating = true;
             }
         }
         card.bottom() + 11.0
@@ -1000,6 +1057,57 @@ mod tests {
         assert_eq!(tool_icon("Task"), icon::BOT);
         assert_eq!((tool_icon("TaskUpdate"), tool_icon("TodoWrite")), (icon::LIST, icon::LIST));
         assert_eq!(tool_icon("mcp__thing__do"), icon::WRENCH);
+    }
+
+    #[test]
+    fn the_turns_subagents_are_listed_with_how_each_is_doing() {
+        let agent = |id: &str, about: &str, output: Option<&str>, activity: &str| {
+            Block::Tool(ToolUse {
+                id: id.into(),
+                name: "Agent".into(),
+                input: serde_json::json!({ "subagent_type": "Explore", "description": about }).to_string(),
+                output: output.map(str::to_owned),
+                activity: activity.into(),
+                ..ToolUse::default()
+            })
+        };
+        let reply = |blocks: Vec<Block>| Entry::Reply(Reply { blocks, ..Reply::default() });
+        let mut thread = Thread::new(Session::new("a"));
+        thread.session.prompt("first", "");
+        let earlier = agent("old", "", Some("found"), "Done · 1 tool call · 2.0k tokens · 3s");
+        thread.session.entries.push(reply(vec![earlier]));
+        thread.session.prompt("second", "");
+        thread.session.entries.push(reply(vec![
+            agent("a1", "Find the escapes", None, "Reading src/tokenizer.rs · 2 tool calls"),
+            agent("a2", "List the tests", Some("14 tests"), "Done · 3 tool calls · 28.8k tokens · 12s"),
+        ]));
+        // Sent to the background: its call returned at once, and it works on.
+        let background = agent("a3", "Run the tests", Some("Started."), "cargo test · 1 tool call");
+        thread.session.entries.push(reply(vec![background]));
+        thread.busy = true;
+        let listed = |thread: &Thread| -> Vec<(String, bool, bool)> {
+            thread.subagents().into_iter().map(|agent| (agent.label, agent.running, agent.open)).collect()
+        };
+        let row = |label: &str, running, open| (label.to_owned(), running, open);
+        assert_eq!(
+            listed(&thread),
+            [
+                row("Find the escapes", true, false),
+                row("List the tests", false, false),
+                row("Run the tests", true, false)
+            ],
+            "the latest turn's, across its replies"
+        );
+        thread.open_agent(Some("a2".into()));
+        assert_eq!(listed(&thread)[1], row("List the tests", false, true));
+        // One of an earlier turn, opened from its card, lists that turn's; with no description, its kind.
+        thread.open_agent(Some("old".into()));
+        assert_eq!(listed(&thread), [row("Explore", false, true)]);
+        // Nothing works once the turn is over.
+        thread.open_agent(None);
+        thread.busy = false;
+        assert!(thread.subagents().iter().all(|agent| !agent.running));
+        assert!(Thread::new(Session::new("a")).subagents().is_empty());
     }
 
     #[test]

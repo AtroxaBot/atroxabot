@@ -218,24 +218,6 @@ pub fn diff(folder: &Path, file: &GitFile) -> Result<String, String> {
     Ok(text)
 }
 
-/// Commits everything that changed, new files included.
-///
-/// # Errors
-/// What git complained about (nothing to commit, no author set, a hook).
-pub fn commit(folder: &Path, message: &str) -> Result<(), String> {
-    git(folder, &["add", "--all"])?;
-    git(folder, &["commit", "--message", message]).map(drop)
-}
-
-/// Pushes the branch, to `origin` under its own name if it tracks nothing yet.
-///
-/// # Errors
-/// What git complained about.
-pub fn push(folder: &Path, tracking: bool) -> Result<(), String> {
-    let args: &[&str] = if tracking { &["push"] } else { &["push", "--set-upstream", "origin", "HEAD"] };
-    git(folder, args).map(drop)
-}
-
 /// Checks out the local branch `branch`.
 ///
 /// # Errors
@@ -300,10 +282,6 @@ pub enum Job {
     Refresh,
     /// Read one file's diff.
     Diff(GitFile),
-    /// Commit everything with this message.
-    Commit(String),
-    /// Push the branch.
-    Push,
     /// Check out this branch.
     Switch(String),
 }
@@ -317,8 +295,6 @@ pub enum Report {
         status: Option<GitStatus>,
         /// What git complained about, if the job failed.
         problem: Option<String>,
-        /// Whether a commit went through.
-        committed: bool,
     },
     /// A file's diff.
     Diff {
@@ -332,15 +308,12 @@ pub enum Report {
 /// Does `job` in `folder` and reads the status again.
 #[must_use]
 pub fn run(folder: &Path, job: Job) -> Report {
-    let mut committed = false;
     let result = match job {
         Job::Diff(file) => return Report::Diff { text: diff(folder, &file), path: file.path },
         Job::Refresh => Ok(()),
-        Job::Commit(message) => commit(folder, &message).inspect(|()| committed = true),
-        Job::Push => push(folder, status(folder).is_some_and(|status| !status.upstream.is_empty())),
         Job::Switch(branch) => switch(folder, &branch),
     };
-    Report::Status { status: status(folder), problem: result.err(), committed }
+    Report::Status { status: status(folder), problem: result.err() }
 }
 
 #[cfg(test)]
@@ -410,7 +383,7 @@ mod tests {
 
     /// Against a real repository in a temporary folder; needs `git`.
     #[test]
-    fn a_repository_is_read_committed_and_switched() {
+    fn a_repository_is_read_and_switched() {
         let dir = std::env::temp_dir().join(format!("atroxabot-git-{}", crate::new_id()));
         std::fs::create_dir_all(&dir).expect("temp dir");
         if git(&dir, &["init", "--initial-branch=main"]).is_err() {
@@ -422,6 +395,10 @@ mod tests {
             git(&dir, &["config", key, value]).expect("config");
         }
         assert!(status(&std::env::temp_dir().join("atroxabot-no-such-folder")).is_none());
+        // Committing is the agent's to do; here it only makes the history the rest reads.
+        let commit = |message: &str| {
+            git(&dir, &["add", "--all"]).and_then(|_| git(&dir, &["commit", "--message", message])).map(drop)
+        };
 
         std::fs::write(dir.join("a.txt"), "one\ntwo\n").expect("write");
         std::fs::write(dir.join(".gitignore"), "built/\n").expect("write");
@@ -435,15 +412,14 @@ mod tests {
         assert_eq!(before.files, [GitFile { path: "a.txt".into(), change: Change::Added, added: 0, removed: 0 }]);
         assert!(diff(&dir, &before.files[0]).expect("diff").contains("+two"));
 
-        commit(&dir, "first").expect("commit");
+        commit("first").expect("commit");
         assert!(status(&dir).expect("status").files.is_empty());
-        assert!(commit(&dir, "nothing").is_err(), "nothing to commit is an error");
 
         std::fs::write(dir.join("a.txt"), "one\nthree\nfour\n").expect("write");
         let changed = status(&dir).expect("status");
         assert_eq!(changed.files, [GitFile { path: "a.txt".into(), change: Change::Modified, added: 2, removed: 1 }]);
         assert!(diff(&dir, &changed.files[0]).expect("diff").contains("-two"));
-        commit(&dir, "second").expect("commit");
+        commit("second").expect("commit");
 
         git(&dir, &["branch", "side"]).expect("branch");
         switch(&dir, "side").expect("switch");
@@ -451,13 +427,9 @@ mod tests {
         assert_eq!((after.branch.as_str(), after.branches.len()), ("side", 2));
         assert!(switch(&dir, "--orphan").is_err(), "an option is not a branch");
         let report = run(&dir, Job::Switch("main".into()));
-        assert!(
-            matches!(&report, Report::Status { status: Some(s), problem: None, committed: false } if s.branch == "main")
-        );
-        assert!(matches!(
-            run(&dir, Job::Commit("x".into())),
-            Report::Status { problem: Some(_), committed: false, .. }
-        ));
+        assert!(matches!(&report, Report::Status { status: Some(s), problem: None } if s.branch == "main"));
+        let refused = run(&dir, Job::Switch("no-such-branch".into()));
+        assert!(matches!(&refused, Report::Status { status: Some(s), problem: Some(_) } if s.branch == "main"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

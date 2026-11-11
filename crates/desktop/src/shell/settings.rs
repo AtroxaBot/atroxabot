@@ -13,7 +13,8 @@ use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::CursorIcon;
 
-use super::widgets::{Scroll, chip, line_field, logo_badge, modal, row, tile, toggle};
+use super::menu::Menu;
+use super::widgets::{Scroll, chip, dropdown, line_field, logo_badge, modal, row, tile, toggle};
 use super::{Account, Shell};
 use crate::app::Action;
 use crate::editor::Editor;
@@ -21,6 +22,7 @@ use crate::form::Fields;
 use crate::logo::Logo;
 use crate::paint::{Painter, Rect, fade, mix};
 use crate::theme::{self, Scheme};
+use crate::tray::CloseAction;
 use crate::ui::{ButtonStyle, Ui, button, icon, icon_button, id};
 
 /// The modal's size.
@@ -348,7 +350,7 @@ impl Settings {
         p: &mut Painter,
         ui: &mut Ui,
         (x, y, w): (f32, f32, f32),
-        shell: &Shell,
+        shell: &mut Shell,
         scheme: Scheme,
         actions: &mut Vec<Action>,
     ) -> f32 {
@@ -397,6 +399,18 @@ impl Settings {
             }
         }
         y += 104.0 + 34.0;
+
+        // What the close button does: by default the app keeps running.
+        p.label("Window", theme::LABEL, x, y, t.text);
+        y += 30.0;
+        let closing = CloseAction::from_key(shell.config.close.as_deref());
+        let rect = Rect::new(x, y, w, 58.0);
+        row(p, rect, (icon::X, None), "When you close the window", closing.detail(), 256.0);
+        let anchor = Rect::new(rect.right() - 252.0, rect.y + 9.0, 240.0, 40.0);
+        if dropdown(p, ui, anchor, None, closing.label(), shell.menu_open(Menu::Close)) {
+            shell.toggle_menu(Menu::Close, anchor);
+        }
+        y += 58.0 + 34.0;
 
         p.label("On this computer", theme::LABEL, x, y, t.text);
         y += 30.0;

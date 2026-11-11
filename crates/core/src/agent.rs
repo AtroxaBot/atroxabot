@@ -235,6 +235,15 @@ pub const CALL_STARTED: &str = "(The user is now talking to you on a voice call:
 /// What an agent is told when the user types again after a call.
 pub const CALL_ENDED: &str = "(The voice call has ended; the user is typing again and reads your replies.)";
 
+/// What goes before a message the user sent while an agent on an API was
+/// working, which it reads after its latest tool results. (Claude Code
+/// introduces such a message itself.)
+pub const FOLLOW_UP: &str = "(The user sent this while you were working. Take it into account as you carry on.)";
+
+/// What goes before a message the user stopped an agent on an API to send.
+pub const INTERRUPTING: &str = "(The user stopped you to send this. What you did so far is above: take this into \
+    account, then carry on from where you were unless it says otherwise.)";
+
 /// The last `max` bytes of `text`, cut at a line where possible and never
 /// inside a character.
 fn tail(text: &str, max: usize) -> &str {

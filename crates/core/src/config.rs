@@ -235,6 +235,14 @@ pub struct Config {
     /// Whether the side panel (the session's usage and its folder's git) is open.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub panel: bool,
+    /// The sessions in the order the user dragged them into, by id. One
+    /// not named here (started since) comes before them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub session_order: Vec<String>,
+    /// What closing the window does: `background` (keep running in the tray
+    /// or Dock), `minimize` or `quit`; the platform's default if unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub close: Option<String>,
     /// Settings a newer version wrote, kept as they are.
     #[serde(flatten)]
     pub extra: Map<String, Value>,

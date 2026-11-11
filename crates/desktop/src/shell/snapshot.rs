@@ -94,8 +94,9 @@ fn snapshots() {
         branch.open_menu(Menu::Branch, Rect::new(1120.0, 318.0, 288.0, 36.0));
         let mut plain = panel();
         plain.git.status = None;
-        // A turn with subagents: their cards in the conversation, and the tab of one.
-        let delegate = |tab: Option<&str>| {
+        // A turn with subagents: their cards in the conversation and their list in the side
+        // panel, and one of them open.
+        let delegate = |open: Option<&str>| {
             let mut delegating = panel();
             let turn = delegating.current.clone().unwrap_or_default();
             delegating.send(
@@ -150,8 +151,8 @@ fn snapshots() {
             };
             delegating.agent_event(&turn, AgentEvent::Limits(limits), &mut Vec::new());
             if let Some(thread) = delegating.threads.get_mut(&turn) {
-                thread.busy = tab.is_none();
-                thread.tab = tab.map(str::to_owned);
+                thread.busy = open.is_none();
+                thread.sub = open.map(str::to_owned);
             }
             delegating
         };
@@ -207,11 +208,31 @@ fn snapshots() {
             let done = AgentEvent::ToolResult { id: format!("u{id}"), output: "Updated".into(), is_error: false };
             tasks.agent_event(&turn, done, &mut Vec::new());
         }
+        // Messages sent while the agent works wait above the message box: one handed over, one not yet.
+        let mut queued = shell();
+        let turn = queued.current.clone().unwrap_or_default();
+        queued.send("Make the tokenizer test pass", false, Vec::new(), &mut Vec::new());
+        let test = serde_json::json!({ "command": "cargo test tokenizer" }).to_string();
+        for event in [
+            AgentEvent::ReplyStarted,
+            AgentEvent::Text("I'll run the failing test first.".into()),
+            AgentEvent::ToolCall(ToolUse { id: "q1".into(), name: "Bash".into(), input: test, ..ToolUse::default() }),
+        ] {
+            queued.agent_event(&turn, event, &mut Vec::new());
+        }
+        queued.send("Also check the escaped backslash case", false, Vec::new(), &mut Vec::new());
+        let failed = AgentEvent::ToolResult { id: "q1".into(), output: "test result: FAILED".into(), is_error: false };
+        queued.agent_event(&turn, failed, &mut Vec::new());
+        queued.send("And keep the fix to one function, please", false, Vec::new(), &mut Vec::new());
         let mut diff = panel();
         let file = repository().files.remove(0);
         diff.modal = Some(Modal::Diff(Box::new(DiffView::new(file.clone()))));
         let repo = diff.git.folder.clone();
         diff.git_report(&repo, Report::Diff { path: file.path, text: Ok(DIFF.into()) });
+        // A picture of the conversation, opened whole (the app's own icon stands in for one).
+        let mut picture = shell();
+        let icon = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon/256.png");
+        picture.modal = Some(Modal::Picture(icon.into()));
         let mut autonomy = shell();
         autonomy.modal = Some(Modal::Agent(Box::new(AgentForm::new(autonomy.selected_agent()))));
         autonomy.open_menu(Menu::FormAutonomy, Rect::new(725.0, 472.0, 297.0, 40.0));
@@ -220,6 +241,9 @@ fn snapshots() {
             shell.modal = Some(Modal::Settings(Box::new(Settings::new(tab))));
             shell
         };
+        // The close button's choices, open under their dropdown.
+        let mut closing = settings(Tab::General);
+        closing.open_menu(Menu::Close, Rect::new(905.0, 432.0, 240.0, 40.0));
         let adding = |tab: Tab, what: Adding| {
             let mut shell = shell();
             let mut settings = Settings::new(tab);
@@ -255,15 +279,18 @@ fn snapshots() {
             ("panel", panel()),
             ("panel-no-git", plain),
             ("subagents", delegating),
-            ("subagent-tab", inside),
+            ("subagent-open", inside),
             ("question", asked),
             ("slash", slash),
             ("mention", mention),
             ("tasks", tasks),
+            ("queued", queued),
             ("menu-branch", branch),
             ("diff", diff),
+            ("picture", picture),
             ("menu-autonomy", autonomy),
             ("settings-general", settings(Tab::General)),
+            ("menu-close", closing),
             ("settings-providers", settings(Tab::Providers)),
             ("settings-voice", settings(Tab::Voice)),
             ("settings-mcp", settings(Tab::Mcp)),
@@ -371,6 +398,11 @@ fn frame(
         draw(&mut p, &mut ui, view);
         crate::titlebar::draw(&mut p, &mut ui, view, false);
         ui.end();
+        // Pictures are decoded on the spot, where the app has a worker do it.
+        for key in images.take_wanted() {
+            let pixels = crate::image::thumbnail(&key);
+            images.insert(key, pixels);
+        }
     }
     gpu.render(SIZE, &instances, (&mut atlas.uploads, &mut images.uploads), 1.0, palette.panel)
 }

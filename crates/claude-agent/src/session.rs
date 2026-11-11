@@ -145,20 +145,39 @@ impl Session {
     /// # Errors
     /// [`Error::Closed`] after the session closed, [`Error::Io`] when the write fails.
     pub fn send_content(&self, content: &Value) -> Result<(), Error> {
-        self.shared.write(&json!({
+        self.send_message(content, None)
+    }
+
+    /// Sends a user message, as [`Session::send_content`] does, under the id `uuid` when one is given. A message
+    /// sent while a turn runs is taken into that turn after its running tool calls (or starts the next turn if
+    /// it ends first); with `--replay-user-messages` the binary replays it, under the same id, at that moment.
+    /// Every message is marked as typed by a person (`origin`), which the binary counts in a result's
+    /// [`TurnResult::queued_turn_count`].
+    ///
+    /// # Errors
+    /// [`Error::Closed`] after the session closed, [`Error::Io`] when the write fails.
+    pub fn send_message(&self, content: &Value, uuid: Option<&str>) -> Result<(), Error> {
+        let mut message = json!({
             "type": "user",
             "message": {"role": "user", "content": content},
             "parent_tool_use_id": null,
             "session_id": "default",
-        }))
+            "origin": {"kind": "human"},
+        });
+        if let Some(uuid) = uuid {
+            message["uuid"] = uuid.into();
+        }
+        self.shared.write(&message)
     }
 
-    /// Asks the binary to stop the running turn. The turn still ends with an [`Event::Result`].
+    /// Asks the binary to stop the running turn. The turn still ends with an [`Event::Result`]. Messages sent
+    /// meanwhile and not taken in yet are dropped when `cancel_queued`, and otherwise answered next, each in a
+    /// turn of its own (builds before 2.1.219 always answer them).
     ///
     /// # Errors
     /// [`Error::Closed`] after the session closed, [`Error::Io`] when the write fails.
-    pub fn interrupt(&self) -> Result<(), Error> {
-        self.request(&json!({"subtype": "interrupt"}))
+    pub fn interrupt(&self, cancel_queued: bool) -> Result<(), Error> {
+        self.request(&json!({"subtype": "interrupt", "cancel_queued": cancel_queued}))
     }
 
     /// Changes the permission mode. A refusal arrives as an [`Event::Error`].

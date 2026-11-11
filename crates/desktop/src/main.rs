@@ -29,6 +29,7 @@ mod shell;
 mod text;
 mod theme;
 mod titlebar;
+mod tray;
 mod ui;
 
 use std::process::ExitCode;
@@ -68,9 +69,9 @@ impl ApplicationHandler<WorkerEvent> for Handler {
         }
     }
 
-    fn user_event(&mut self, _: &ActiveEventLoop, event: WorkerEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WorkerEvent) {
         if let Some(app) = &mut self.app {
-            app.worker_event(event);
+            app.worker_event(event_loop, event);
         }
     }
 
@@ -110,6 +111,11 @@ fn main() -> ExitCode {
     let _lock = match atroxabot_core::lock_instance(LOCK_FILE) {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => {
+            // Perhaps it only waits in the tray: it shows its window instead.
+            #[cfg(windows)]
+            if tray::wake_running() {
+                return ExitCode::SUCCESS;
+            }
             return fail("AtroxaBot is already running. Switch to its window, or close it before starting it again.");
         }
         Err(e) => {

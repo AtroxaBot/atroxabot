@@ -282,12 +282,17 @@ pub enum Event {
         /// Set when the message stands in for an API failure, e.g. `rate_limit` or `authentication_failed`.
         error: Option<String>,
     },
-    /// A user-role message echoed by the binary: tool results and subagent prompts.
+    /// A user-role message echoed by the binary: tool results and subagent prompts, and (with
+    /// `--replay-user-messages`) the caller's own messages at the moment a turn takes them in.
     User {
         /// The message's content.
         blocks: Vec<Block>,
         /// Set inside a subagent: the id of the tool call that started it.
         parent_tool_use_id: Option<String>,
+        /// The message's id: for a replayed message, the `uuid` it was sent with.
+        uuid: String,
+        /// Whether this is one of the caller's messages, replayed (`isReplay`).
+        replay: bool,
     },
     /// The binary asks whether a tool may run (`can_use_tool`). Answer with [`Session::respond`].
     Permission(PermissionRequest),
@@ -419,6 +424,9 @@ pub struct TurnResult {
     pub permission_denials: usize,
     /// The context window of the model that answered (the largest, if several did); 0 when not said.
     pub context_window: u64,
+    /// How many of the caller's messages still wait to be answered, each in a turn of its own that follows
+    /// at once (`queued_turn_count`); 0 when not said.
+    pub queued_turn_count: u64,
     /// The whole message.
     pub raw: Value,
 }
