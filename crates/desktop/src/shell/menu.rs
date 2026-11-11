@@ -256,6 +256,18 @@ impl Shell {
         }
     }
 
+    /// Who an account is signed in as, on one line: its email address (unless
+    /// the settings keep those off the screen) and its plan.
+    fn signed_in_as(&self, email: &str, plan: &str) -> String {
+        let email = if self.config.hide_emails { "" } else { email };
+        match (email.is_empty(), plan.is_empty()) {
+            (true, true) => "Signed in".to_owned(),
+            (true, false) => format!("Signed in · {plan}"),
+            (false, true) => email.to_owned(),
+            (false, false) => format!("{email} · {plan}"),
+        }
+    }
+
     /// One line on a provider: a Claude account's sign-in, or where an API goes.
     pub(super) fn provider_detail(&self, connection: &Connection) -> String {
         if connection.kind == ConnectionKind::Codex {
@@ -265,15 +277,13 @@ impl Shell {
                     Some(account) if account.email.is_empty() && account.kind == "apiKey" => {
                         "Signed in with an API key".to_owned()
                     }
-                    Some(account) if account.email.is_empty() => "Signed in".to_owned(),
-                    Some(account) if account.plan.is_empty() => account.email.clone(),
                     Some(account) => {
                         // Codex names a plan in lower case: `plus`, `pro`.
                         let mut plan = account.plan.clone();
                         if let Some(first) = plan.get_mut(..1) {
                             first.make_ascii_uppercase();
                         }
-                        format!("{} · {plan}", account.email)
+                        self.signed_in_as(&account.email, &plan)
                     }
                 },
                 Some(CodexAccount::Missing) => "Codex is not installed".to_owned(),
@@ -286,8 +296,7 @@ impl Shell {
         }
         match self.claude.get(&connection.id) {
             Some(Account::Ready(info)) if info.account.email.is_empty() => "Not signed in".to_owned(),
-            Some(Account::Ready(info)) if info.account.subscription.is_empty() => info.account.email.clone(),
-            Some(Account::Ready(info)) => format!("{} · {}", info.account.email, info.account.subscription),
+            Some(Account::Ready(info)) => self.signed_in_as(&info.account.email, &info.account.subscription),
             Some(Account::Missing) => "Claude Code is not installed".to_owned(),
             Some(Account::Failed(why)) => why.clone(),
             Some(Account::Checking) | None => "Checking…".to_owned(),

@@ -470,6 +470,18 @@ impl Settings {
         }
         y += 58.0 + 34.0;
 
+        // For streaming or sharing the screen: no account's address shows anywhere.
+        p.label("Privacy", theme::LABEL, x, y, t.text);
+        y += 30.0;
+        let rect = Rect::new(x, y, w, 58.0);
+        let about = "Accounts show their plan only, everywhere in the app: for streaming or sharing your screen.";
+        row(p, rect, (icon::EYE, None), "Hide email addresses", about, 70.0);
+        if toggle(p, ui, (rect.right() - 52.0, rect.y + 18.0), shell.config.hide_emails, "hide-emails") {
+            shell.config.hide_emails = !shell.config.hide_emails;
+            actions.push(Action::SaveConfig);
+        }
+        y += 58.0 + 34.0;
+
         p.label("On this computer", theme::LABEL, x, y, t.text);
         y += 30.0;
         let installed = shell.claude.values().find_map(|account| match account {

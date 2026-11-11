@@ -268,6 +268,10 @@ pub struct Config {
     /// Whether the side panel (the session's usage and its folder's git) is open.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub panel: bool,
+    /// Whether the accounts' email addresses are kept off the screen (for
+    /// streaming or sharing it): an account shows its plan only.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hide_emails: bool,
     /// The sessions in the order the user dragged them into, by id. One
     /// not named here (started since) comes before them.
     #[serde(skip_serializing_if = "Vec::is_empty")]

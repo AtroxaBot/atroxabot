@@ -298,6 +298,12 @@ fn snapshots() {
         // The close button's choices, open under their dropdown.
         let mut closing = settings(Tab::General);
         closing.open_menu(Menu::Close, Rect::new(905.0, 432.0, 240.0, 40.0));
+        // Streaming: the accounts show their plans and no addresses, in the settings and the top bar's menu.
+        let mut private = settings(Tab::Providers);
+        private.config.hide_emails = true;
+        let mut private_menu = shell();
+        private_menu.config.hide_emails = true;
+        private_menu.open_menu(Menu::Provider, Rect::new(1152.0, 47.0, 96.0, 30.0));
         let adding = |tab: Tab, what: Adding| {
             let mut shell = shell();
             let mut settings = Settings::new(tab);
@@ -497,6 +503,8 @@ fn snapshots() {
             ("settings-general", settings(Tab::General)),
             ("menu-close", closing),
             ("settings-providers", settings(Tab::Providers)),
+            ("settings-providers-private", private),
+            ("menu-provider-private", private_menu),
             ("settings-voice", settings(Tab::Voice)),
             ("settings-integrations", connected),
             ("settings-skills", skilled(None)),

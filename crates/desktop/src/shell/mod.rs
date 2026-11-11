@@ -2527,6 +2527,14 @@ mod tests {
         let info = CodexInfo { account: Some(signed_in), limits: Some(window), ..*info };
         shell.codex_info(&account.id, Ok(info), &mut actions);
         assert_eq!(shell.provider_detail(&account), "me@example.com · Plus");
+        // On a stream the address stays off the screen; the plan still shows.
+        shell.config.hide_emails = true;
+        assert_eq!(shell.provider_detail(&account), "Signed in · Plus");
+        self::signed_in(&mut shell);
+        let claude = shell.config.connection(Connection::CLAUDE_AGENT).expect("built in");
+        assert_eq!(shell.provider_detail(&claude), "Signed in");
+        shell.config.hide_emails = false;
+        assert_eq!(shell.provider_detail(&claude), "me@example.com");
         assert!(actions.iter().any(|a| matches!(a, Action::SaveLimits(kept) if kept.contains_key(&account.id))));
         assert_eq!(shell.limits_account().as_deref(), Some(account.id.as_str()), "the panel shows its plan");
         actions.clear();

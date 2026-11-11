@@ -309,7 +309,9 @@ fn limits(p: &mut Painter, shell: &Shell, (x, y, w): (f32, f32, f32)) -> f32 {
             p.text(&name, left + 24.0, top, t.text);
             // Who it is, and how old the numbers are.
             let email = match shell.claude.get(&connection.id) {
-                Some(Account::Ready(info)) if !info.account.email.is_empty() => format!("{} · ", info.account.email),
+                Some(Account::Ready(info)) if !info.account.email.is_empty() && !shell.config.hide_emails => {
+                    format!("{} · ", info.account.email)
+                }
                 _ => String::new(),
             };
             let seen =

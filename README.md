@@ -216,6 +216,10 @@ cargo clippy --workspace --all-targets -- -D warnings
   opens it again, and its menu opens it or quits; starting AtroxaBot again also brings the window back. On
   macOS the app hides as with Cmd+H, and its Dock icon brings it back. Linux has no tray here, so there the
   window is minimised. The other choices are to minimise or to quit. Ctrl+Q quits (Cmd+Q on macOS).
+- **Hiding email addresses** (Settings, General, *Privacy*): for streaming or sharing your screen, no
+  account's address shows anywhere in the app (the settings, the top bar's provider menu, the agent editor,
+  the statistics); an account shows its plan only, "Signed in · Claude Max". Signing in still happens in
+  Claude Code's or Codex's own terminal, which shows the address.
 - **Looks.** The app draws its own title bar, the sidebar sits on the window and the session floats beside
   it on a rounded canvas, with the side panel on one of its own; the agent editor, the settings, the
   statistics, the spotlight, a file's diff and a picture open over them as modals. Three themes: Black
@@ -337,7 +341,8 @@ To look at the design without opening the app, draw every screen offscreen in ev
 Everything lives in `~/.atroxabot/`:
 
 - `config.json`: providers (with their API keys), voice providers (with theirs), MCP servers, recent
-  folders, the theme, window and zoom, what closing the window does, whether the side panel is open, the order you dragged the
+  folders, the theme, window and zoom, what closing the window does, whether email addresses are hidden,
+  whether the side panel is open, the order you dragged the
   sessions into, when unused worktrees are cleaned up, the repositories worktrees were made in, and what a
   session does when its account runs out.
 - `usage.jsonl`: what every reply used (when, which agent, session, provider and model, its tokens, cost
