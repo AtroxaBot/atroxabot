@@ -325,11 +325,17 @@ fn rate_limit(info: &Value) -> RateLimit {
             .into_iter()
             .flatten()
             .take(16)
-            .map(|(name, window)| RateWindow {
-                name: name.clone(),
-                utilization: field(window, "utilization").as_f64().unwrap_or(0.0).clamp(0.0, 1.0),
-                resets_at: number(window, "resetsAt"),
-                status: text(window, "status"),
+            .filter_map(|(name, window)| {
+                let status = text(window, "status");
+                // A window that says no number is full when it is the one that refused, and unknown otherwise:
+                // then it is left out, so that what was known of it stands.
+                let used = field(window, "utilization").as_f64().or_else(|| (status == "rejected").then_some(1.0))?;
+                Some(RateWindow {
+                    name: name.clone(),
+                    utilization: used.clamp(0.0, 1.0),
+                    resets_at: number(window, "resetsAt"),
+                    status,
+                })
             })
             .collect(),
     }
@@ -441,8 +447,15 @@ mod tests {
             ("allowed", "five_hour", 1_794_333_000)
         );
         let windows: Vec<(&str, f64)> = limits.windows.iter().map(|w| (w.name.as_str(), w.utilization)).collect();
-        assert_eq!(windows, [("five_hour", 0.1), ("odd", 0.0), ("seven_day", 0.58)]);
+        assert_eq!(windows, [("five_hour", 0.1), ("seven_day", 0.58)], "what is no window is left out");
         assert_eq!(event(r#"{"type":"rate_limit_event"}"#), Event::RateLimit(RateLimit::default()));
+        // A window without a number: full when it refused, left out (what was known stands) otherwise.
+        let refused = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":9,
+            "rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"status":"rejected","resetsAt":9},
+            "seven_day":{"status":"allowed"}}}}"#;
+        let Event::RateLimit(limits) = event(&refused.replace('\n', " ")) else { panic!("not limits") };
+        let windows: Vec<(&str, f64)> = limits.windows.iter().map(|w| (w.name.as_str(), w.utilization)).collect();
+        assert_eq!(windows, [("five_hour", 1.0)]);
 
         let progress = r#"{"type":"system","subtype":"task_progress","tool_use_id":"toolu_1","description":"Finding *",
             "subagent_type":"general-purpose","usage":{"total_tokens":26674,"tool_uses":1,"duration_ms":2350},

@@ -185,8 +185,10 @@ impl Shell {
                 } else {
                     10.0
                 };
+                // Armed, it says what goes: with a worktree, its uncommitted changes too.
+                let warning = if confirming { self.delete_warning(&session.id) } else { String::new() };
                 let title = if confirming {
-                    "Click again to delete"
+                    warning.as_str()
                 } else if session.title.is_empty() {
                     "New session"
                 } else {
@@ -248,8 +250,12 @@ impl Shell {
         if let Some(session) = delete {
             if self.confirm_delete.as_deref() == Some(session.as_str()) {
                 self.confirm_delete = None;
-                self.delete_session(&session, actions);
+                // Changes the armed button named go with it; ones it did not know of are kept.
+                let told = self.worktrees.get(&session).is_some_and(|state| state.changes > 0);
+                self.delete_session(&session, told, actions);
             } else {
+                // What its worktree holds is read, for the button to say.
+                self.ask_worktree(&session, actions);
                 self.confirm_delete = Some(session);
             }
         } else if let Some(agent) = edit {

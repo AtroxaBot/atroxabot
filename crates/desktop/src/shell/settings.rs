@@ -17,7 +17,7 @@ use winit::window::CursorIcon;
 use super::menu::Menu;
 use super::skills::SkillsPage;
 use super::widgets::{Scroll, chip, dropdown, line_field, logo_badge, modal, row, tile, toggle};
-use super::{Account, Connectors, Shell};
+use super::{Account, CodexAccount, Connectors, Shell};
 use crate::app::Action;
 use crate::editor::Editor;
 use crate::form::Fields;
@@ -50,10 +50,13 @@ pub(super) enum Tab {
     Integrations,
     /// The skills every agent has.
     Skills,
+    /// The sessions' git worktrees, and their cleaning up.
+    Worktrees,
 }
 
 impl Tab {
-    const ALL: [Self; 5] = [Self::General, Self::Providers, Self::Voice, Self::Integrations, Self::Skills];
+    const ALL: [Self; 6] =
+        [Self::General, Self::Providers, Self::Voice, Self::Integrations, Self::Skills, Self::Worktrees];
 
     fn label(self) -> (&'static str, char) {
         match self {
@@ -62,6 +65,7 @@ impl Tab {
             Self::Voice => ("Voice", icon::AUDIO),
             Self::Integrations => ("Integrations", icon::LINK),
             Self::Skills => ("Skills", icon::SPARKLES),
+            Self::Worktrees => ("Worktrees", icon::BRANCH),
         }
     }
 }
@@ -89,6 +93,8 @@ pub(super) enum Adding {
     Nothing,
     /// A Claude account: it only needs a name.
     ClaudeAccount,
+    /// A Codex account: it only needs a name.
+    CodexAccount,
     /// An API provider: which one is being chosen.
     PickProvider,
     /// The API provider with this preset: its key (and, for a custom one, its name and address).
@@ -115,6 +121,10 @@ pub(super) struct Settings {
     scroll: Scroll,
     /// The skills page's own state.
     skills: SkillsPage,
+    /// The worktrees page: the folder whose remove button was clicked once.
+    armed: Option<String>,
+    /// The worktrees page was shown: what is on disk was asked for.
+    listed: bool,
 }
 
 impl Settings {
@@ -131,7 +141,14 @@ impl Settings {
             renamed: false,
             scroll: Scroll::default(),
             skills: SkillsPage::new(),
+            armed: None,
+            listed: false,
         }
+    }
+
+    /// Whether the page shown lists the worktrees on disk.
+    pub(super) fn shows_worktrees(&self) -> bool {
+        self.tab == Tab::Worktrees
     }
 
     /// Starts (or with [`Adding::Nothing`] ends) adding something: its
@@ -155,7 +172,7 @@ impl Settings {
     /// The fields on screen now, in order: Tab moves among these.
     fn visible(&self) -> Vec<usize> {
         match (self.tab, self.adding) {
-            (Tab::Providers, Adding::ClaudeAccount) => vec![NAME],
+            (Tab::Providers, Adding::ClaudeAccount | Adding::CodexAccount) => vec![NAME],
             (Tab::Providers, Adding::Provider(CUSTOM)) => vec![NAME, URL, KEY],
             (Tab::Providers, Adding::Provider(_)) | (Tab::Voice, Adding::Voice(_)) => vec![KEY],
             (Tab::Integrations, Adding::Mcp(_)) => vec![NAME, URL, VARS],
@@ -308,6 +325,7 @@ impl Settings {
                     self.tab = tab;
                     self.add(Adding::Nothing);
                     self.skills = SkillsPage::new();
+                    (self.armed, self.listed) = (None, false);
                     self.scroll.reset();
                 }
             }
@@ -327,6 +345,22 @@ impl Settings {
             Tab::Voice => self.voice(p, ui, (x, top, w), shell, actions),
             Tab::Integrations => self.integrations(p, ui, (x, top, w), shell, actions),
             Tab::Skills => self.skills.draw(p, ui, (x, top, w), (area.y, area.bottom()), shell, actions),
+            Tab::Worktrees => {
+                // Looked at afresh when the page opens; their sizes follow.
+                if !std::mem::replace(&mut self.listed, true) {
+                    shell.sweep_worktrees(actions);
+                }
+                let (end, open) = super::worktrees::page(p, ui, (x, top, w), shell, &mut self.armed, actions);
+                // The arrow of a worktree leads to its session.
+                let agent = open.as_ref().and_then(|session| {
+                    shell.sessions.iter().find(|known| known.id == *session).map(|known| known.agent.clone())
+                });
+                if let (Some(session), Some(agent)) = (open, agent) {
+                    shell.open_found(&agent, &session, actions);
+                    leave = true;
+                }
+                end
+            }
         };
         p.set_clip(clip);
         let content = end + offset - area.y + 24.0;
@@ -336,7 +370,7 @@ impl Settings {
     }
 
     /// A page's title and what it is for. Returns where what follows starts.
-    fn title(p: &mut Painter, (x, y, w): (f32, f32, f32), title: &str, about: &str) -> f32 {
+    pub(super) fn title(p: &mut Painter, (x, y, w): (f32, f32, f32), title: &str, about: &str) -> f32 {
         let t = p.theme;
         p.label(title, theme::TITLE, x, y, t.text);
         let about = p.layout(about, theme::SMALL, Some(w - 40.0));
@@ -364,7 +398,7 @@ impl Settings {
     }
 
     /// A small line of explanation. Returns where what follows starts.
-    fn note(p: &mut Painter, (x, y, w): (f32, f32, f32), text: &str) -> f32 {
+    pub(super) fn note(p: &mut Painter, (x, y, w): (f32, f32, f32), text: &str) -> f32 {
         let note = p.layout(text, theme::TINY, Some(w));
         p.text(&note, x, y, p.theme.text_faint);
         y + note.height()
@@ -476,6 +510,118 @@ impl Settings {
         y + 58.0
     }
 
+    /// The Codex accounts: each the Codex CLI the user installed, signed in
+    /// to one account. Returns where what follows starts.
+    fn codex_accounts(
+        &mut self,
+        p: &mut Painter,
+        ui: &mut Ui,
+        (x, mut y, w): (f32, f32, f32),
+        shell: &mut Shell,
+        changed: &mut bool,
+        actions: &mut Vec<Action>,
+    ) -> f32 {
+        let t = p.theme;
+        if Self::heading(p, ui, (x, y, w), "Codex accounts", Some("Add account")) {
+            self.add(Adding::CodexAccount);
+        }
+        y += 40.0;
+        let mut remove = None;
+        let accounts: Vec<Connection> =
+            shell.config.connections.iter().filter(|c| c.kind == ConnectionKind::Codex).cloned().collect();
+        for account in &accounts {
+            let rect = Rect::new(x, y, w, 58.0);
+            let state = shell.codex.get(&account.id);
+            let signed_in = matches!(state, Some(CodexAccount::Ready(info)) if info.account.is_some());
+            let can_sign_in = matches!(state, Some(CodexAccount::Ready(_) | CodexAccount::Failed(_)));
+            let title = if self.is_renaming(&account.id) { "" } else { account.name.as_str() };
+            row(
+                p,
+                rect,
+                (icon::TERMINAL, Shell::provider_tint(account)),
+                title,
+                &shell.provider_detail(account),
+                190.0,
+            );
+            if let Some(name) = self.name_field(p, ui, rect, (&account.id, &account.name), 190.0) {
+                shell.config.rename_connection(&account.id, &name);
+                *changed = true;
+            }
+            shell.provider_picture(p, account, Rect::new(rect.x + 12.0, rect.y + 12.0, 34.0, 34.0));
+            let mut right = rect.right() - 12.0;
+            right -= 28.0;
+            if icon_button(p, ui, Rect::new(right, rect.y + 15.0, 28.0, 28.0), icon::TRASH, true) {
+                remove = Some(account.id.clone());
+            }
+            right -= 30.0;
+            if icon_button(p, ui, Rect::new(right, rect.y + 15.0, 28.0, 28.0), icon::REFRESH, true) {
+                shell.codex.insert(account.id.clone(), CodexAccount::Checking);
+                actions.push(Action::ProbeCodex(Box::new(account.clone())));
+            }
+            if signed_in {
+                icon::draw(p, icon::CHECK, (right - 16.0, rect.y + 29.0), 15.0, t.text_muted);
+            } else if can_sign_in {
+                let sign_in = Rect::new(right - 92.0, rect.y + 13.0, 84.0, 32.0);
+                if button(p, ui, sign_in, "Sign in", ButtonStyle::Primary, true) {
+                    actions.push(Action::CodexLogin(Box::new(account.clone())));
+                }
+            }
+            y += 66.0;
+        }
+        if let Some(id) = remove {
+            // Its folder, and so its sign-in, stays where it is: the account only leaves the list.
+            shell.config.connections.retain(|c| c.id != id);
+            shell.codex.remove(&id);
+            *changed = true;
+        }
+        if accounts.iter().all(|account| !account.config_dir.is_empty()) {
+            // The Codex the user already has, as they use it in their terminal.
+            let rect = Rect::new(x, y, w, 58.0);
+            let about = "Whoever `codex` is signed in as in your terminal, with its settings.";
+            row(p, rect, (icon::TERMINAL, None), "Codex's own sign-in", about, 100.0);
+            let add = Rect::new(rect.right() - 92.0, rect.y + 13.0, 80.0, 32.0);
+            if button(p, ui, add, "Use it", ButtonStyle::Secondary, true) {
+                let account = Connection::codex("Codex");
+                shell.codex.insert(account.id.clone(), CodexAccount::Checking);
+                actions.push(Action::ProbeCodex(Box::new(account.clone())));
+                shell.config.connections.push(account);
+                *changed = true;
+            }
+            y += 66.0;
+        }
+        if self.adding == Adding::CodexAccount {
+            let card = Rect::new(x, y, w, 108.0);
+            p.bordered(card, t.surface, theme::RADIUS, 1.0, t.border_focus);
+            p.label("A name for the account", theme::CAPTION, card.x + 16.0, card.y + 14.0, t.text_muted);
+            let field = Rect::new(card.x + 16.0, card.y + 38.0, card.w - 32.0 - 250.0, 42.0);
+            self.field(p, ui, NAME, field, "Work, Personal …");
+            let name = self.fields.text(NAME).trim().to_owned();
+            let cancel = Rect::new(card.right() - 242.0, card.y + 38.0, 84.0, 42.0);
+            if button(p, ui, cancel, "Cancel", ButtonStyle::Ghost, true) {
+                self.add(Adding::Nothing);
+            }
+            let add = Rect::new(card.right() - 150.0, card.y + 38.0, 134.0, 42.0);
+            if button(p, ui, add, "Add and sign in", ButtonStyle::Primary, !name.is_empty()) {
+                match Connection::codex_account(&name) {
+                    Ok(account) => {
+                        shell.codex.insert(account.id.clone(), CodexAccount::Checking);
+                        actions.push(Action::CodexLogin(Box::new(account.clone())));
+                        shell.config.connections.push(account);
+                        *changed = true;
+                    }
+                    Err(e) => shell.notify(format!("The account could not be added: {e}")),
+                }
+                self.add(Adding::Nothing);
+            }
+            y += 116.0;
+        }
+        let note = "A Codex account is the Codex CLI you installed (npm install -g @openai/codex), run as it is, \
+                    with its own tools, sandbox and approvals, on your ChatGPT plan or API key. Each account you \
+                    add has a Codex home of its own, with its own sign-in, settings and conversations. Signing \
+                    in opens Codex in a terminal; AtroxaBot never sees your credentials.";
+        Self::note(p, (x, y + 2.0, w), note) + 30.0
+    }
+
     fn providers(
         &mut self,
         p: &mut Painter,
@@ -488,6 +634,16 @@ impl Settings {
         let about = "What your agents think through. Swap an agent's provider from the top bar of its session.";
         let mut y = Self::title(p, (x, y, w), "Providers", about);
         let mut changed = false;
+
+        // What a session does when its account's usage limit stops it.
+        let out = shell.out_of_limits();
+        let rect = Rect::new(x, y, w, 58.0);
+        row(p, rect, (icon::HISTORY, None), "When an account runs out", out.detail(), 300.0);
+        let anchor = Rect::new(rect.right() - 292.0, rect.y + 9.0, 280.0, 40.0);
+        if dropdown(p, ui, anchor, None, out.label(), shell.menu_open(Menu::OutOfLimits)) {
+            shell.toggle_menu(Menu::OutOfLimits, anchor);
+        }
+        y += 58.0 + 34.0;
 
         // Claude accounts: each a Claude Code profile of its own.
         if Self::heading(p, ui, (x, y, w), "Claude accounts", Some("Add account")) {
@@ -603,6 +759,8 @@ impl Settings {
                     is billed to the account you sign in to.";
         y = Self::note(p, (x, y + 2.0, w), note) + 30.0;
 
+        y = self.codex_accounts(p, ui, (x, y, w), shell, &mut changed, actions);
+
         // API providers.
         let adding_provider = matches!(self.adding, Adding::PickProvider | Adding::Provider(_));
         if Self::heading(p, ui, (x, y, w), "API providers", (!adding_provider).then_some("Add provider")) {
@@ -610,7 +768,7 @@ impl Settings {
         }
         y += 40.0;
         let (mut remove, mut rename) = (None, None);
-        for connection in shell.config.connections.iter().filter(|c| c.kind != ConnectionKind::ClaudeAgent) {
+        for connection in shell.config.connections.iter().filter(|c| !c.kind.is_account()) {
             let rect = Rect::new(x, y, w, 58.0);
             let key = if connection.api_key.is_some() { "key saved" } else { "no key" };
             let detail = format!("{} · {key}", connection.host());

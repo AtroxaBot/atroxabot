@@ -302,8 +302,10 @@ impl Shell {
             }
         }
 
-        // What was sent while the agent works waits on top of the composer, and a waiting approval on top of that.
-        let waiting = self.draw_queue(p, ui, (x, card.y - 8.0, width), actions);
+        // A session a usage limit stopped says when it goes on, right on top of the composer; what was sent while
+        // the agent works waits above that, and a waiting approval on top of it all.
+        let resuming = self.draw_resume(p, ui, (x, card.y - 8.0, width), actions);
+        let waiting = self.draw_queue(p, ui, (x, resuming, width), actions);
         let top = if waiting < card.y - 8.0 { waiting } else { card.y };
         match self.thread().and_then(|thread| thread.asks.first()).cloned() {
             // A question is answered on a card of its own.

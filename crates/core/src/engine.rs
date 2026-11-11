@@ -110,6 +110,9 @@ pub enum AgentEvent {
     Window(u64),
     /// Where the account's plan limits stand.
     Limits(Limits),
+    /// The account's usage limit stopped the turn, which ends next. When
+    /// the limit lifts is in the account's [`Limits`], if its provider said.
+    LimitReached,
     /// What the context holds, by kind (system prompt, tools, messages, …).
     Context(Vec<ContextPart>),
     /// The Claude Agent's own session id, to resume it later.
@@ -273,6 +276,7 @@ impl Session {
             | AgentEvent::PermissionGone(_)
             | AgentEvent::Status(_)
             | AgentEvent::Limits(_)
+            | AgentEvent::LimitReached
             | AgentEvent::TurnEnded { .. }
             | AgentEvent::Disconnected(_) => return,
         }

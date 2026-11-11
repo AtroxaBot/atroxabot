@@ -32,11 +32,22 @@ pub enum ConnectionKind {
     /// Any OpenAI-compatible gateway (`OpenRouter`, Inworld, `OpenAI`, Ollama, ...).
     #[serde(rename = "openai")]
     OpenAi,
+    /// The Codex CLI the user installed and signed in to, driven through
+    /// its app server. AtroxaBot never sees its sign-in.
+    Codex,
 }
 
 impl ConnectionKind {
     /// Every kind, in the order menus list them.
-    pub const ALL: [Self; 3] = [Self::ClaudeAgent, Self::ClaudeApi, Self::OpenAi];
+    pub const ALL: [Self; 4] = [Self::ClaudeAgent, Self::Codex, Self::ClaudeApi, Self::OpenAi];
+
+    /// Whether it runs an agent the user installed and signed in to (Claude
+    /// Code, Codex), which keeps the conversation and brings its own tools,
+    /// rather than an API the app runs the agent loop over.
+    #[must_use]
+    pub fn is_account(self) -> bool {
+        matches!(self, Self::ClaudeAgent | Self::Codex)
+    }
 
     /// The name menus show. "Claude Agent" is the name Anthropic's branding
     /// guidelines ask for; the product is never presented as Claude Code.
@@ -46,6 +57,7 @@ impl ConnectionKind {
             Self::ClaudeAgent => "Claude Agent",
             Self::ClaudeApi => "Claude API",
             Self::OpenAi => "OpenAI-compatible",
+            Self::Codex => "Codex",
         }
     }
 }
@@ -67,7 +79,8 @@ pub struct Connection {
     pub api_key: Option<String>,
     /// For a Claude account: the folder Claude Code keeps this account's
     /// sign-in, settings and history in (its `CLAUDE_CONFIG_DIR`). Empty for
-    /// Claude Code's own default folder, the account it already uses.
+    /// Claude Code's own default folder, the account it already uses. For a
+    /// Codex account, the same of Codex (its `CODEX_HOME`).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub config_dir: String,
 }
@@ -99,6 +112,26 @@ impl Connection {
         let id = crate::session::new_id();
         let config_dir = Config::dir()?.join("claude").join(&id).display().to_string();
         Ok(Self { id, kind: ConnectionKind::ClaudeAgent, name: name.to_owned(), config_dir, ..Self::default() })
+    }
+
+    /// The Codex account the user already has: whoever `codex` is signed
+    /// in as in their terminal, with Codex's own settings.
+    #[must_use]
+    pub fn codex(name: &str) -> Self {
+        Self { id: crate::session::new_id(), kind: ConnectionKind::Codex, name: name.to_owned(), ..Self::default() }
+    }
+
+    /// Another Codex account, kept apart from the first: Codex is started
+    /// for it with a home folder of its own under `~/.atroxabot/codex/`
+    /// (`CODEX_HOME`), where it keeps that account's sign-in, settings and
+    /// conversations. The user signs in to it with Codex itself.
+    ///
+    /// # Errors
+    /// [`Error::NoHomeDir`] if the platform reports no home directory.
+    pub fn codex_account(name: &str) -> Result<Self> {
+        let id = crate::session::new_id();
+        let config_dir = Config::dir()?.join("codex").join(&id).display().to_string();
+        Ok(Self { id, kind: ConnectionKind::Codex, name: name.to_owned(), config_dir, ..Self::default() })
     }
 
     /// The host of its address, for showing where an API connection goes.
@@ -243,6 +276,20 @@ pub struct Config {
     /// or Dock), `minimize` or `quit`; the platform's default if unset.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub close: Option<String>,
+    /// What happens when an account's usage limit stops a turn: `wait` (go
+    /// on once it lifts), `switch` (go on with another account of the same
+    /// kind that has usage left) or `stop`; `wait` if unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub out_of_limits: Option<String>,
+    /// The repositories the app made worktrees in: what it tidies after
+    /// their sessions are gone (see [`crate::worktree`]).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub worktree_repos: Vec<String>,
+    /// How many days a session may go unused before its worktree, when
+    /// nothing in it is uncommitted, is taken away: a number, or `never`.
+    /// Three days when unset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree_idle: Option<String>,
     /// Settings a newer version wrote, kept as they are.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
@@ -335,6 +382,18 @@ impl Config {
         self.recent_folders.retain(|recent| recent != folder);
         self.recent_folders.insert(0, folder.to_owned());
         self.recent_folders.truncate(8);
+    }
+
+    /// How many seconds a session may go unused before its clean worktree
+    /// is taken away; `None` to keep it for as long as the session is there.
+    #[must_use]
+    pub fn worktree_idle_seconds(&self) -> Option<u64> {
+        const DAY: u64 = 86_400;
+        match self.worktree_idle.as_deref().map(str::trim) {
+            Some("never") => None,
+            Some(days) => Some(days.parse::<u64>().map_or(3, |days| days.clamp(1, 3650)) * DAY),
+            None => Some(3 * DAY),
+        }
     }
 
     /// Every connection an agent can use, the built-in one (if the user kept it) first.
@@ -442,6 +501,13 @@ mod tests {
             config.use_folder(folder);
         }
         assert_eq!(config.recent_folders, ["a", "b"], "newest first, once each");
+        let idle = |setting: Option<&str>| {
+            Config { worktree_idle: setting.map(str::to_owned), ..Config::default() }.worktree_idle_seconds()
+        };
+        assert_eq!(
+            [idle(None), idle(Some("7")), idle(Some("never")), idle(Some("soon")), idle(Some("0"))],
+            [Some(259_200), Some(604_800), None, Some(259_200), Some(86_400)]
+        );
         let server = McpServer { vars: "TOKEN = s3cret\n\n=x\nplain\nA=b=c".into(), ..McpServer::default() };
         assert_eq!(server.pairs(), [("TOKEN".to_owned(), "s3cret".to_owned()), ("A".to_owned(), "b=c".to_owned())]);
         assert!(!format!("{server:?}").contains("s3cret"));

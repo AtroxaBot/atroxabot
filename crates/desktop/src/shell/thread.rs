@@ -15,6 +15,7 @@ use serde_json::Value;
 use winit::window::CursorIcon;
 
 use super::elapsed;
+use super::limits::Resume;
 use super::menu::folder_name;
 use super::queue::Waiting;
 use super::widgets::Scroll;
@@ -246,6 +247,15 @@ pub(super) struct Thread {
     /// The model and effort the last message went with: a Claude account's
     /// process keeps the ones it started with, so other ones need a new process.
     pub sent_with: Option<(String, String)>,
+    /// The account's usage limit stopped the running turn, as its agent said.
+    pub limited: bool,
+    /// The account was refused during the running turn (it may still have
+    /// gone on, on extra usage): a turn that fails now failed for it.
+    pub refused: bool,
+    /// The usage limit stopped the session, which goes on by itself then (`limits.rs`).
+    pub resume: Option<Resume>,
+    /// How many turns in a row a usage limit stopped.
+    pub tries: u32,
 }
 
 impl Thread {
@@ -279,6 +289,10 @@ impl Thread {
             doing: String::new(),
             clicked_picture: None,
             sent_with: None,
+            limited: false,
+            refused: false,
+            resume: None,
+            tries: 0,
         }
     }
 
@@ -300,6 +314,9 @@ impl Thread {
     pub fn begin_turn(&mut self) {
         self.busy = true;
         self.stopping = false;
+        (self.limited, self.refused) = (false, false);
+        // Whatever started it, the session is not waiting to go on any more.
+        self.resume = None;
         self.follow = true;
         self.status.clear();
         self.started = Some(Instant::now());

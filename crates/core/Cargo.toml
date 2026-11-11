@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 atroxabot-claude-agent.workspace = true
+atroxabot-codex.workspace = true
 atroxabot-mcp.workspace = true
 flate2.workspace = true
 serde.workspace = true

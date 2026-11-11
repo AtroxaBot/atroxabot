@@ -1,8 +1,8 @@
 # CLAUDE.md
 
 AtroxaBot is a native desktop app for agents the user chats with and calls. It is a Cargo workspace:
-`crates/claude-agent` (the Rust port of the Claude Agent SDK's transport), `crates/mcp` (a small MCP
-client), `crates/core` (agents, sessions, API client, agent loop and tools, usage statistics, git; no GUI), `crates/voice` (Fish
+`crates/claude-agent` (the Rust port of the Claude Agent SDK's transport), `crates/codex` (the transport
+for the installed Codex CLI's app server), `crates/mcp` (a small MCP client), `crates/core` (agents, sessions, API client, agent loop and tools, usage statistics, git, the sessions' worktrees; no GUI), `crates/voice` (Fish
 Audio and ElevenLabs, the call loop, audio devices) and `crates/desktop` (the app; package and binary
 `atroxabot`). `README.md` describes every feature, the crate layout and the storage format: read it before
 changing behaviour, and keep it current when you do.
@@ -28,6 +28,12 @@ cargo fmt --all --check
   product name of ours (a plain statement that it runs the user's Claude Code is fine). The README's
   section on this is the reference; re-read Anthropic's pages linked there before changing how the binary
   is started.
+- **Codex accounts, the same way.** Run the user's installed Codex binary as published (`codex
+  app-server`), never a `.cmd` shim. Never read, store or forward its credentials, never send
+  `account/login/start`, and refuse its requests for tokens: signing in is `codex login`, started in a
+  terminal the user sees. The app sets `CODEX_HOME` to select an extra account's folder and never looks
+  inside it. What the app gives Codex (MCP servers, the skill library) is for the run only: nothing is
+  written to an account's configuration.
 - **Rust-native, custom UI.** `winit` + `wgpu`, and we draw the app's interface ourselves. No UI
   frameworks (egui, iced, Tauri, …).
 - **Beautiful, elegant and fast.** Redraw only when something changes, do minimal work per frame, and keep
@@ -44,7 +50,13 @@ cargo fmt --all --check
   earlier turns of a request; add a note to the newest user message instead (see `CALL_STARTED`).
 - **Secrets:** never log an API key. Config files are written atomically, `0600` on Unix. A key is only
   sent to the address it was saved for. Agents' file tools never reach `~/.atroxabot` (`tools::risk`),
-  except to read the installed skills (`library/skills/`).
+  except to read the installed skills (`library/skills/`) and to work in the sessions' worktrees
+  (`worktrees/`).
+- **Worktrees clean up after themselves** (`core/src/worktree.rs`, whose module comment is the rule book).
+  Never leave one behind: whatever makes a worktree records it on its session, whatever removes a session
+  removes its worktree, and nothing is removed while a `worktree::Lease` is held or while it has
+  uncommitted changes the user was not told of. A new way to make or drop a worktree gets a test against
+  real git there.
 - **Safety:** links from replies only open `http(s)` and `mailto`. A tool call that changes something,
   runs a command or goes online is asked about unless the agent's autonomy allows it.
 - **Testing:** the owner tests the GUI. Don't drive the app with computer use; `cargo build`, `clippy`
@@ -72,12 +84,15 @@ which platform a provider is. Never use one as the app's own branding.
   the composer float on `Palette::surface` with a soft shadow. The top bar holds only what belongs to
   the session; the sidebar holds the app's as icons: search and a new agent over the agents, settings
   and statistics at its foot. Under the message box: the paperclip at the left, the model at the right.
+- Whether a session works in a worktree of its own is a switch in the folder menu of the top bar, the
+  session's until its worktree is made; what is on disk is listed in the settings (`shell/worktrees.rs`).
 - An agent has no model or effort in its editor: both are chosen under the message box. There is no
   "auto" effort; `Shell::effort_in_use` gives every model a level of its own.
 - What the agent needs from the user rides on a card over the message box: an approval (`draw_ask`) or a
   question (`shell/question.rs`). What the user sends while the agent works waits in a tray just above the
   message box until the agent reads it at its next step (`shell/queue.rs`); it is never a separate list or
-  window. A subagent is a card in the conversation and a row in the side
+  window. A session an account's usage limit stopped says in that tray when it goes on by itself
+  (`shell/limits.rs`); it only does while the user leaves it be, and never writes in the user's name. A subagent is a card in the conversation and a row in the side
   panel's list under the tasks; either opens it in the conversation's place (`shell/thread.rs`), never as
   tabs or a separate window.
 - An agent's system prompt is its own (`Agent::system_prompt`, plus `CLAUDE_TOOLS` on a Claude account),

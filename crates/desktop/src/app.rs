@@ -18,10 +18,11 @@ use atroxabot_core::git;
 use atroxabot_core::skills::{self, Library, Skill};
 use atroxabot_core::stats::{self, Ledger, Record};
 use atroxabot_core::tools::Workspace;
+use atroxabot_core::worktree;
 use atroxabot_core::{
-    Agent, AgentEvent, ApiEngine, ClaudeAgent, ClaudeError, ClaudeInfo, ClaudeMcpServer, Client, Config, Connection,
-    ConnectionKind, Control, Error, FollowUp, Limits, McpHub, McpServer, Model, Records, SearchHit, Session,
-    SessionStore, SessionSummary, Verdict,
+    Agent, AgentEvent, ApiEngine, ClaudeAgent, ClaudeError, ClaudeInfo, ClaudeMcpServer, Client, CodexAgent,
+    CodexError, CodexInfo, Config, Connection, ConnectionKind, Control, Error, FollowUp, Limits, McpHub, McpServer,
+    Model, Records, SearchHit, Session, SessionStore, SessionSummary, Verdict,
 };
 use atroxabot_voice::{Call, CallEvent, CallOptions, VoiceConfig};
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -95,6 +96,13 @@ pub enum WorkerEvent {
         /// Its models and who is signed in, or why it could not be asked.
         result: Result<ClaudeInfo, ClaudeError>,
     },
+    /// Codex said (or could not say) what a Codex account offers.
+    CodexInfo {
+        /// The account's connection id.
+        connection: String,
+        /// Its models and who is signed in, or why it could not be asked.
+        result: Result<CodexInfo, CodexError>,
+    },
     /// Claude Code said (or could not say) which MCP servers a Claude account's sessions get.
     Connectors {
         /// The account's connection id.
@@ -120,6 +128,17 @@ pub enum WorkerEvent {
     },
     /// A skill library job is done.
     Skills(skills::Report),
+    /// Something asked about the sessions' worktrees is done.
+    Worktree(worktree::Report),
+    /// A session's worktree is ready for the message that waited for it (or could not be made).
+    WorktreeReady {
+        /// The message that waits.
+        pending: Box<Pending>,
+        /// The engine it was to go to ([`App::renew`]): a newer one means it was given up.
+        generation: u64,
+        /// The worktree and the hold on it, or why there is none.
+        prepared: Result<worktree::Prepared, String>,
+    },
     /// A folder's files were listed, for naming one in a message.
     Files {
         /// The folder.
@@ -133,6 +152,15 @@ pub enum WorkerEvent {
     Problem(String),
     /// The tray icon was clicked, or another start of the app asks for the window.
     Tray(TrayEvent),
+}
+
+/// A message on its way to an engine: what [`Action::Send`] carries.
+pub struct Pending {
+    agent: Agent,
+    connection: Connection,
+    model: Option<Box<Model>>,
+    session: Session,
+    text: String,
 }
 
 /// Something the interface wants done that needs a thread, a file or a device.
@@ -171,7 +199,7 @@ pub enum Action {
         /// The answer.
         verdict: Verdict,
     },
-    /// End the Claude Agent process of this session, if it has one.
+    /// End the agent's process (Claude Code, Codex) of this session, if it has one.
     CloseLive(String),
     /// Ask the Claude Agent process of this session, if it has one, what its context holds.
     AskContext(String),
@@ -195,6 +223,10 @@ pub enum Action {
     ProbeConnectors(Box<Connection>),
     /// Open Claude Code's own sign-in for a Claude account, in a terminal.
     ClaudeLogin(Box<Connection>),
+    /// Ask Codex what a Codex account offers.
+    ProbeCodex(Box<Connection>),
+    /// Open Codex's own sign-in for a Codex account, in a terminal.
+    CodexLogin(Box<Connection>),
     /// Search every session's messages.
     Search {
         /// The text to find.
@@ -217,6 +249,8 @@ pub enum Action {
     },
     /// Change the skill library, or read a repository of skills.
     Skills(skills::Job),
+    /// Look after the sessions' worktrees: clean up, take one away, measure.
+    Worktree(worktree::Job),
     /// List a folder's files, for naming one in a message.
     ListFiles(String),
     /// Ask for a folder.
@@ -307,10 +341,15 @@ pub struct App {
     agents: Option<Records>,
     /// Performs every file write, in order, off the UI thread.
     writer: Writer,
-    /// The Claude Agent process of each session that has one.
-    live: HashMap<String, ClaudeAgent>,
+    /// The agent's process (Claude Code, Codex) of each session that has one.
+    live: HashMap<String, Live>,
     /// The running API turn of each session that has one.
     turns: HashMap<String, Control>,
+    /// The hold on the worktree of each session something works in (a
+    /// turn, an agent's process): nothing cleans it up meanwhile.
+    leases: HashMap<String, worktree::Lease>,
+    /// The sessions whose message waits for its worktree to be ready.
+    preparing: HashSet<String>,
     /// The engine (a Claude process, an API turn) each session hears from,
     /// by a number given to each: what one it replaced still says is dropped.
     generations: HashMap<String, u64>,
@@ -455,6 +494,8 @@ impl App {
             writer,
             live: HashMap::new(),
             turns: HashMap::new(),
+            leases: HashMap::new(),
+            preparing: HashSet::new(),
             generations: HashMap::new(),
             next_generation: 1,
             approved: HashMap::new(),
@@ -700,6 +741,10 @@ impl App {
             WorkerEvent::Agent { session, event, .. } => {
                 if matches!(event, AgentEvent::TurnEnded { .. }) {
                     self.turns.remove(&session);
+                    // A turn through an API is all that worked in its worktree; a process stays in it.
+                    if !self.live.contains_key(&session) {
+                        self.leases.remove(&session);
+                    }
                 }
                 self.shell.agent_event(&session, event, &mut actions);
             }
@@ -725,6 +770,12 @@ impl App {
                 }
                 self.shell.claude_info(&connection, result);
             }
+            WorkerEvent::CodexInfo { connection, result } => {
+                if let Err(e) = &result {
+                    log::error(format!("Codex could not be asked about an account: {e}"));
+                }
+                self.shell.codex_info(&connection, result, &mut actions);
+            }
             WorkerEvent::Connectors { connection, result } => {
                 if let Err(e) = &result {
                     log::error(format!("Claude Code could not say which MCP servers an account has: {e}"));
@@ -736,6 +787,30 @@ impl App {
             WorkerEvent::Git { folder, report } => self.shell.git_report(&folder, report),
             WorkerEvent::Files { folder, files } => self.shell.files_listed(&folder, files),
             WorkerEvent::Skills(report) => self.shell.skills_report(report),
+            WorkerEvent::Worktree(report) => self.shell.worktree_report(report, &mut actions),
+            WorkerEvent::WorktreeReady { pending, generation, prepared } => {
+                let Pending { agent, connection, model, mut session, text } = *pending;
+                let id = session.id.clone();
+                // Stopped or deleted meanwhile: the message no longer goes. One sent since then is
+                // waiting for a worktree of its own asking, and is not this one's to answer for.
+                let wanted = self.generations.get(&id) == Some(&generation) && self.preparing.remove(&id);
+                match prepared {
+                    Ok(prepared) => {
+                        // Made is made: the session keeps it either way, so it is found again and cleaned up.
+                        self.shell.worktree_ready(&id, &prepared.worktree, &prepared.workdir, &mut actions);
+                        if wanted {
+                            session.worktree = Some(prepared.worktree);
+                            session.workdir = prepared.workdir;
+                            self.leases.insert(id, prepared.lease);
+                            self.start_turn(&agent, &connection, model, session, &text);
+                        }
+                    }
+                    Err(problem) if wanted => {
+                        fail(self.emitter(&id), format!("Its worktree could not be made ready: {problem}"));
+                    }
+                    Err(_) => {}
+                }
+            }
             WorkerEvent::Problem(text) => self.shell.notify(text),
         }
         self.apply(actions);
@@ -754,6 +829,10 @@ impl App {
                 self.send(&agent, &connection, model, *session, &text);
             }
             Action::Stop(session) => {
+                // Not started yet: its worktree is still being made ready.
+                if self.preparing.remove(&session) {
+                    self.emitter(&session)(AgentEvent::TurnEnded { problem: None });
+                }
                 if let Some(turn) = self.turns.get(&session) {
                     turn.stop();
                 }
@@ -762,6 +841,9 @@ impl App {
                 }
             }
             Action::Interrupt(session) => {
+                if self.preparing.remove(&session) {
+                    self.emitter(&session)(AgentEvent::TurnEnded { problem: None });
+                }
                 // An API turn ends; the shell sends what it had not read as the next message.
                 if let Some(turn) = self.turns.get(&session) {
                     turn.stop();
@@ -772,8 +854,7 @@ impl App {
             }
             Action::FollowUp { session, message } => {
                 if let Some(live) = self.live.get(&session) {
-                    // Fails only if the process is gone, which ends the turn.
-                    let _ = live.follow_up(*message);
+                    live.follow_up(*message);
                 } else if let Some(turn) = self.turns.get(&session) {
                     turn.follow_up(*message);
                 }
@@ -787,7 +868,8 @@ impl App {
             }
             Action::CloseLive(session) => {
                 if let Some(live) = self.live.remove(&session) {
-                    retire(live);
+                    // Its worktree is let go once the process has ended.
+                    retire(live, self.leases.remove(&session));
                 }
             }
             Action::AskContext(session) => {
@@ -805,6 +887,7 @@ impl App {
             }
             Action::SaveSession(session) => self.writer.send(Job::SaveSession(session)),
             Action::DeleteSession(session) => {
+                self.preparing.remove(&session);
                 self.approved.remove(&session);
                 self.skill_sets.remove(&session);
                 self.writer.send(Job::DeleteSession(session));
@@ -843,6 +926,21 @@ impl App {
                     self.shell.notify(format!("The sign-in could not be opened: {e}"));
                 }
             }
+            Action::ProbeCodex(connection) => self.spawn(move || WorkerEvent::CodexInfo {
+                result: atroxabot_core::codex_info(&connection),
+                connection: connection.id.clone(),
+            }),
+            Action::CodexLogin(connection) => {
+                // Codex's own sign-in, in a terminal the user sees: the app only starts it.
+                let started = atroxabot_core::codex_login(&connection)
+                    .ok_or_else(|| "Codex is not installed.".to_owned())
+                    .and_then(|login| {
+                        platform::run_in_terminal(&login.program, &login.args, &login.env).map_err(|e| e.to_string())
+                    });
+                if let Err(e) = started {
+                    self.shell.notify(format!("The sign-in could not be opened: {e}"));
+                }
+            }
             Action::Search { query, generation } => {
                 if let Some(store) = self.sessions_dir.clone().map(SessionStore::at) {
                     self.spawn(move || WorkerEvent::SearchResults {
@@ -866,6 +964,7 @@ impl App {
                 self.spawn(move || WorkerEvent::Git { report: git::run(std::path::Path::new(&folder), job), folder });
             }
             Action::Skills(job) => self.spawn(move || WorkerEvent::Skills(skills::run(job))),
+            Action::Worktree(job) => self.spawn(move || WorkerEvent::Worktree(worktree::run(job))),
             Action::ListFiles(folder) => {
                 self.spawn(move || WorkerEvent::Files { files: git::files(std::path::Path::new(&folder)), folder });
             }
@@ -979,8 +1078,42 @@ impl App {
         self.mcp.as_ref().map(|(_, hub)| hub.clone())
     }
 
-    /// Starts the turn answering the latest prompt of `session`.
+    /// Answers the latest prompt of `session`. One that works in a
+    /// worktree waits for it to be there first: made on its first message,
+    /// made again if it was cleaned up since.
     fn send(
+        &mut self,
+        agent: &Agent,
+        connection: &Connection,
+        model: Option<Box<Model>>,
+        session: Session,
+        text: &str,
+    ) {
+        // With a hold on it already (its agent's process is up), it is there.
+        if session.worktree.is_none() || self.leases.contains_key(&session.id) {
+            self.start_turn(agent, connection, model, session, text);
+            return;
+        }
+        let id = session.id.clone();
+        self.renew(&id);
+        self.preparing.insert(id.clone());
+        self.emitter(&id)(AgentEvent::Status("Getting its worktree ready…".to_owned()));
+        let generation = self.generations.get(&id).copied().unwrap_or_default();
+        let pending = Box::new(Pending {
+            agent: agent.clone(),
+            connection: connection.clone(),
+            model,
+            session,
+            text: text.to_owned(),
+        });
+        self.spawn(move || {
+            let prepared = worktree::prepare(&pending.session);
+            WorkerEvent::WorktreeReady { pending, generation, prepared }
+        });
+    }
+
+    /// Starts the turn answering the latest prompt of `session`.
+    fn start_turn(
         &mut self,
         agent: &Agent,
         connection: &Connection,
@@ -994,26 +1127,39 @@ impl App {
             Some(atroxabot_core::Entry::User { files, .. }) => files.clone(),
             _ => Vec::new(),
         };
-        if connection.kind == ConnectionKind::ClaudeAgent {
+        if connection.kind.is_account() {
             if !self.live.contains_key(&id) {
                 self.renew(&id);
             }
             let mut emit = self.emitter(&id);
+            let codex = connection.kind == ConnectionKind::Codex;
             // One process serves the session until it is closed or its agent changes.
-            let mcp = atroxabot_core::claude_mcp_config(&self.shell.config.mcp);
-            let sent = match self.live.get(&id) {
-                Some(live) => live.send(text, &files),
-                None => ClaudeAgent::connect(agent, connection, &session, mcp, self.emitter(&id)).and_then(|live| {
+            let servers = &self.shell.config.mcp;
+            let sent = if let Some(live) = self.live.get(&id) {
+                live.send(text, &files)
+            } else {
+                let started = if codex {
+                    CodexAgent::connect(agent, connection, &session, servers, self.emitter(&id))
+                        .map(Live::Codex)
+                        .map_err(|e| e.to_string())
+                } else {
+                    let mcp = atroxabot_core::claude_mcp_config(servers);
+                    ClaudeAgent::connect(agent, connection, &session, mcp, self.emitter(&id))
+                        .map(Live::Claude)
+                        .map_err(|e| e.to_string())
+                };
+                started.and_then(|live| {
                     let sent = live.send(text, &files);
                     self.live.insert(id.clone(), live);
                     sent
-                }),
+                })
             };
             if let Err(e) = sent {
                 if let Some(live) = self.live.remove(&id) {
-                    retire(live);
+                    retire(live, self.leases.remove(&id));
                 }
-                emit(AgentEvent::TurnEnded { problem: Some(format!("The Claude Agent could not be reached: {e}")) });
+                let who = if codex { "Codex" } else { "The Claude Agent" };
+                fail(&mut emit, format!("{who} could not be reached: {e}"));
             }
             return;
         }
@@ -1030,7 +1176,7 @@ impl App {
             client: client_for(connection),
             model: agent.model.clone(),
             effort: Some(agent.effort.clone()).filter(|effort| !effort.is_empty()),
-            system: agent.system_prompt(&session.folder()),
+            system: format!("{}{}", agent.system_prompt(&session.folder()), session.worktree_note()),
             workspace,
             autonomy: agent.autonomy,
             // Anthropic's own web tools; other providers have none to offer here.
@@ -1049,7 +1195,7 @@ impl App {
         });
         if let Err(e) = spawned {
             self.turns.remove(&id);
-            self.emitter(&id)(AgentEvent::TurnEnded { problem: Some(format!("The turn could not be started: {e}")) });
+            fail(self.emitter(&id), format!("The turn could not be started: {e}"));
         }
     }
 
@@ -1105,6 +1251,8 @@ impl App {
         let view = self.view();
         let maximized = self.window.is_maximized();
         let mut actions = Vec::new();
+        // What is due is done before it is drawn (a busy app never sleeps long enough for its timer).
+        self.shell.tick(&mut actions);
         let mut command = None;
         // A second pass runs only if the glyph atlas overflowed mid-frame.
         for _ in 0..2 {
@@ -1190,19 +1338,29 @@ impl App {
         }
     }
 
-    /// How long the event loop may sleep: until the caret blinks next, or a tooltip shows.
+    /// How long the event loop may sleep: until the caret blinks next, a
+    /// tooltip shows, or something the shell waits for is due.
     pub fn control_flow(&self) -> ControlFlow {
         let blink = self.ui.focused.then(|| self.last_frame + Duration::from_secs_f32(self.ui.next_blink().max(0.01)));
         // A tooltip shows once the mouse has rested a moment, with nothing else moving.
         let tip = self.ui.next_tip().map(|left| self.last_frame + Duration::from_secs_f32(left.max(0.01)));
-        match blink.into_iter().chain(tip).chain(self.gpu_retry).min() {
+        // A session going on after a usage limit, or a limit's notice going: the clock is looked at once a
+        // minute meanwhile (a sleeping computer stops the event loop's own), and what counts down is redrawn.
+        let due = self.shell.next_wake().map(|at| {
+            let left = at.saturating_sub(atroxabot_core::unix_now()).clamp(1, 60);
+            Instant::now() + Duration::from_secs(left)
+        });
+        match blink.into_iter().chain(tip).chain(self.gpu_retry).chain(due).min() {
             Some(at) => ControlFlow::WaitUntil(at),
             None => ControlFlow::Wait,
         }
     }
 
-    /// A timer fired: redraws for the caret.
+    /// A timer fired: does what the shell has due, and redraws for the caret.
     pub fn wake(&mut self) {
+        let mut actions = Vec::new();
+        self.shell.tick(&mut actions);
+        self.apply(actions);
         self.window.request_redraw();
     }
 }
@@ -1210,7 +1368,7 @@ impl App {
 impl Drop for App {
     fn drop(&mut self) {
         self.hang_up();
-        // The Claude Agent processes end with the app.
+        // The agents' processes end with the app.
         for (_, live) in self.live.drain() {
             live.close();
         }
@@ -1253,10 +1411,84 @@ fn provider_icons() -> HashMap<String, String> {
     pictures.filter_map(|path| Some((path.file_stem()?.to_str()?.to_lowercase(), path.display().to_string()))).collect()
 }
 
-/// Lets a Claude Agent process go on another thread: closing it waits for
-/// the process, which the UI must not.
-fn retire(live: ClaudeAgent) {
-    let _ = std::thread::Builder::new().name("atroxabot-retire".into()).spawn(move || live.close());
+/// The agent's process of a session: the Claude Code or the Codex the user installed.
+enum Live {
+    Claude(ClaudeAgent),
+    Codex(CodexAgent),
+}
+
+impl Live {
+    /// Sends the user's message, with the files that go with it.
+    fn send(&self, text: &str, files: &[String]) -> Result<(), String> {
+        match self {
+            Self::Claude(agent) => agent.send(text, files).map_err(|e| e.to_string()),
+            Self::Codex(agent) => agent.send(text, files).map_err(|e| e.to_string()),
+        }
+    }
+
+    /// Hands it a message the user wrote while it works.
+    fn follow_up(&self, message: FollowUp) {
+        // Fails only if the process is gone, which ends the turn.
+        match self {
+            Self::Claude(agent) => drop(agent.follow_up(message)),
+            Self::Codex(agent) => drop(agent.follow_up(message)),
+        }
+    }
+
+    /// Stops the turn in progress; what was handed over and not read yet is
+    /// dropped when `cancel_queued`. (Codex keeps none: the app sends it again.)
+    fn interrupt(&self, cancel_queued: bool) {
+        match self {
+            Self::Claude(agent) => agent.interrupt(cancel_queued),
+            Self::Codex(agent) => agent.interrupt(),
+        }
+    }
+
+    /// Answers the approval `id`.
+    fn decide(&self, id: &str, verdict: Verdict) {
+        match self {
+            Self::Claude(agent) => agent.decide(id, verdict),
+            Self::Codex(agent) => agent.decide(id, verdict),
+        }
+    }
+
+    /// Asks what the context holds, of an agent that can say.
+    fn ask_context(&self) {
+        if let Self::Claude(agent) = self {
+            agent.ask_context();
+        }
+    }
+
+    /// Ends the process, waiting for it.
+    fn close(&self) {
+        match self {
+            Self::Claude(agent) => agent.close(),
+            Self::Codex(agent) => agent.close(),
+        }
+    }
+}
+
+/// Lets an agent's process go on another thread: closing it waits for
+/// the process, which the UI must not. The hold on the worktree it worked
+/// in, if any, ends once it has.
+fn retire(live: Live, lease: Option<worktree::Lease>) {
+    let _ = std::thread::Builder::new().name("atroxabot-retire".into()).spawn(move || {
+        live.close();
+        drop(lease);
+    });
+}
+
+/// Ends a turn that could not start, with `problem` as the reply the user reads.
+fn fail(mut emit: impl FnMut(AgentEvent), problem: String) {
+    emit(AgentEvent::ReplyStarted);
+    emit(AgentEvent::ReplyEnded {
+        raw: Vec::new(),
+        model: String::new(),
+        usage: atroxabot_core::Usage::default(),
+        cost: 0.0,
+        problem: problem.clone(),
+    });
+    emit(AgentEvent::TurnEnded { problem: Some(problem) });
 }
 
 /// The client for an API connection: Messages for a Claude API one

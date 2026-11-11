@@ -8,7 +8,7 @@
 
 use atroxabot_core::git::{Change, GitFile, GitStatus, Job, Report};
 use atroxabot_core::stats::Ledger;
-use atroxabot_core::{ConnectionKind, ContextPart, Limits, Todo, TodoState};
+use atroxabot_core::{ContextPart, Limits, Todo, TodoState};
 use winit::window::CursorIcon;
 
 use super::menu::Menu;
@@ -100,10 +100,15 @@ pub(super) fn limit_bars(p: &mut Painter, limits: &Limits, (x, mut y, w): (f32, 
         if window.resets > 0 {
             let when = if over {
                 "Started over since".to_owned()
+            } else if full >= 1.0 {
+                format!("Limit reached · starts over {}", until(now, window.resets))
             } else {
                 format!("Starts over {}", until(now, window.resets))
             };
-            p.label(&when, theme::TINY, x, y, t.text_faint);
+            p.label(&when, theme::TINY, x, y, if full >= 1.0 { t.danger } else { t.text_faint });
+            y += 18.0;
+        } else if full >= 1.0 {
+            p.label("Limit reached", theme::TINY, x, y, t.danger);
             y += 18.0;
         }
         y += 8.0;
@@ -452,7 +457,7 @@ impl Shell {
     /// session ran on before). `None` when that is an API provider.
     pub(super) fn limits_account(&self) -> Option<String> {
         let connection = self.selected_agent().and_then(|agent| self.connection(agent))?;
-        (connection.kind == ConnectionKind::ClaudeAgent).then_some(connection.id)
+        connection.kind.is_account().then_some(connection.id)
     }
 
     /// Where the plan limits of the Claude account the top bar names stand,
@@ -503,7 +508,15 @@ impl Shell {
             self.draw_git(p, ui, (x, y, w), rect.bottom(), &status, actions);
             self.git.status.get_or_insert(status);
         } else {
-            let note = if self.git.loading { "Reading…" } else { "This folder is not in a git repository." };
+            let note = if self.git.loading {
+                "Reading…"
+            } else if self.worktree_in_use().is_some() {
+                "Its worktree was cleaned up. The next message makes it again."
+            } else if self.wants_worktree() {
+                "Its worktree is made with the first message."
+            } else {
+                "This folder is not in a git repository."
+            };
             let note = p.layout(note, theme::SMALL, Some(w));
             p.text(&note, x, y, t.text_faint);
         }
@@ -536,6 +549,13 @@ impl Shell {
         let mut sync = p.layout(&sync, theme::TINY, None);
         sync.truncate(p.fonts, w);
         p.text(&sync, x, y, t.text_faint);
+        // A session in a worktree: what it is of, and how its work stands.
+        if let Some(line) = self.worktree_line() {
+            y += 18.0;
+            let mut line = p.layout(&line, theme::TINY, None);
+            line.truncate(p.fonts, w);
+            p.text(&line, x, y, t.text_faint);
+        }
         y += 28.0;
 
         let changes =

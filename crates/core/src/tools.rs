@@ -160,7 +160,9 @@ pub fn risk(name: &str, input: &Value, workspace: &Workspace) -> Risk {
     let path = path.map_or_else(|| workspace.dir.clone(), |path| resolve(path, workspace));
     let notes = workspace.memory.as_deref().is_some_and(|memory| path.starts_with(memory));
     let library = workspace.library.as_deref().is_some_and(|library| path.starts_with(library));
-    let private = !notes && Config::dir().is_ok_and(|dir| path.starts_with(dir));
+    // The sessions' worktrees are kept in the data folder, and are checkouts like any other.
+    let private =
+        !notes && Config::dir().is_ok_and(|dir| path.starts_with(&dir) && !path.starts_with(dir.join("worktrees")));
     let inside = notes || path.starts_with(&workspace.dir);
     match name {
         skills::TOOL => Risk::Safe,
@@ -682,6 +684,15 @@ mod tests {
             let record = private.join("library").join("library.json");
             assert_eq!(risk("read", &json!({ "path": record.to_str().unwrap() }), &ws), Risk::Forbidden);
             assert_eq!(risk(skills::TOOL, &json!({ "name": "pdf" }), &ws), Risk::Safe);
+            // A session's worktree is kept there too, and is a folder to work in like any other.
+            let tree = private.join("worktrees").join("parser-1a2b");
+            let inside = Workspace { dir: tree.join("src"), ..ws.clone() };
+            let file = |name: &str| json!({ "path": tree.join(name).to_str().unwrap() });
+            assert_eq!(risk("write", &file("src/a.rs"), &inside), Risk::Edit);
+            assert_eq!(risk("read", &file("Cargo.toml"), &inside), Risk::Ask, "the rest of it: outside its folder");
+            assert_eq!(risk("read", &json!({ "path": config.to_str().unwrap() }), &inside), Risk::Forbidden);
+            let sneaky = tree.join("..").join("..").join("config.json");
+            assert_eq!(risk("read", &json!({ "path": sneaky.to_str().unwrap() }), &inside), Risk::Forbidden);
         }
         fs::remove_dir_all(&ws.dir).unwrap();
     }

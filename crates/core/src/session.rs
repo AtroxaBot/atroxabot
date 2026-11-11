@@ -28,6 +28,7 @@ use crate::agent::Agent;
 use crate::config::{Config, write_private};
 use crate::error::{Error, Result};
 use crate::responses::Usage;
+use crate::worktree::Worktree;
 
 /// Name of the index file. The leading dot keeps it out of session scans,
 /// since `.` is not a valid id character.
@@ -74,6 +75,10 @@ pub struct Session {
     /// engine said; empty when it did not.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<ContextPart>,
+    /// The git worktree of its own it works in, when it asked for one:
+    /// [`Session::workdir`] is a folder in it once it is made. See [`crate::worktree`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<Worktree>,
     /// What was said and done, oldest first.
     pub entries: Vec<Entry>,
 }
@@ -314,9 +319,10 @@ impl Session {
     }
 
     /// Gives `agent` the model and effort chosen in this session, when they
-    /// were chosen on the provider it thinks through now.
-    pub fn apply_choice(&self, agent: &mut Agent) {
-        if !self.provider.is_empty() && self.provider == agent.connection {
+    /// were chosen on the provider it thinks through now, or on one that
+    /// offers the same models (`kin`: another account of the same kind).
+    pub fn apply_choice(&self, agent: &mut Agent, kin: bool) {
+        if !self.provider.is_empty() && (kin || self.provider == agent.connection) {
             self.model.clone_into(&mut agent.model);
             self.effort.clone_into(&mut agent.effort);
         }
@@ -338,6 +344,36 @@ impl Session {
         } else {
             PathBuf::from(chosen)
         }
+    }
+
+    /// The folder the user chose for it: its own, or for a session in a
+    /// worktree the folder of the repository that its folder there stands for.
+    #[must_use]
+    pub fn origin(&self) -> String {
+        let Some(worktree) = self.worktree.as_ref().filter(|worktree| worktree.made()) else {
+            return self.workdir.clone();
+        };
+        match Path::new(&self.workdir).strip_prefix(&worktree.path) {
+            Ok(inside) if inside.as_os_str().is_empty() => worktree.repo.clone(),
+            Ok(inside) => Path::new(&worktree.repo).join(inside).display().to_string(),
+            Err(_) => worktree.repo.clone(),
+        }
+    }
+
+    /// What an agent is told, after where it works, when that is a
+    /// worktree; empty otherwise. The same for the whole session.
+    #[must_use]
+    pub fn worktree_note(&self) -> String {
+        let Some(worktree) = self.worktree.as_ref().filter(|worktree| worktree.made()) else {
+            return String::new();
+        };
+        format!(
+            "\n\nThat folder is a git worktree made for this session: a checkout of its own of the repository `{}`, \
+             on the branch `{}` (started from `{}`). Work there and commit your work on that branch; the user's own \
+             checkout in `{}` is not yours to change. The worktree is removed once its branch is merged, so leave \
+             nothing in it uncommitted that should be kept.",
+            worktree.repo, worktree.branch, worktree.base, worktree.repo
+        )
     }
 
     /// What was said so far, as plain text of at most about `budget` bytes
@@ -469,6 +505,7 @@ impl Session {
             updated: self.updated,
             cost: self.cost(),
             tokens: self.tokens(),
+            worktree: self.worktree.clone().filter(Worktree::made),
         }
     }
 }
@@ -493,6 +530,9 @@ pub struct SessionSummary {
     pub cost: f64,
     /// Total tokens in and out.
     pub tokens: u64,
+    /// The worktree it works in, once made: what the cleaning up goes by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<Worktree>,
 }
 
 /// A session whose messages contain the search text.
@@ -824,7 +864,7 @@ mod tests {
         (agent.connection, agent.model, agent.effort) = ("claude".into(), "opus".into(), "max".into());
         let mut session = Session::new(&agent.id);
         let mut seen = agent.clone();
-        session.apply_choice(&mut seen);
+        session.apply_choice(&mut seen, false);
         assert_eq!(seen.model, "opus", "a session that chose nothing thinks as its agent does");
         session.keep_choice(&agent);
         let json = serde_json::to_string(&session).unwrap();
@@ -833,13 +873,18 @@ mod tests {
         // The agent moves on; the session keeps what it was set to.
         (agent.model, agent.effort) = ("haiku".into(), String::new());
         let mut seen = agent.clone();
-        back.apply_choice(&mut seen);
+        back.apply_choice(&mut seen, false);
         assert_eq!((seen.model.as_str(), seen.effort.as_str()), ("opus", "max"));
         // On another provider those models mean nothing.
         agent.connection = "openai".into();
         let mut seen = agent.clone();
-        back.apply_choice(&mut seen);
+        back.apply_choice(&mut seen, false);
         assert_eq!(seen.model, "haiku");
+        // On another account of the same kind they mean the same.
+        agent.connection = "work".into();
+        let mut seen = agent.clone();
+        back.apply_choice(&mut seen, true);
+        assert_eq!((seen.model.as_str(), seen.effort.as_str()), ("opus", "max"));
     }
 
     fn session(agent: &str, prompt: &str, answer: &str) -> Session {

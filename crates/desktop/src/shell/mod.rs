@@ -11,6 +11,7 @@
 mod agent_form;
 mod call;
 mod composer;
+mod limits;
 mod menu;
 mod panel;
 mod picture;
@@ -25,6 +26,7 @@ mod spotlight;
 mod stats;
 mod thread;
 mod widgets;
+mod worktrees;
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -32,8 +34,8 @@ use std::time::Instant;
 use arboard::Clipboard;
 use atroxabot_core::stats::Ledger;
 use atroxabot_core::{
-    Agent, AgentEvent, CALL_ENDED, CALL_STARTED, ClaudeError, ClaudeInfo, ClaudeMcpServer, Config, Connection,
-    ConnectionKind, Error, Limits, Model, SearchHit, Session, SessionSummary, Verdict, unix_now,
+    Agent, AgentEvent, CALL_ENDED, CALL_STARTED, ClaudeError, ClaudeInfo, ClaudeMcpServer, CodexError, CodexInfo,
+    Config, Connection, ConnectionKind, Error, Limits, Model, SearchHit, Session, SessionSummary, Verdict, unix_now,
 };
 use atroxabot_voice::CallEvent;
 use winit::event::KeyEvent;
@@ -117,6 +119,38 @@ enum Account {
     Ready(Box<ClaudeInfo>),
 }
 
+/// What is known of a Codex account: what Codex said when asked.
+#[derive(Debug, Clone)]
+enum CodexAccount {
+    /// Being asked.
+    Checking,
+    /// Codex is not installed.
+    Missing,
+    /// It could not be asked; why.
+    Failed(String),
+    /// Its models and who is signed in.
+    Ready(Box<CodexInfo>),
+}
+
+/// Something the user is told, on a card under the top bar, until they dismiss it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Notice {
+    /// What it says.
+    text: String,
+    /// For a limit that was reached: when it lifts, in Unix seconds. The
+    /// card says how long that is from now, and goes once it has; 0 for none.
+    lifts: u64,
+    /// The account whose limit it is about; empty for any other news.
+    account: String,
+}
+
+impl Notice {
+    /// What it says at `now`: a limit's with how long until it lifts.
+    fn said(&self, now: u64) -> String {
+        if self.lifts == 0 { self.text.clone() } else { format!("{} It lifts {}.", self.text, until(now, self.lifts)) }
+    }
+}
+
 /// The whole user interface.
 pub struct Shell {
     /// The user's settings; the app saves them when asked to.
@@ -138,8 +172,10 @@ pub struct Shell {
     models: HashMap<String, Models>,
     /// What Claude Code says of each Claude account, by connection id.
     claude: HashMap<String, Account>,
+    /// What Codex says of each Codex account, by connection id.
+    codex: HashMap<String, CodexAccount>,
     /// Problems to tell the user about, oldest first.
-    notices: Vec<String>,
+    notices: Vec<Notice>,
     call: Option<CallView>,
     sidebar_scroll: Scroll,
     /// The repository of the folder the open session works in, for the side panel.
@@ -158,6 +194,17 @@ pub struct Shell {
     was_on_call: bool,
     /// The folder the next new session will work in.
     pending_folder: String,
+    /// Whether it will work there in a git worktree of its own.
+    pending_worktree: bool,
+    /// How each session's worktree stood when it was last looked at, by session.
+    worktrees: HashMap<String, atroxabot_core::worktree::State>,
+    /// Worktree folders left without a session that were kept (they hold changes).
+    orphans: Vec<atroxabot_core::worktree::Orphan>,
+    /// How much disk each worktree's folder takes, once the settings asked.
+    sizes: HashMap<String, u64>,
+    /// The worktrees are being looked at, and when that was last asked for.
+    sweeping: bool,
+    swept: Option<Instant>,
     /// The session the mouse holds in the sidebar, and whether it has been
     /// moved far enough to be a drag and not a click.
     drag: Option<(String, bool)>,
@@ -166,6 +213,8 @@ pub struct Shell {
     /// Each Claude account's MCP servers and connectors, by connection id,
     /// once the MCP settings asked for them.
     connectors: HashMap<String, Connectors>,
+    /// The message being sent goes on after a usage limit stopped its session (`limits.rs`).
+    going_on: bool,
 }
 
 impl Shell {
@@ -192,6 +241,7 @@ impl Shell {
             menu: None,
             models: HashMap::new(),
             claude: HashMap::new(),
+            codex: HashMap::new(),
             notices: Vec::new(),
             call: None,
             sidebar_scroll: Scroll::default(),
@@ -203,9 +253,16 @@ impl Shell {
             confirm_delete: None,
             was_on_call: false,
             pending_folder: String::new(),
+            pending_worktree: false,
+            worktrees: HashMap::new(),
+            orphans: Vec::new(),
+            sizes: HashMap::new(),
+            sweeping: false,
+            swept: None,
             drag: None,
             skills: SkillsView::default(),
             connectors: HashMap::new(),
+            going_on: false,
         }
     }
 
@@ -219,6 +276,8 @@ impl Shell {
         if let Some(agent) = self.agent.clone() {
             self.select_agent(&agent, actions);
         }
+        // What was merged or left behind since the last run is cleaned up.
+        self.sweep_worktrees(actions);
     }
 
     /// What a skill library job came to.
@@ -239,12 +298,42 @@ impl Shell {
         self.limits = limits;
     }
 
-    /// Asks Claude Code what the Claude account `connection` offers.
+    /// Asks Claude Code (or Codex) what the account `connection` offers.
     fn probe(&mut self, connection: &Connection, actions: &mut Vec<Action>) {
-        if connection.kind == ConnectionKind::ClaudeAgent {
-            self.claude.entry(connection.id.clone()).or_insert(Account::Checking);
-            actions.push(Action::ProbeClaude(Box::new(connection.clone())));
+        match connection.kind {
+            ConnectionKind::ClaudeAgent => {
+                self.claude.entry(connection.id.clone()).or_insert(Account::Checking);
+                actions.push(Action::ProbeClaude(Box::new(connection.clone())));
+            }
+            ConnectionKind::Codex => {
+                self.codex.entry(connection.id.clone()).or_insert(CodexAccount::Checking);
+                actions.push(Action::ProbeCodex(Box::new(connection.clone())));
+            }
+            ConnectionKind::ClaudeApi | ConnectionKind::OpenAi => {}
         }
+    }
+
+    /// Codex answered (or could not) about the Codex account `connection`.
+    /// Where its plan's limits stand comes with the answer.
+    pub fn codex_info(&mut self, connection: &str, result: Result<CodexInfo, CodexError>, actions: &mut Vec<Action>) {
+        let account = match result {
+            Ok(info) => {
+                if let Some(limits) = &info.limits {
+                    let limits = atroxabot_core::codex_limits(limits);
+                    merge_limits(self.limits.entry(connection.to_owned()).or_default(), limits);
+                    actions.push(Action::SaveLimits(self.limits.clone()));
+                }
+                CodexAccount::Ready(Box::new(info))
+            }
+            Err(CodexError::NotFound) => CodexAccount::Missing,
+            Err(e) => CodexAccount::Failed(e.to_string()),
+        };
+        self.codex.insert(connection.to_owned(), account);
+    }
+
+    /// Whether the Codex account `connection` is known to be signed in.
+    fn codex_signed_in(&self, connection: &str) -> bool {
+        matches!(self.codex.get(connection), Some(CodexAccount::Ready(info)) if info.account.is_some())
     }
 
     /// Claude Code answered (or could not) about the Claude account `connection`.
@@ -270,8 +359,9 @@ impl Shell {
     /// The window has the user's attention again: an account they may just
     /// have signed in to (in the terminal the app opened) is asked about anew.
     pub fn focused(&mut self, actions: &mut Vec<Action>) {
-        // The files may have changed while the user was elsewhere.
+        // The files may have changed while the user was elsewhere, and a session's work been merged.
         self.refresh_git(actions);
+        self.sweep_worktrees_again(actions);
         // Only while the settings are open: that is where signing in starts.
         if !matches!(self.modal, Some(Modal::Settings(_))) {
             return;
@@ -284,15 +374,27 @@ impl Shell {
             let checking = matches!(self.claude.get(&connection.id), Some(Account::Checking));
             if connection.kind == ConnectionKind::ClaudeAgent && !signed_in && !checking {
                 actions.push(Action::ProbeClaude(Box::new(connection)));
+            } else if connection.kind == ConnectionKind::Codex
+                && !self.codex_signed_in(&connection.id)
+                && !matches!(self.codex.get(&connection.id), Some(CodexAccount::Checking))
+            {
+                actions.push(Action::ProbeCodex(Box::new(connection)));
             }
         }
     }
 
     /// Shows a problem until the user dismisses it.
     pub fn notify(&mut self, text: String) {
-        if self.notices.last() != Some(&text) {
-            self.notices.push(text);
-        }
+        self.notify_about("", text, 0);
+    }
+
+    /// Shows a problem of the account `account` (empty for none) that is
+    /// over at `lifts` (Unix seconds; 0 for one that is not): the card
+    /// counts down to it and goes by itself then.
+    fn notify_about(&mut self, account: &str, text: String, lifts: u64) {
+        // Said again, it is the same card, with the newer time.
+        self.notices.retain(|notice| notice.text != text);
+        self.notices.push(Notice { text, lifts, account: account.to_owned() });
         // Old ones make way: three are plenty to read.
         let extra = self.notices.len().saturating_sub(3);
         self.notices.drain(..extra);
@@ -312,7 +414,7 @@ impl Shell {
     fn agent_in_use(&self) -> Option<Agent> {
         let mut agent = self.selected_agent()?.clone();
         if let Some(thread) = self.thread().filter(|thread| thread.loaded) {
-            thread.session.apply_choice(&mut agent);
+            self.apply_choice(&thread.session, &mut agent);
         }
         Some(agent)
     }
@@ -363,6 +465,12 @@ impl Shell {
             self.notify("Wait for the reply to finish, or stop it, before changing the folder.".into());
             return;
         }
+        if self.worktree_in_use().is_some() {
+            self.notify(
+                "This session works in its own worktree. Start a new session to work in another folder.".into(),
+            );
+            return;
+        }
         match self.thread_mut() {
             Some(thread) => {
                 folder.clone_into(&mut thread.session.workdir);
@@ -404,6 +512,7 @@ impl Shell {
             actions.push(Action::SaveConfig);
         }
         self.pending_folder = self.selected_agent().map(|agent| agent.workdir.clone()).unwrap_or_default();
+        self.pending_worktree = self.selected_agent().is_some_and(|agent| agent.worktree);
         match self.latest_session(agent).map(|session| session.id.clone()) {
             Some(latest) => self.open_session(&latest, actions),
             None => self.current = None,
@@ -436,7 +545,9 @@ impl Shell {
         if let Some(previous) = self.current.take()
             && let Some(thread) = self.threads.get(&previous)
         {
-            self.pending_folder.clone_from(&thread.session.workdir);
+            // Where the one being left worked: for one in a worktree, the folder that stands for.
+            self.pending_folder = thread.session.origin();
+            self.pending_worktree = thread.session.worktree.is_some();
             if !thread.busy {
                 actions.push(Action::CloseLive(previous));
             }
@@ -445,7 +556,8 @@ impl Shell {
 
     /// Asks for an API `connection`'s models unless they are known already.
     fn want_models(&mut self, connection: &Connection, actions: &mut Vec<Action>) {
-        if connection.kind == ConnectionKind::ClaudeAgent || self.models.contains_key(&connection.id) {
+        // An account's models come from its agent, with what else it says of itself.
+        if connection.kind.is_account() || self.models.contains_key(&connection.id) {
             return;
         }
         self.models.insert(connection.id.clone(), Models::Loading);
@@ -563,6 +675,8 @@ impl Shell {
                 }
                 let mut session = Session::new(&owner);
                 session.workdir.clone_from(&self.pending_folder);
+                // Asked for here, made when the message goes.
+                session.worktree = self.pending_worktree.then(atroxabot_core::Worktree::default);
                 // It keeps the model and effort it starts with.
                 session.keep_choice(&agent);
                 let id = session.id.clone();
@@ -578,6 +692,8 @@ impl Shell {
                 call.session.clone_from(&session);
             }
         }
+        // What the user sends is what happens next, not going on by itself after a usage limit.
+        self.cancel_resume(&session);
         let Some(thread) = self.threads.get_mut(&session) else { return };
         if thread.busy {
             if spoken || thread.stopping {
@@ -619,8 +735,25 @@ impl Shell {
                 _ => {}
             }
         }
+        if connection.kind == ConnectionKind::Codex {
+            match self.codex.get(&connection.id) {
+                Some(CodexAccount::Missing) => {
+                    self.notify(
+                        "Codex is not installed. Install it (npm install -g @openai/codex) and sign in, or pick \
+                         another provider."
+                            .into(),
+                    );
+                    return None;
+                }
+                Some(CodexAccount::Ready(info)) if info.account.is_none() && info.requires_auth => {
+                    self.notify(format!("{} is not signed in. Sign in under Settings, Providers.", connection.name));
+                    return None;
+                }
+                _ => {}
+            }
+        }
         // An API needs a model named: the provider's first, when the agent names none.
-        if agent.model.is_empty() && connection.kind != ConnectionKind::ClaudeAgent {
+        if agent.model.is_empty() && !connection.kind.is_account() {
             match self.model_choices(&connection).into_iter().next() {
                 Some(first) => agent.model = first.value,
                 None if connection.kind == ConnectionKind::ClaudeApi => DEFAULT_CLAUDE.clone_into(&mut agent.model),
@@ -662,7 +795,7 @@ impl Shell {
         let Some(mut agent) = self.agents.iter().find(|agent| Some(agent.id.as_str()) == owner).cloned() else {
             return false;
         };
-        thread.session.apply_choice(&mut agent);
+        self.apply_choice(&thread.session, &mut agent);
         let chosen = agent.clone();
         let Some((agent, connection)) = self.ready(agent) else { return false };
         if text.starts_with("/compact") && connection.kind != ConnectionKind::ClaudeAgent {
@@ -674,21 +807,48 @@ impl Shell {
         }
         let model = self.model_info(&connection.id, &agent.model).cloned();
         let Some(thread) = self.threads.get_mut(session) else { return false };
+        let going_on = self.going_on;
         // The agent is told once when a call begins and once when it is over.
         let announced = self.call.as_mut().is_some_and(|call| std::mem::replace(&mut call.announced, true));
         let call_note = match (spoken, announced, self.was_on_call) {
+            _ if going_on => "",
             (true, false, _) => CALL_STARTED,
             (false, _, true) => CALL_ENDED,
             _ => "",
         };
-        self.was_on_call = spoken;
+        if !going_on {
+            self.was_on_call = spoken;
+        }
         let stopped_note = if interrupted { Self::interrupting_note(connection.kind, text) } else { "" };
-        let note =
-            [call_note, stopped_note].into_iter().filter(|note| !note.is_empty()).collect::<Vec<_>>().join("\n\n");
-        let mut sent = if note.is_empty() { text.to_owned() } else { format!("{note}\n\n{text}") };
-        // A Claude account that never saw this conversation is told what was said.
+        // A command (`/compact`) must come first to run: it goes as it is.
+        let limit_note = if going_on && !text.trim_start().starts_with('/') { limits::GO_ON } else { "" };
+        let note = [call_note, stopped_note, limit_note]
+            .into_iter()
+            .filter(|note| !note.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        // Going on by itself with nothing of the user's: an account is only told to; an API is asked in words.
+        let quiet = going_on && text.is_empty() && connection.kind.is_account();
+        let text = if going_on && text.is_empty() && !quiet { "Carry on from where you left off." } else { text };
+        let mut sent = match (note.is_empty(), text.is_empty()) {
+            (true, _) => text.to_owned(),
+            (false, true) => note.clone(),
+            (false, false) => format!("{note}\n\n{text}"),
+        };
+        if going_on {
+            // A line in the conversation says why it went on, and with which account.
+            let ran_on = &thread.session.account;
+            let text = if ran_on.is_empty() || *ran_on == connection.id {
+                "The usage limit lifted · going on".to_owned()
+            } else {
+                let former = self.config.connection(ran_on).map(|former| former.name).unwrap_or_default();
+                format!("{former} is out of usage · going on with {}", connection.name)
+            };
+            thread.session.entries.push(atroxabot_core::Entry::Note { text });
+        }
+        // An account (Claude's or Codex's) that never saw this conversation is told what was said.
         let foreign = thread.session.remote.is_empty() || thread.session.account != connection.id;
-        if connection.kind == ConnectionKind::ClaudeAgent && foreign {
+        if connection.kind.is_account() && foreign {
             let earlier = thread.session.digest(TAKEOVER_BUDGET);
             if !earlier.is_empty() {
                 sent = format!(
@@ -708,15 +868,18 @@ impl Shell {
         if thread.loaded && thread.session.provider != chosen.connection {
             thread.session.keep_choice(&chosen);
         }
-        // A Claude account's process thinks with what it was started with: other choices need a new one.
+        // An account's process thinks with what it was started with: other choices need a new one.
         let with = (agent.model.clone(), agent.effort.clone());
-        if connection.kind == ConnectionKind::ClaudeAgent && thread.sent_with.as_ref().is_some_and(|sent| *sent != with)
-        {
+        if connection.kind.is_account() && thread.sent_with.as_ref().is_some_and(|sent| *sent != with) {
             actions.push(Action::CloseLive(session.to_owned()));
         }
         thread.sent_with = Some(with);
-        thread.session.prompt(text, &note);
-        thread.session.attach(files);
+        if quiet {
+            thread.session.updated = unix_now();
+        } else {
+            thread.session.prompt(text, &note);
+            thread.session.attach(files);
+        }
         thread.begin_turn();
         actions.push(Action::SaveSession(Box::new(thread.session.clone())));
         actions.push(Action::Send {
@@ -743,6 +906,7 @@ impl Shell {
             agent: old.agent.clone(),
             created: old.created,
             workdir: old.workdir.clone(),
+            worktree: old.worktree.clone(),
             window: old.window,
             provider: old.provider.clone(),
             model: old.model.clone(),
@@ -846,7 +1010,7 @@ impl Shell {
         {
             thread.begin_turn();
         }
-        let (mut resend, mut give_back, mut send_waiting) = (None, false, None);
+        let (mut resend, mut give_back, mut send_waiting, mut out_of_usage) = (None, false, None, false);
         let ended = matches!(event, AgentEvent::TurnEnded { .. });
         match event {
             AgentEvent::Text(text) if speaking => actions.push(Action::Say(text)),
@@ -856,22 +1020,26 @@ impl Shell {
             }
             AgentEvent::PermissionGone(id) => thread.asks.retain(|ask| ask.id != id),
             AgentEvent::Limits(limits) => {
-                // The account the turn runs on; one that just ran out is said so.
+                // The account the turn runs on; one that just ran out is said so, while its agent still uses it.
                 let account = thread.session.account.clone();
-                let hit = limits.status == "rejected"
-                    && self.limits.get(&account).is_none_or(|known| known.status != "rejected");
-                if hit {
-                    let lifts = if limits.resets == 0 {
-                        String::new()
-                    } else {
-                        format!(" It lifts {}.", until(unix_now(), limits.resets))
-                    };
-                    self.notify(format!("This Claude account has reached its usage limit.{lifts}"));
-                }
-                merge_limits(self.limits.entry(account).or_default(), limits);
+                let refused = limits.status == "rejected";
+                thread.refused |= refused && thread.busy;
+                let hit = refused && self.limits.get(&account).is_none_or(|known| known.status != "rejected");
+                let used =
+                    self.agents.iter().any(|agent| agent.id == thread.session.agent && agent.connection == account);
+                let resets = limits.resets;
+                merge_limits(self.limits.entry(account.clone()).or_default(), limits);
                 actions.push(Action::SaveLimits(self.limits.clone()));
+                if hit && used {
+                    self.notify_limit(&account, resets);
+                } else if !refused {
+                    // It has usage again: what was said of its limit is over.
+                    self.notices.retain(|notice| notice.account != account);
+                }
                 return;
             }
+            // Its usage limit stops the turn: what happens next is decided when it has ended.
+            AgentEvent::LimitReached => thread.limited = true,
             AgentEvent::Status(status) => thread.status = status,
             AgentEvent::Summarized(_) => thread.invalidate(),
             AgentEvent::Remote(_) => actions.push(Action::SaveSession(Box::new(thread.session.clone()))),
@@ -884,10 +1052,21 @@ impl Shell {
             AgentEvent::Queued(count) => thread.more = count,
             AgentEvent::TurnEnded { problem } => {
                 let (hurried, stopped) = (std::mem::take(&mut thread.hurry), thread.stopping);
+                // The account's usage limit stopped it: its agent said so, or it was refused and the turn failed.
+                let refused = std::mem::take(&mut thread.refused) && problem.is_some();
+                let out = (std::mem::take(&mut thread.limited) || refused) && !stopped;
+                if !out {
+                    thread.tries = 0;
+                }
                 thread.end_turn(problem);
                 actions.push(Action::SaveSession(Box::new(thread.session.clone())));
                 // A Claude account's process is asked what its context holds now (an API engine said so itself).
                 actions.push(Action::AskContext(session.to_owned()));
+                // The turn may have committed, or merged: how its worktree stands is read again.
+                if let Some(worktree) = thread.session.worktree.clone().filter(atroxabot_core::Worktree::made) {
+                    let job = atroxabot_core::worktree::Job::State { session: session.to_owned(), worktree };
+                    actions.push(Action::Worktree(job));
+                }
                 if speaking {
                     actions.push(Action::FinishReply);
                 }
@@ -901,7 +1080,10 @@ impl Shell {
                     for waiting in &mut thread.follow_ups {
                         waiting.sent = false;
                     }
-                    if !thread.follow_ups.is_empty() {
+                    if out {
+                        // What waits stays in the tray: it goes when the session goes on.
+                        out_of_usage = true;
+                    } else if !thread.follow_ups.is_empty() {
                         if stopped && !hurried { give_back = true } else { send_waiting = Some(hurried) }
                     }
                 }
@@ -910,7 +1092,7 @@ impl Shell {
                 actions.push(Action::CloseLive(session.to_owned()));
                 // Gone while a turn of its queue was to come: it never will.
                 if thread.busy {
-                    thread.end_turn(Some("The Claude Agent stopped unexpectedly.".to_owned()));
+                    thread.end_turn(Some("The agent's process stopped unexpectedly.".to_owned()));
                     thread.more = 0;
                     for waiting in &mut thread.follow_ups {
                         waiting.sent = false;
@@ -926,6 +1108,9 @@ impl Shell {
         // The turn may have changed files: the side panel reads the repository again.
         if ended && self.current.as_deref() == Some(session) {
             self.refresh_git(actions);
+        }
+        if out_of_usage {
+            self.limit_stopped(session, actions);
         }
         if let Some((text, spoken, files)) = resend
             && self.current.as_deref() == Some(session)
@@ -956,7 +1141,17 @@ impl Shell {
     fn save_agent(&mut self, mut agent: Agent, actions: &mut Vec<Action>) {
         agent.updated = unix_now();
         let id = agent.id.clone();
-        self.update_agent(agent, actions);
+        match self.agents.iter().find(|old| old.id == id).cloned() {
+            // Given another provider: a move, as from the top bar. Its model stays on one that offers it, and
+            // its sessions waiting for a limit to lift are the user's again.
+            Some(old) if old.connection != agent.connection => {
+                let to = std::mem::replace(&mut agent.connection, old.connection);
+                (agent.model, agent.effort) = (old.model, old.effort);
+                self.cancel_resumes_of(&id);
+                self.move_agent(agent, &to, actions);
+            }
+            _ => self.update_agent(agent, actions),
+        }
         self.select_agent(&id, actions);
     }
 
@@ -964,7 +1159,8 @@ impl Shell {
     fn delete_agent(&mut self, agent: &str, actions: &mut Vec<Action>) {
         let sessions: Vec<String> = self.sessions.iter().filter(|s| s.agent == agent).map(|s| s.id.clone()).collect();
         for session in sessions {
-            self.delete_session(&session, actions);
+            // Uncommitted work in a worktree is not thrown away unseen: such a folder is kept and listed.
+            self.delete_session(&session, false, actions);
         }
         self.agents.retain(|a| a.id != agent);
         actions.push(Action::DeleteAgent(agent.to_owned()));
@@ -976,14 +1172,22 @@ impl Shell {
         }
     }
 
-    /// Deletes a session and stops whatever it was doing.
-    fn delete_session(&mut self, session: &str, actions: &mut Vec<Action>) {
+    /// Deletes a session and stops whatever it was doing. Its worktree
+    /// goes with it: with its uncommitted changes when `discard` (the user
+    /// was told of them), and kept as a folder to look at otherwise.
+    fn delete_session(&mut self, session: &str, discard: bool, actions: &mut Vec<Action>) {
         if self.call.as_ref().is_some_and(|call| call.session == session) {
             self.end_call(actions);
         }
         actions.push(Action::Stop(session.to_owned()));
         actions.push(Action::CloseLive(session.to_owned()));
         actions.push(Action::DeleteSession(session.to_owned()));
+        let worktree = self.sessions.iter().find(|known| known.id == session).and_then(|known| known.worktree.clone());
+        if let Some(worktree) = worktree {
+            let job = atroxabot_core::worktree::Job::Remove { session: session.to_owned(), worktree, discard };
+            actions.push(Action::Worktree(job));
+        }
+        self.worktrees.remove(session);
         self.threads.remove(session);
         self.sessions.retain(|s| s.id != session);
         self.composer.forget(session);
@@ -1164,12 +1368,13 @@ impl Shell {
         }
         right = phone.x - 6.0;
 
-        // Where the session works: a click picks another folder.
-        let folder = self.folder_in_use();
+        // Where the session works: a click picks another folder. One in a
+        // worktree shows the folder that stands for, on a branch of its own.
+        let folder = self.origin_in_use();
         let label = folder_label(&folder);
+        let glyph = if self.wants_worktree() { icon::BRANCH } else { icon::FOLDER };
         let width = 58.0 + p.layout(label, theme::SMALL, None).width().min(220.0);
-        let folder_chip =
-            self.toolbar_button(p, ui, (right - width, mid - 15.0), (Some(icon::FOLDER), label), Menu::Folder);
+        let folder_chip = self.toolbar_button(p, ui, (right - width, mid - 15.0), (Some(glyph), label), Menu::Folder);
         right = folder_chip.x - 6.0;
 
         // The provider: a click swaps it.
@@ -1286,8 +1491,9 @@ impl Shell {
             || "No provider".to_owned(),
             |connection| format!("{} · {}", connection.name, self.model_in_use(connection, &agent.model).label),
         );
-        let folder = self.folder_in_use();
+        let folder = self.origin_in_use();
         let folder = if folder.is_empty() { "Your home folder".to_owned() } else { folder };
+        let folder = if self.wants_worktree() { format!("{folder}, in a worktree of its own") } else { folder };
         let facts =
             [(icon::SPARKLES, thinks), (icon::FOLDER, folder), (icon::SHIELD, agent.autonomy.label().to_owned())];
         y += 18.0;
@@ -1314,8 +1520,11 @@ impl Shell {
         let x = canvas.x + ((canvas.w - width) * 0.5).round();
         let mut y = canvas.y + theme::HEADER_HEIGHT + 8.0;
         let mut close = None;
+        // A limit that has lifted is no news any more.
+        let now = unix_now();
+        self.notices.retain(|notice| notice.lifts == 0 || notice.lifts > now);
         for (index, notice) in self.notices.iter().enumerate() {
-            let text = p.layout(notice, theme::SMALL, Some(width - 60.0));
+            let text = p.layout(&notice.said(now), theme::SMALL, Some(width - 60.0));
             let card = Rect::new(x, y, width, text.height() + 24.0);
             p.shadow(Rect::new(card.x, card.y + 4.0, card.w, card.h), t.shadow, theme::RADIUS, 14.0);
             p.bordered(card, t.surface, theme::RADIUS, 1.0, fade(t.danger, 0.5));
@@ -2261,5 +2470,100 @@ mod tests {
         actions.clear();
         shell.send("More", false, Vec::new(), &mut actions);
         assert!(!actions.iter().any(|a| matches!(a, Action::CloseLive(_))));
+    }
+
+    /// A shell whose one agent thinks through a Codex account that is signed in.
+    fn on_codex() -> (Shell, Vec<Action>) {
+        let account = Connection::codex("Codex");
+        let agent = Agent { connection: account.id.clone(), ..Agent::new("Scout") };
+        let mut config = Config::default();
+        config.connections.push(account.clone());
+        let mut shell = Shell::new(config, vec![agent], Vec::new());
+        let mut actions = Vec::new();
+        shell.start(&mut actions);
+        assert!(actions.iter().any(|a| matches!(a, Action::ProbeCodex(asked) if asked.id == account.id)));
+        let model = |id: &str, default_effort: &str, is_default, hidden| atroxabot_core::CodexModel {
+            id: id.into(),
+            name: id.to_uppercase(),
+            efforts: vec!["low".into(), "medium".into(), "high".into()],
+            default_effort: default_effort.into(),
+            is_default,
+            hidden,
+            ..atroxabot_core::CodexModel::default()
+        };
+        let info = CodexInfo {
+            version: "0.167.1".into(),
+            models: vec![
+                model("astra", "medium", false, false),
+                model("sol", "low", true, false),
+                model("old", "", false, true),
+            ],
+            requires_auth: true,
+            ..CodexInfo::default()
+        };
+        shell.codex_info(&account.id, Ok(info), &mut actions);
+        (shell, actions)
+    }
+
+    #[test]
+    fn a_codex_account_answers_with_its_own_models_once_signed_in() {
+        let (mut shell, mut actions) = on_codex();
+        let account = shell.config.connections[0].clone();
+        // What Codex's own picker lists, its default first, each at the effort Codex gives it.
+        let choices = shell.model_choices(&account);
+        let listed: Vec<(&str, &str)> = choices.iter().map(|c| (c.value.as_str(), c.usual.as_str())).collect();
+        assert_eq!(listed, [("sol", "low"), ("astra", "medium")]);
+        assert_eq!(shell.provider_detail(&account), "Not signed in");
+        // Signed out, a message does not go: a notice says where to sign in.
+        actions.clear();
+        shell.send("Hello", false, Vec::new(), &mut actions);
+        assert!(!actions.iter().any(|a| matches!(a, Action::Send { .. })) && shell.current.is_none());
+        assert!(shell.notices.last().is_some_and(|notice| notice.text.contains("is not signed in")));
+
+        // Signed in (with where the plan's limits stand): it goes, with Codex's default model at its effort.
+        let CodexAccount::Ready(info) = shell.codex[&account.id].clone() else { panic!("known") };
+        let signed_in = atroxabot_codex_account("me@example.com", "plus");
+        let window = atroxabot_core::CodexLimits::default();
+        let info = CodexInfo { account: Some(signed_in), limits: Some(window), ..*info };
+        shell.codex_info(&account.id, Ok(info), &mut actions);
+        assert_eq!(shell.provider_detail(&account), "me@example.com · Plus");
+        assert!(actions.iter().any(|a| matches!(a, Action::SaveLimits(kept) if kept.contains_key(&account.id))));
+        assert_eq!(shell.limits_account().as_deref(), Some(account.id.as_str()), "the panel shows its plan");
+        actions.clear();
+        shell.send("Hello", false, Vec::new(), &mut actions);
+        let sent = actions.iter().find_map(|a| match a {
+            Action::Send { agent, connection, session, .. } => {
+                Some((agent.model.clone(), agent.effort.clone(), connection.kind, session.account.clone()))
+            }
+            _ => None,
+        });
+        assert_eq!(sent, Some((String::new(), "low".into(), ConnectionKind::Codex, account.id.clone())));
+        let session = shell.current.clone().unwrap();
+        shell.agent_event(&session, AgentEvent::Remote("thread-1".into()), &mut actions);
+
+        // A message sent while it works is handed over while its tools run, as with Claude.
+        shell.send("Also the docs", false, Vec::new(), &mut actions);
+        actions.clear();
+        shell.agent_event(&session, AgentEvent::ReplyStarted, &mut actions);
+        shell.agent_event(&session, call("t1"), &mut actions);
+        assert_eq!(handed(&actions), ["Also the docs"]);
+        // "Send now" only stops the turn: Codex keeps nothing it was handed, so it goes as the next message.
+        shell.send("Stop, the other file", false, Vec::new(), &mut actions);
+        actions.clear();
+        shell.hurry(&session, &mut actions);
+        assert!(handed(&actions).is_empty() && actions.iter().any(|a| matches!(a, Action::Interrupt(_))));
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        let texts = sent_texts(&actions);
+        assert_eq!(texts.len(), 1);
+        assert!(texts[0].ends_with("Also the docs\n\nStop, the other file") && texts[0].contains("stopped you"));
+        // `/compact` is Claude Code's: Codex summarises by itself, and is not sent the word.
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        actions.clear();
+        shell.send("/compact", false, Vec::new(), &mut actions);
+        assert!(sent_texts(&actions).is_empty());
+    }
+
+    fn atroxabot_codex_account(email: &str, plan: &str) -> atroxabot_core::CodexAccount {
+        atroxabot_core::CodexAccount { kind: "chatgpt".into(), email: email.into(), plan: plan.into() }
     }
 }

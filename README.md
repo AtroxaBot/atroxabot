@@ -1,8 +1,9 @@
 # AtroxaBot
 
 A native, GPU-rendered desktop app for agents you chat with and call. You define agents; each has many
-sessions, each session works in a folder of its own; and an agent thinks through one of your Claude
-accounts, Anthropic's API, or any OpenAI-compatible gateway. It runs on Windows, macOS and Linux, and it
+sessions, each session works in a folder of its own (or in a git worktree of its own); and an agent
+thinks through one of your Claude accounts, your Codex account, Anthropic's API, or any OpenAI-compatible
+gateway. It runs on Windows, macOS and Linux, and it
 is pure Rust: no web view and no UI framework.
 
 ```sh
@@ -69,29 +70,72 @@ cargo clippy --workspace --all-targets -- -D warnings
 - **A folder per session.** The folder chip at the right of the top bar says where the session works;
   click it for the folders used lately, or to choose another. A new session starts in the folder the
   agent's last one worked in.
+- **Worktrees.** The folder menu has a switch, *Work in a worktree*: the session then works on a branch
+  of its own (`atroxabot/<what it is about>-<id>`), checked out in a folder of its own under
+  `~/.atroxabot/worktrees/`, so several sessions change one repository without touching each other or your
+  checkout. It is chosen before the session's first message (an agent's next session starts the way its
+  last one did), made when that message goes, and the agent is told where it is and to commit there. The
+  top bar shows the folder it stands for with a branch icon; the side panel says what it came from and how
+  many commits are still to merge. Worktrees are cleaned up by themselves (Settings, Worktrees):
+  - one whose work is **merged** into the branch it came from (fast-forwarded, merged or squashed, into
+    the local branch or what it tracks) goes at once, with its branch;
+  - one with nothing uncommitted goes once its session has been **unused** for a while (three days unless
+    you choose a day, a week, a month or never); its branch stays for as long as it holds commits that are
+    not merged, and goes when they are;
+  - a session used again after that gets its worktree back, in the same folder: from its branch, or from
+    the branch it came from as that is now;
+  - one with **uncommitted changes** is never cleaned up by itself;
+  - **deleting a session** takes its worktree with it: the armed delete button says how many uncommitted
+    changes go with it; changes it did not know of are kept, as a folder the settings list;
+  - a folder left **without a session** (after a crash, say) is removed when it is clean and listed when
+    it is not, with its size and a button to remove it; branches of the app's that nothing uses are deleted
+    once merged, and git's records of folders that are gone are pruned.
+  All of that runs when the app starts, when you come back to its window (at most once a minute), and
+  from *Clean up now*; nothing touches a worktree while a turn or an agent's process works in it. The
+  settings page lists every worktree on disk with what it holds and how much room it takes.
 - **Providers**, chosen per agent and swapped from the chip in a session's top bar:
   - **Claude accounts**: the Claude Code you installed, driven with the Claude Agent SDK's protocol, with
     its own tools, permissions, subagents, skills and MCP servers. Several accounts (work, personal) are
     kept apart; see *Claude accounts and Anthropic's terms*.
   Click a provider's name in the settings to rename it, the first Claude account included.
+  - **Codex accounts**: the Codex CLI you installed, driven through its app server, with its own tools,
+    sandbox, approvals and sub-agents, on your ChatGPT plan or API key. Several accounts are kept apart;
+    see *Codex accounts*.
   - **Claude API**: Anthropic's Messages API with your API key.
   - **OpenAI-compatible**: OpenRouter, Inworld, OpenAI, Ollama, or any other Chat Completions gateway.
   With an API provider the app runs the agent loop itself, with its own tools: `read`, `write`, `edit`,
   `list`, `search`, `shell` and `fetch` (and, on the Claude API, Anthropic's web search and fetch).
-  Swapping provider mid-session works: a Claude account that never saw the conversation is handed what
-  was said so far.
+  Swapping provider mid-session works: a Claude or Codex account that never saw the conversation is
+  handed what was said so far. Swapping to another account of the same kind (one Claude account for
+  another) keeps the model and effort, and takes away the notice of the account that was left.
+- **When an account runs out** (Settings, Providers): when a Claude or Codex account's usage limit stops a
+  turn, the session can *Wait for limit refill* (the default: it goes on by itself a minute after the limit
+  lifts, so you can walk away; when the provider did not say when, it tries again every 15 minutes), *Continue using different account* (the agent moves at once to another
+  signed-in account of the same kind that has usage left, the least used first, keeping its model and
+  effort, and that account is handed the conversation; with none left it waits for the first to lift), or
+  *Stop*. While it waits, a row above the message box says when it goes on, with *Continue now* and a
+  button to cancel; what you sent while the agent worked waits there too and goes with it. A line in the
+  conversation says why it went on and on which account, and the agent is told it was cut short and to
+  carry on; nothing is written in your name. Whatever you do first wins: sending a message, switching the
+  agent's provider, clearing or deleting the session cancels the wait. A session the limit stops five turns
+  in a row stops trying. The app wakes for it while it is in the tray; a wait does not outlive the app.
 - **Models from the provider.** The model menu at the right under the message box lists what the provider itself
   offers: a Claude account's list comes from Claude Code (so it is always current; of a family listed in
-  several versions only the newest is shown), an API provider's from
+  several versions only the newest is shown), a Codex account's from Codex (what its own picker lists, each
+  with the efforts and the usual effort Codex gives it), an API provider's from
   its `/models`. The provider's default is the one in use until you pick another; any model id can be
   typed. The same menu sets the effort, which is always one of the model's own levels: Opus, Haiku and
   Fable start at medium, Sonnet at high, and picking another model starts at that model's level. A model
   that takes no effort shows none. Picking an effort closes the menu. The model and effort are the
   session's: each session keeps its own, so switching sessions switches them too, and a new session starts
-  with the last ones picked. A session moved to another provider takes that provider's choice. A message
+  with the last ones picked. A session moved to another provider takes that provider's choice; moved to
+  another account of the same kind, it keeps its own. A message
   typed and not sent stays with its session (until the app quits), files attached included.
 - **Autonomy**, set in the agent's editor: *Ask first*, *Edit freely*, *Auto* (what a new agent starts
-  with: Claude Code's auto mode, with a Claude account), *Full autonomy* or *Read only*. A call that needs approval waits on a card above
+  with: Claude Code's auto mode, with a Claude account), *Full autonomy* or *Read only*. With a Codex account these are Codex's own: *Ask first* asks before
+  any change or command, *Edit freely* and *Auto* work freely in the folder inside Codex's sandbox and ask
+  for what reaches beyond it, *Full autonomy* runs without sandbox or questions, *Read only* refuses what
+  would change something. A call that needs approval waits on a card above
   the message box: Enter allows it, Esc denies it, *Always allow* stops asking for the session. The app's
   own data folder, which holds API keys, is off limits to every agent's file tools.
 - **Integrations** (Settings, Integrations): MCP servers, local commands or remote addresses whose tools
@@ -135,7 +179,10 @@ cargo clippy --workspace --all-targets -- -D warnings
   turn ran on it, and when each starts over); the account is the one the top bar names, so picking
   another there shows its numbers at once, and its address is not put on screen here. They are what
   Claude Code reports for that account with each turn, the same numbers its own `/usage` prints (an
-  account that has not replied yet says so); reaching a limit is said in a notice. A message after the
+  account that has not replied yet says so); a window that is used up says *Limit reached* and when it
+  starts over, and reaching a limit is said in a notice that names the account, counts down to when it
+  lifts and goes away by itself then. A Codex account's limits are shown the same way, as Codex reports
+  them (when the app starts and with each turn). A message after the
   account was switched goes to a Claude Code started for the new account, even if the old one was still
   answering when it was switched.
 - **Statistics** (the chart at the foot of the sidebar, beside the settings; counted from a usage log of
@@ -222,25 +269,60 @@ the running tool calls, or as a turn of its own right after; `queued_turn_count`
 how an interrupt keeps or drops it (`cancel_queued`) and how `/clear` resets the context were checked
 against Claude Code 2.1.322.
 
+## Codex accounts
+
+A Codex account is the Codex CLI you installed, used the way OpenAI documents for clients of its own:
+
+- AtroxaBot **starts the Codex binary you installed, as published** (`codex app-server`, "the interface
+  Codex uses to power rich clients", over its standard input and output), found on your `PATH` or in the
+  usual install folders. An npm install's `codex.cmd` shim is never run: the native binary beside it is.
+- AtroxaBot **never handles your sign-in**. *Sign in* opens Codex's own `codex login` in a terminal; the
+  app never asks the app server to sign in, never reads or stores Codex's credentials, and refuses when
+  Codex asks a client for tokens. Usage is billed to the account you sign in to.
+- **Several accounts**: the first is whoever `codex` is signed in as in your terminal, with its settings
+  (`~/.codex`). Each account you add is a Codex home of its own (`CODEX_HOME`, under
+  `~/.atroxabot/codex/<id>/`), with its own sign-in, settings and conversations. AtroxaBot only tells
+  Codex which folder to use.
+- A session is a Codex thread, resumed by its id; the agent's instructions go in as the thread's developer
+  instructions, on top of Codex's own; your `AGENTS.md` files are Codex's to read. The app's MCP servers
+  and the skill library are given to Codex for the run (`-c mcp_servers.…`, `skills/extraRoots/set`):
+  nothing is written to an account's own configuration.
+- A message sent while Codex works is put into the running turn (`turn/steer`), where it reads it at its
+  next step; one it does not take in is sent again as the next message. *Send now* stops the turn and
+  sends it right after.
+
+OpenAI's page on the app server says to contact OpenAI before shipping an integration for enterprise use,
+and (as we read it) that signing users in through the app server is not for commercial or hosted services;
+AtroxaBot does not sign anyone in. Read [OpenAI's page](https://developers.openai.com/codex/app-server)
+yourself before distributing the app.
+
+`crates/codex` is the transport. What it sends and reads was checked against Codex CLI 0.167.1 **signed
+out** (the handshake, models, threads, resuming, a turn that fails for want of a sign-in, steering,
+interrupting, compaction); replies, tool calls, approvals, questions, plans, usage, limits and sub-agents
+are written from Codex's own protocol types and were not run against a signed-in account.
+
 ## Layout
 
 | Crate | Purpose |
 |---|---|
 | `crates/claude-agent` (`atroxabot-claude-agent`) | Rust port of the Claude Agent SDK's transport and control protocol. Only dependency: `serde_json`. |
+| `crates/codex` (`atroxabot-codex`) | Drives the installed Codex CLI through `codex app-server`: the handshake, threads and turns as a state machine without I/O (`machine.rs`), its messages (`parse.rs`), the process (`session.rs`), finding the binary (`cli.rs`). Only dependency: `serde_json`. |
 | `crates/mcp` (`atroxabot-mcp`) | A small MCP client (stdio and Streamable HTTP): lists a server's tools and calls them. |
-| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Messages and Chat Completions); the agent loop and its tools; the Claude Agent engine; usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
+| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Messages and Chat Completions); the agent loop and its tools; the Claude Agent and Codex engines (`claude.rs`, `codex.rs`); usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the sessions' worktrees and their cleaning up (`worktree.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
 | `crates/voice` (`atroxabot-voice`) | Fish Audio and ElevenLabs speech-to-text and text-to-speech, voice-activity detection, the call loop, and audio devices (`cpal`). |
 | `crates/desktop` | The app (`atroxabot`): winit window, wgpu renderer, text engine, immediate-mode UI. |
 
-Both engines report a turn as the same `AgentEvent`s (`core/src/engine.rs`), and `Session::apply` turns
-those into the saved transcript, so the app shows a Claude session and an API session the same way.
+Every engine reports a turn as the same `AgentEvent`s (`core/src/engine.rs`), and `Session::apply` turns
+those into the saved transcript, so the app shows a Claude session, a Codex session and an API session the same way.
 
 `crates/desktop/src`: `gpu.rs` + `shader.wgsl` (one instanced pipeline, one draw call per frame),
 `text.rs`/`font.rs`/`raster.rs` (text), `markdown.rs` → `doc.rs` (laid-out Markdown), `paint.rs`/`ui.rs`
 (drawing and widgets), `orb.rs` (the agents' faces), `logo.rs` (the app's own mark, three bodies in a line, and the platforms' marks, from the outlines in
 `assets/logos/`), `tray.rs` (what closing the window does, and the Windows tray icon, through Win32 directly),
-`shell/` (the screen: `sidebar.rs`, `thread.rs`, `composer.rs`, `queue.rs`, `question.rs`,
+`shell/` (the screen: `sidebar.rs`, `thread.rs`, `composer.rs`, `queue.rs`, `limits.rs` (what a session
+does when its account runs out), `question.rs`,
 `menu.rs`, `panel.rs`, `picture.rs`, `spotlight.rs`, `stats.rs`, `agent_form.rs`, `settings.rs`, `skills.rs`,
+`worktrees.rs`,
 `call.rs`, `widgets.rs`), `app.rs` (events, threads, engines).
 
 The app redraws only when something changes. Model requests, tools, the Claude Agent's process, calls and
@@ -255,8 +337,9 @@ To look at the design without opening the app, draw every screen offscreen in ev
 Everything lives in `~/.atroxabot/`:
 
 - `config.json`: providers (with their API keys), voice providers (with theirs), MCP servers, recent
-  folders, the theme, window and zoom, what closing the window does, whether the side panel is open, and the order you dragged the
-  sessions into.
+  folders, the theme, window and zoom, what closing the window does, whether the side panel is open, the order you dragged the
+  sessions into, when unused worktrees are cleaned up, the repositories worktrees were made in, and what a
+  session does when its account runs out.
 - `usage.jsonl`: what every reply used (when, which agent, session, provider and model, its tokens, cost
   and tool calls), a line each. The statistics are counted from it; it is started once from the saved
   sessions and only added to after that. `limits.json`: each Claude account's plan limits as last
@@ -268,7 +351,11 @@ Everything lives in `~/.atroxabot/`:
   (`.claude-plugin/plugin.json`), and `library.json`: the repositories you look in and where each skill came
   from. A skill folder you put in `skills/` yourself works too. `cache/repositories/`: the last download
   of each repository looked at, read again on the next look.
-- `sessions/<id>.json`: one file per session, with its folder and the model and effort chosen in it; `.index.json` next to them holds titles.
+- `worktrees/<repository>-<session id>/`: the git worktree of each session that works in one. The app
+  makes and removes them; agents' file tools may work in them as in any folder.
+- `codex/<id>/`: the Codex home of each extra Codex account. Codex owns what is in it. Removing an account
+  in Settings leaves the folder, and so its sign-in, where it is.
+- `sessions/<id>.json`: one file per session, with its folder (and its worktree, if it has one) and the model and effort chosen in it; `.index.json` next to them holds titles.
 - `claude/<id>/`: the Claude Code configuration folder of each extra Claude account. Claude Code owns what
   is in it. Removing an account in Settings leaves the folder, and so its sign-in, where it is.
 - `desktop.log`, `desktop-crash.log`, `desktop.lock`.
@@ -278,7 +365,13 @@ saved for.
 
 ## Known limits (deliberate, for now)
 
-- Codex is not a provider yet.
+- Codex accounts: not run against a signed-in account yet (see *Codex accounts*). `/compact` is not sent
+  to Codex (it summarises by itself), the context's breakdown and a reply's cost are not known for it,
+  and its sign-in status is read when the app starts and when you come back to the settings.
+- Worktrees: merged work is recognised from what your repository knows, so a pull request merged on the
+  server counts once you have fetched or pulled (the app does not fetch); until then the unused-worktree
+  rule cleans it up. What git ignores in a worktree (build output, a local `.env`) goes with it. A session
+  that has started cannot move into or out of a worktree; start a new one.
 - No agent-to-agent handoff and no scheduled jobs.
 - API agents run their tool calls one after another and have no subagents (Claude accounts have both,
   from Claude Code). MCP servers behind OAuth are not supported for them: static headers only.

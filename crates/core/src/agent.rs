@@ -107,6 +107,10 @@ pub struct Agent {
     /// The folder its next session starts in: the one its last session
     /// worked in. Empty for the user's home directory.
     pub workdir: String,
+    /// Whether its next session starts in a git worktree of its own, as
+    /// its last one did (see [`crate::worktree`]).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub worktree: bool,
     /// How much it may do without asking.
     pub autonomy: Autonomy,
     /// Whether it keeps notes between sessions.

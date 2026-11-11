@@ -265,7 +265,11 @@ fn options(agent: &Agent, connection: &Connection, session: &Session) -> sdk::Op
         // The agent's own prompt, not Claude Code's: its identity and how it
         // works here. Claude Code still adds the project's CLAUDE.md, the
         // skills and the environment (date, system, folder) to the conversation.
-        system_prompt: sdk::SystemPrompt::Custom(format!("{}{CLAUDE_TOOLS}", agent.system_prompt(&folder))),
+        system_prompt: sdk::SystemPrompt::Custom(format!(
+            "{}{}{CLAUDE_TOOLS}",
+            agent.system_prompt(&folder),
+            session.worktree_note()
+        )),
         cwd: Some(folder).filter(|folder| !folder.as_os_str().is_empty()),
         model: some(&agent.model),
         effort: some(&agent.effort),
@@ -437,8 +441,11 @@ impl Mapper {
                     }
                 }
                 self.streamed = false;
-                if let Some(error) = error {
-                    out.push(AgentEvent::Status(error));
+                // Claude Code's own message on a refused request: "You've hit your limit · resets 7pm".
+                match error {
+                    Some(error) if error == "rate_limit" => out.push(AgentEvent::LimitReached),
+                    Some(error) => out.push(AgentEvent::Status(error)),
+                    None => {}
                 }
             }
             // What a subagent says and does goes inside the tool call that started it.
@@ -492,11 +499,26 @@ impl Mapper {
             sdk::Event::RateLimit(limit) => {
                 let window =
                     |w: sdk::RateWindow| LimitWindow { name: w.name, used: w.utilization, resets: w.resets_at };
+                let mut windows: Vec<LimitWindow> = limit.windows.into_iter().map(window).collect();
+                // Refused: the window that decided is full until it starts over, whatever else was said of it
+                // (Claude Code names the window and when it lifts, and not always how full it is).
+                if limit.status == "rejected" && !limit.kind.is_empty() {
+                    let full = LimitWindow { name: limit.kind.clone(), used: 1.0, resets: limit.resets_at };
+                    match windows.iter_mut().find(|window| window.name == limit.kind) {
+                        Some(window) => {
+                            window.used = 1.0;
+                            if window.resets == 0 {
+                                window.resets = limit.resets_at;
+                            }
+                        }
+                        None => windows.push(full),
+                    }
+                }
                 out.push(AgentEvent::Limits(Limits {
                     at: crate::session::unix_now(),
                     status: limit.status,
                     resets: limit.resets_at,
-                    windows: limit.windows.into_iter().map(window).collect(),
+                    windows,
                 }));
             }
             sdk::Event::Status(status) => {
@@ -820,6 +842,21 @@ mod tests {
             matches!(&limits[..], [AgentEvent::Limits(limits)] if limits.windows[0].name == "five_hour" && limits.resets == 9)
         );
 
+        // The limit is hit: Claude Code names the window and when it lifts, not how full it is.
+        let hit =
+            sdk::RateLimit { status: "rejected".into(), kind: "five_hour".into(), resets_at: 99, windows: vec![] };
+        let hit = mapper.map(sdk::Event::RateLimit(hit));
+        let [AgentEvent::Limits(hit)] = &hit[..] else { panic!("limits") };
+        assert_eq!(hit.windows, [LimitWindow { name: "five_hour".into(), used: 1.0, resets: 99 }]);
+        // Named with a stale number, it is full all the same.
+        let stale =
+            sdk::RateWindow { name: "seven_day".into(), utilization: 0.97, resets_at: 7, status: String::new() };
+        let hit =
+            sdk::RateLimit { status: "rejected".into(), kind: "seven_day".into(), resets_at: 99, windows: vec![stale] };
+        let hit = mapper.map(sdk::Event::RateLimit(hit));
+        let [AgentEvent::Limits(hit)] = &hit[..] else { panic!("limits") };
+        assert_eq!(hit.windows, [LimitWindow { name: "seven_day".into(), used: 1.0, resets: 7 }]);
+
         assert_eq!(mapper.map(sdk::Event::Status(Some("compacting".into()))).len(), 1);
         let compacted = mapper.map(sdk::Event::Compacted { manual: true, pre_tokens: 39_577, post_tokens: 11_092 });
         assert_eq!(
@@ -904,6 +941,17 @@ mod tests {
         assert!(
             matches!(failed.last(), Some(AgentEvent::TurnEnded { problem: Some(text) }) if text.contains("error_during_execution"))
         );
+        // Claude Code's own line on a refused request says the limit stopped the turn; other errors pass by.
+        let refused = |error: &str| sdk::Event::Assistant {
+            blocks: vec![sdk::Block::Text("You've hit your limit · resets 7pm".into())],
+            model: "<synthetic>".into(),
+            parent_tool_use_id: None,
+            usage: sdk::Usage::default(),
+            error: Some(error.into()),
+        };
+        assert_eq!(mapper.map(refused("rate_limit")).last(), Some(&AgentEvent::LimitReached));
+        assert_eq!(mapper.map(refused("server_error")).last(), Some(&AgentEvent::Status("server_error".into())));
+        let _ = mapper.map(result(true, Some("You've hit your limit · resets 7pm"), 0.0));
 
         // A subagent's words stream into its own call, and its whole message does not repeat them.
         let inner = sdk::Event::TextDelta { text: "inner".into(), parent_tool_use_id: Some("t".into()) };

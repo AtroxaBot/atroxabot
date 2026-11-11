@@ -360,11 +360,17 @@ impl AgentForm {
 /// What `level` means with the provider `connection`: auto mode is Claude
 /// Code's, so elsewhere it can only edit freely.
 pub(super) fn autonomy_hint(level: Autonomy, connection: Option<&Connection>) -> &'static str {
-    let claude = connection.is_some_and(|c| c.kind == ConnectionKind::ClaudeAgent);
-    if level == Autonomy::Auto && !claude {
-        "With a Claude account. Here it edits freely and asks for the rest."
-    } else {
-        level.hint()
+    match (level, connection.map(|connection| connection.kind)) {
+        (_, Some(ConnectionKind::ClaudeAgent)) => level.hint(),
+        // Codex decides in its own way: a sandbox around its commands, and questions about what leaves it.
+        (Autonomy::Ask, Some(ConnectionKind::Codex)) => {
+            "Reads freely; asks before it changes a file or runs a command."
+        }
+        (Autonomy::Edits | Autonomy::Auto, Some(ConnectionKind::Codex)) => {
+            "Works freely in its folder, in Codex's sandbox; asks for what reaches beyond it."
+        }
+        (Autonomy::Auto, _) => "With a Claude account. Here it edits freely and asks for the rest.",
+        _ => level.hint(),
     }
 }
 

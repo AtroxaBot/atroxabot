@@ -10,9 +10,10 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::CursorIcon;
 
 use super::agent_form::{VOICES, autonomy_hint};
+use super::limits::OutOfLimits;
 use super::settings::{Settings, Tab};
-use super::widgets::{Scroll, chip, logo_badge};
-use super::{Account, Modal, Models, Shell};
+use super::widgets::{Scroll, chip, logo_badge, toggle};
+use super::{Account, CodexAccount, Modal, Models, Shell};
 use crate::app::Action;
 use crate::editor::Editor;
 use crate::image::Lookup;
@@ -41,6 +42,10 @@ pub(super) enum Menu {
     FormVoice,
     /// What closing the window does, in the settings.
     Close,
+    /// When an unused worktree is cleaned up, in the settings.
+    WorktreeIdle,
+    /// What happens when an account's usage limit stops a turn, in the settings.
+    OutOfLimits,
 }
 
 impl Menu {
@@ -83,6 +88,9 @@ struct Item {
     inert: bool,
     /// Set apart from the choices above it by a line.
     apart: bool,
+    /// A switch, on or off, rather than a choice: the row wears one, and
+    /// flipping it leaves the list open.
+    switch: Option<bool>,
 }
 
 /// A model a provider offers.
@@ -96,6 +104,8 @@ pub(super) struct ModelChoice {
     pub detail: String,
     /// The efforts it takes, weakest first.
     pub efforts: Vec<String>,
+    /// The effort its provider says it thinks at unless told otherwise; empty when it does not say.
+    pub usual: String,
 }
 
 /// The efforts offered where a provider does not say which a model takes.
@@ -118,6 +128,7 @@ pub(super) fn autonomy_glyph(level: Autonomy) -> char {
 pub(super) fn icon_key(connection: &Connection) -> String {
     match connection.kind {
         ConnectionKind::ClaudeAgent => "claude".to_owned(),
+        ConnectionKind::Codex => "codex".to_owned(),
         ConnectionKind::ClaudeApi => "anthropic".to_owned(),
         ConnectionKind::OpenAi => {
             let host = connection.host().split(':').next().unwrap_or_default();
@@ -128,11 +139,18 @@ pub(super) fn icon_key(connection: &Connection) -> String {
     }
 }
 
-/// The effort a model starts at: Sonnet thinks hard, the others at medium.
-fn default_effort(model: &ModelChoice) -> &'static str {
+/// The effort a model starts at: what its provider says, and otherwise
+/// Sonnet thinks hard, the others at medium.
+fn default_effort(model: &ModelChoice) -> &str {
     let named =
         |family: &str| model.value.to_lowercase().contains(family) || model.label.to_lowercase().contains(family);
-    if named("sonnet") { "high" } else { "medium" }
+    if !model.usual.is_empty() {
+        &model.usual
+    } else if named("sonnet") {
+        "high"
+    } else {
+        "medium"
+    }
 }
 
 /// An effort as a menu shows it.
@@ -143,6 +161,9 @@ pub(super) fn effort_label(effort: &str) -> &str {
         "high" => "High",
         "xhigh" => "Extra",
         "max" => "Max",
+        "none" => "None",
+        "minimal" => "Minimal",
+        "ultra" => "Ultra",
         other => other,
     }
 }
@@ -172,6 +193,7 @@ impl Shell {
         let name = name.to_lowercase();
         match kind {
             ConnectionKind::ClaudeAgent => icon::SPARKLES,
+            ConnectionKind::Codex => icon::TERMINAL,
             ConnectionKind::ClaudeApi => icon::KEY,
             ConnectionKind::OpenAi if name.contains("openrouter") => icon::ROUTE,
             ConnectionKind::OpenAi if name.contains("openai") => icon::HEXAGON,
@@ -236,6 +258,29 @@ impl Shell {
 
     /// One line on a provider: a Claude account's sign-in, or where an API goes.
     pub(super) fn provider_detail(&self, connection: &Connection) -> String {
+        if connection.kind == ConnectionKind::Codex {
+            return match self.codex.get(&connection.id) {
+                Some(CodexAccount::Ready(info)) => match &info.account {
+                    None => "Not signed in".to_owned(),
+                    Some(account) if account.email.is_empty() && account.kind == "apiKey" => {
+                        "Signed in with an API key".to_owned()
+                    }
+                    Some(account) if account.email.is_empty() => "Signed in".to_owned(),
+                    Some(account) if account.plan.is_empty() => account.email.clone(),
+                    Some(account) => {
+                        // Codex names a plan in lower case: `plus`, `pro`.
+                        let mut plan = account.plan.clone();
+                        if let Some(first) = plan.get_mut(..1) {
+                            first.make_ascii_uppercase();
+                        }
+                        format!("{} · {plan}", account.email)
+                    }
+                },
+                Some(CodexAccount::Missing) => "Codex is not installed".to_owned(),
+                Some(CodexAccount::Failed(why)) => why.clone(),
+                Some(CodexAccount::Checking) | None => "Checking…".to_owned(),
+            };
+        }
         if connection.kind != ConnectionKind::ClaudeAgent {
             return format!("{} · {}", connection.kind.label(), connection.host());
         }
@@ -252,6 +297,27 @@ impl Shell {
     /// The models `connection` offers, its default first. Empty while they
     /// are being fetched or when they could not be.
     pub(super) fn model_choices(&self, connection: &Connection) -> Vec<ModelChoice> {
+        if connection.kind == ConnectionKind::Codex {
+            let Some(CodexAccount::Ready(info)) = self.codex.get(&connection.id) else { return Vec::new() };
+            // What Codex's own picker lists, the model it picks by itself first.
+            let mut choices: Vec<(bool, ModelChoice)> = info
+                .models
+                .iter()
+                .filter(|model| !model.hidden && !model.id.is_empty())
+                .map(|model| {
+                    let choice = ModelChoice {
+                        value: model.id.clone(),
+                        label: if model.name.is_empty() { model.id.clone() } else { model.name.clone() },
+                        detail: model.description.clone(),
+                        efforts: model.efforts.clone(),
+                        usual: model.default_effort.clone(),
+                    };
+                    (model.is_default, choice)
+                })
+                .collect();
+            choices.sort_by_key(|(default, _)| !default);
+            return choices.into_iter().map(|(_, choice)| choice).collect();
+        }
         if connection.kind == ConnectionKind::ClaudeAgent {
             let Some(Account::Ready(info)) = self.claude.get(&connection.id) else { return Vec::new() };
             // Aliases of one model (`default`, `opus`) are listed once: the first is the default.
@@ -282,7 +348,13 @@ impl Shell {
                     .unwrap_or_else(|| model.display_name.clone());
                 let detail =
                     if about.is_empty() || first == label { about.to_owned() } else { model.description.clone() };
-                choices.push(ModelChoice { value: model.value.clone(), label, detail, efforts: model.efforts.clone() });
+                choices.push(ModelChoice {
+                    value: model.value.clone(),
+                    label,
+                    detail,
+                    efforts: model.efforts.clone(),
+                    usual: String::new(),
+                });
             }
             return choices;
         }
@@ -294,6 +366,7 @@ impl Shell {
                 label: if model.name.is_empty() { model.id.clone() } else { model.name.clone() },
                 detail: if model.name.is_empty() { String::new() } else { model.id.clone() },
                 efforts: model.reasoning_levels.clone(),
+                usual: String::new(),
             })
             .collect();
         // The app's usual Claude model leads Anthropic's list, whatever its order.
@@ -369,7 +442,13 @@ impl Shell {
             })
             .collect();
         if items.is_empty() && needle.is_empty() {
+            let codex = self.codex.get(&connection.id).filter(|_| connection.kind == ConnectionKind::Codex);
             let note = match (connection.kind, self.claude.get(&connection.id), self.models.get(&connection.id)) {
+                _ if matches!(codex, Some(CodexAccount::Missing)) => "Codex is not installed".to_owned(),
+                _ if matches!(codex, Some(CodexAccount::Failed(_))) => {
+                    let why = if let Some(CodexAccount::Failed(why)) = codex { why.as_str() } else { "" };
+                    format!("The models could not be listed: {why}")
+                }
                 (ConnectionKind::ClaudeAgent, Some(Account::Missing), _) => "Claude Code is not installed".to_owned(),
                 (ConnectionKind::ClaudeAgent, Some(Account::Failed(why)), _) | (_, _, Some(Models::Failed(why))) => {
                     format!("The models could not be listed: {why}")
@@ -441,7 +520,7 @@ impl Shell {
             }
             Menu::FormProvider => self.provider_items(form.map_or("", |form| form.connection.as_str())),
             Menu::Folder => {
-                let current = self.folder_in_use();
+                let current = self.origin_in_use();
                 let mut items: Vec<Item> = self
                     .config
                     .recent_folders
@@ -460,6 +539,22 @@ impl Shell {
                     glyph: Some(icon::PLUS),
                     label: "Choose a folder…".to_owned(),
                     apart: !items.is_empty(),
+                    ..Item::default()
+                });
+                // Whether the session works there in a worktree of its own: its to choose until it is made.
+                let detail = match (self.worktree_in_use(), self.worktree_open()) {
+                    (Some(worktree), _) => format!("On {}, from {}", worktree.branch, worktree.base),
+                    (None, true) => "A branch and a checkout of its own, cleaned up once merged".to_owned(),
+                    (None, false) => "Chosen when a session starts".to_owned(),
+                };
+                items.push(Item {
+                    value: "worktree".to_owned(),
+                    glyph: Some(icon::BRANCH),
+                    label: "Work in a worktree".to_owned(),
+                    detail,
+                    inert: !self.worktree_open(),
+                    apart: true,
+                    switch: Some(self.wants_worktree()),
                     ..Item::default()
                 });
                 items
@@ -507,6 +602,28 @@ impl Shell {
                 };
                 CloseAction::offered().iter().map(action).collect()
             }
+            Menu::WorktreeIdle => {
+                let current = super::worktrees::idle_choice(self.config.worktree_idle.as_deref()).0;
+                let choice = |(key, label, detail): (&str, &str, &str)| Item {
+                    value: key.to_owned(),
+                    label: label.to_owned(),
+                    detail: detail.to_owned(),
+                    selected: key == current,
+                    ..Item::default()
+                };
+                super::worktrees::IDLE.into_iter().map(choice).collect()
+            }
+            Menu::OutOfLimits => {
+                let current = self.out_of_limits();
+                let choice = |choice: OutOfLimits| Item {
+                    value: choice.key().to_owned(),
+                    label: choice.label().to_owned(),
+                    detail: choice.detail().to_owned(),
+                    selected: choice == current,
+                    ..Item::default()
+                };
+                OutOfLimits::ALL.into_iter().map(choice).collect()
+            }
         }
     }
 
@@ -518,8 +635,13 @@ impl Shell {
 
     /// Applies a choice.
     pub(super) fn choose(&mut self, menu: Menu, value: &str, actions: &mut Vec<Action>) {
-        self.menu = None;
+        let list = self.menu.take();
         match menu {
+            // A switch: flipped, with the list left open to show it.
+            Menu::Folder if value == "worktree" => {
+                self.toggle_worktree(actions);
+                self.menu = list;
+            }
             Menu::Model => {
                 let Some(mut agent) = self.agent_in_use() else { return };
                 // The provider's default is not pinned: it stays the default when that changes.
@@ -536,16 +658,11 @@ impl Shell {
                 self.modal = Some(Modal::Settings(Box::new(Settings::new(Tab::Providers))));
             }
             Menu::Provider => {
-                let Some(mut agent) = self.selected_agent().cloned() else { return };
+                let Some(agent) = self.selected_agent().cloned() else { return };
                 if agent.connection != value {
-                    value.clone_into(&mut agent.connection);
-                    // Another provider has other models: its default, until one is picked.
-                    agent.model.clear();
-                    agent.effort.clear();
-                    if let Some(connection) = self.config.connection(value) {
-                        self.want_models(&connection, actions);
-                    }
-                    self.update_agent(agent, actions);
+                    // The user chose where its sessions go on: none waits for a limit to lift any more.
+                    self.cancel_resumes_of(&agent.id);
+                    self.move_agent(agent, value, actions);
                 }
             }
             Menu::Folder if value == "choose" => actions.push(Action::PickFolder),
@@ -575,6 +692,20 @@ impl Shell {
                 if self.config.close.as_deref() != Some(value) {
                     self.config.close = Some(value.to_owned());
                     actions.push(Action::SaveConfig);
+                }
+            }
+            Menu::OutOfLimits => {
+                if self.config.out_of_limits.as_deref() != Some(value) {
+                    self.config.out_of_limits = Some(value.to_owned());
+                    actions.push(Action::SaveConfig);
+                }
+            }
+            Menu::WorktreeIdle => {
+                if self.config.worktree_idle.as_deref() != Some(value) {
+                    self.config.worktree_idle = Some(value.to_owned());
+                    actions.push(Action::SaveConfig);
+                    // A shorter wait may have some go right now.
+                    self.sweep_worktrees(actions);
                 }
             }
         }
@@ -609,14 +740,19 @@ impl Shell {
             Menu::Folder => 400.0,
             Menu::Provider => 340.0,
             Menu::FormAutonomy => anchor.w.max(460.0),
-            Menu::Close => anchor.w.max(360.0),
+            Menu::Close | Menu::WorktreeIdle => anchor.w.max(360.0),
+            Menu::OutOfLimits => anchor.w.max(420.0),
             _ => anchor.w.max(260.0),
         };
         let view = p.clip();
         let room = if menu.below() { view.bottom() - anchor.bottom() - 16.0 } else { anchor.y - view.y - 16.0 };
         let height = (content + search_h + foot_h + 12.0).min(440.0).min(room.max(120.0));
         // A list wider than a button at a page's right edge ends where the button does.
-        let start = if menu == Menu::Close { anchor.right() - width } else { anchor.x };
+        let start = if matches!(menu, Menu::Close | Menu::WorktreeIdle | Menu::OutOfLimits) {
+            anchor.right() - width
+        } else {
+            anchor.x
+        };
         let x = start.min(view.right() - width - 12.0).max(view.x + 12.0);
         let y = if menu.below() { anchor.bottom() + 6.0 } else { anchor.y - 8.0 - height };
         let rect = Rect::new(x, y, width, height);
@@ -667,7 +803,7 @@ impl Shell {
                 icon::draw(p, glyph, (left + 8.0, row.y + row.h * 0.5), 15.0, ink);
                 left += 26.0;
             }
-            let room = row.right() - 34.0 - left;
+            let room = row.right() - if item.switch.is_some() { 58.0 } else { 34.0 } - left;
             let mut label = p.layout(&item.label, theme::SMALL, None);
             label.truncate(p.fonts, room);
             let color = if item.inert { t.text_faint } else { t.text };
@@ -681,6 +817,10 @@ impl Shell {
             }
             if item.selected {
                 icon::draw(p, icon::CHECK, (row.right() - 16.0, row.y + row.h * 0.5), 14.0, t.text);
+            }
+            if let Some(on) = item.switch {
+                // The row is what is clicked; the switch only shows how it stands.
+                let _ = toggle(p, ui, (row.right() - 48.0, row.y + (row.h - 22.0) * 0.5), on, &item.value);
             }
             if hovered {
                 ui.cursor = CursorIcon::Pointer;

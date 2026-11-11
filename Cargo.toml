@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/claude-agent", "crates/mcp", "crates/core", "crates/voice", "crates/desktop"]
+members = ["crates/claude-agent", "crates/codex", "crates/mcp", "crates/core", "crates/voice", "crates/desktop"]
 
 [workspace.package]
 version = "0.1.0"
@@ -11,6 +11,7 @@ repository = "https://github.com/Luvarly/atroxabot"
 
 [workspace.dependencies]
 atroxabot-claude-agent = { path = "crates/claude-agent" }
+atroxabot-codex = { path = "crates/codex" }
 atroxabot-core = { path = "crates/core" }
 atroxabot-mcp = { path = "crates/mcp" }
 atroxabot-voice = { path = "crates/voice" }

@@ -7,9 +7,11 @@ use std::path::{Path, PathBuf};
 use atroxabot_core::git::{Change, GitFile, GitStatus, Report};
 use atroxabot_core::skills::{self, Catalog, Elsewhere, Group, Origin, Skill, Source};
 use atroxabot_core::stats::{Ledger, Record, day_of};
+use atroxabot_core::worktree;
 use atroxabot_core::{
-    Agent, AgentEvent, Ask, Autonomy, ClaudeInfo, ClaudeMcpServer, ClaudeModel, Config, Connection, ConnectionKind,
-    ContextPart, LimitWindow, Limits, McpServer, Model, Session, ToolUse, Usage, VoiceSettings, unix_now,
+    Agent, AgentEvent, Ask, Autonomy, ClaudeInfo, ClaudeMcpServer, ClaudeModel, CodexAccount, CodexInfo, CodexModel,
+    Config, Connection, ConnectionKind, ContextPart, LimitWindow, Limits, McpServer, Model, Session, ToolUse, Usage,
+    VoiceSettings, Worktree, unix_now,
 };
 use atroxabot_voice::CallState;
 
@@ -256,6 +258,26 @@ fn snapshots() {
         let failed = AgentEvent::ToolResult { id: "q1".into(), output: "test result: FAILED".into(), is_error: false };
         queued.agent_event(&turn, failed, &mut Vec::new());
         queued.send("And keep the fix to one function, please", false, Vec::new(), &mut Vec::new());
+        // The account ran out mid-turn: its notice, and the session waiting above the message box to go on.
+        let mut spent = shell();
+        let turn = spent.current.clone().unwrap_or_default();
+        spent.send("Then make the other escape tests pass too", false, Vec::new(), &mut Vec::new());
+        let lifts = unix_now() + 3_150;
+        let window = LimitWindow { name: "five_hour".into(), used: 1.0, resets: lifts };
+        let refused = Limits { at: unix_now(), status: "rejected".into(), resets: lifts, windows: vec![window] };
+        for event in [
+            AgentEvent::Limits(refused),
+            AgentEvent::ReplyStarted,
+            AgentEvent::Text("You've hit your limit · resets 7pm (Europe/Amsterdam)".into()),
+            AgentEvent::LimitReached,
+            AgentEvent::TurnEnded { problem: Some("You've hit your limit · resets 7pm (Europe/Amsterdam)".into()) },
+        ] {
+            spent.agent_event(&turn, event, &mut Vec::new());
+        }
+        // What a session does when its account runs out, open under its dropdown.
+        let mut out_of_limits = shell();
+        out_of_limits.modal = Some(Modal::Settings(Box::new(Settings::new(Tab::Providers))));
+        out_of_limits.open_menu(Menu::OutOfLimits, Rect::new(865.0, 264.0, 280.0, 40.0));
         let mut diff = panel();
         let file = repository().files.remove(0);
         diff.modal = Some(Modal::Diff(Box::new(DiffView::new(file.clone()))));
@@ -375,6 +397,63 @@ fn snapshots() {
             };
             connected.connectors.insert(id, known);
         }
+        // A session in a worktree of its own: its folder menu, its side panel, and the settings' list of
+        // what is on disk, with a folder left behind by a session that is gone.
+        let in_worktree = || {
+            let mut shell = panel();
+            let worktree = Worktree {
+                repo: "C:\\code\\parser".into(),
+                path: "C:\\Users\\me\\.atroxabot\\worktrees\\parser-18e6a58ab5fe8230".into(),
+                branch: "atroxabot/the-tokenizer-test-fails-8230".into(),
+                base: "main".into(),
+                start: "3f1c2aa".into(),
+            };
+            let session = shell.current.clone().unwrap_or_default();
+            shell.worktree_ready(&session, &worktree, &worktree.path, &mut Vec::new());
+            shell.git.folder = shell.work_folder();
+            shell.git.status =
+                Some(GitStatus { branch: worktree.branch.clone(), upstream: String::new(), ..repository() });
+            let stands = worktree::State {
+                exists: true,
+                branch: worktree.branch.clone(),
+                changes: 3,
+                unmerged: 2,
+                landed: false,
+            };
+            let orphan = worktree::Orphan {
+                path: "C:\\Users\\me\\.atroxabot\\worktrees\\website-18e5f0c2aa91d4e0".into(),
+                repo: "C:\\code\\website".into(),
+                branch: "atroxabot/new-landing-page-d4e0".into(),
+                changes: 4,
+            };
+            let sizes = vec![(worktree.path.clone(), 2_900_000_000), (orphan.path.clone(), 412_000_000)];
+            let swept = worktree::Swept {
+                states: vec![(session, stands)],
+                orphans: vec![orphan],
+                ..worktree::Swept::default()
+            };
+            shell.worktree_report(worktree::Report::Swept(swept), &mut Vec::new());
+            shell.worktree_report(worktree::Report::Sizes(sizes), &mut Vec::new());
+            shell
+        };
+        let mut worktree_menu = in_worktree();
+        worktree_menu.open_menu(Menu::Folder, Rect::new(934.0, 47.0, 98.0, 30.0));
+        let mut worktrees = in_worktree();
+        worktrees.config.panel = false;
+        worktrees.modal = Some(Modal::Settings(Box::new(Settings::new(Tab::Worktrees))));
+        // An agent on a Codex account: its models, each with the efforts Codex lists for it.
+        let mut codex_models = shell();
+        let on_codex = Agent {
+            connection: "codex".into(),
+            model: String::new(),
+            effort: String::new(),
+            ..codex_models.agents[0].clone()
+        };
+        codex_models.update_agent(on_codex, &mut Vec::new());
+        if let Some(thread) = codex_models.thread_mut() {
+            thread.session.provider.clear();
+        }
+        codex_models.open_menu(Menu::Model, Rect::new(474.0, 836.0, 150.0, 30.0));
         let mut editor = shell();
         editor.modal = Some(Modal::Agent(Box::new(AgentForm::new(editor.selected_agent()))));
         let mut call = shell();
@@ -409,6 +488,8 @@ fn snapshots() {
             ("mention", mention),
             ("tasks", tasks()),
             ("queued", queued),
+            ("limit-wait", spent),
+            ("menu-out-of-limits", out_of_limits),
             ("menu-branch", branch),
             ("diff", diff),
             ("picture", picture),
@@ -423,6 +504,11 @@ fn snapshots() {
             ("add-provider", adding(Tab::Providers, Adding::PickProvider)),
             ("add-provider-key", adding(Tab::Providers, Adding::Provider(1))),
             ("add-account", adding(Tab::Providers, Adding::ClaudeAccount)),
+            ("add-codex-account", adding(Tab::Providers, Adding::CodexAccount)),
+            ("settings-worktrees", worktrees),
+            ("menu-folder-worktree", worktree_menu),
+            ("panel-worktree", in_worktree()),
+            ("menu-model-codex", codex_models),
             ("add-voice", adding(Tab::Voice, Adding::Voice(1))),
             ("add-mcp", adding(Tab::Integrations, Adding::Mcp(false))),
             ("agent", editor),
@@ -641,8 +727,9 @@ fn shell() -> Shell {
         api_key: Some("sk-or-secret".into()),
         ..Connection::default()
     };
+    let codex = Connection { id: "codex".into(), ..Connection::codex("Codex") };
     let config = Config {
-        connections: vec![work, router],
+        connections: vec![work, router, codex],
         voice: VoiceSettings { provider: "fish".into(), fish_key: Some("secret".into()), ..VoiceSettings::default() },
         mcp: vec![McpServer {
             name: "files".into(),
@@ -657,6 +744,25 @@ fn shell() -> Shell {
     let mut shell = Shell::new(config, vec![scout, press, inbox], summaries);
     shell.claude_info(Connection::CLAUDE_AGENT, Ok(claude("me@example.com", "Claude Max")));
     shell.claude_info("work", Ok(claude("", "")));
+    let model = |id: &str, name: &str, description: &str, is_default| CodexModel {
+        id: id.into(),
+        name: name.into(),
+        description: description.into(),
+        efforts: ["low", "medium", "high", "xhigh"].map(str::to_owned).into(),
+        default_effort: "medium".into(),
+        is_default,
+        hidden: false,
+    };
+    let codex = CodexInfo {
+        version: "0.167.1".into(),
+        account: Some(CodexAccount { kind: "chatgpt".into(), email: "me@example.com".into(), plan: "plus".into() }),
+        models: vec![
+            model("gpt-6-astra", "GPT-6-Astra", "Frontier intelligence for the most demanding work.", false),
+            model("gpt-6.1-sol", "GPT-6.1-Sol", "Latest workhorse model for coding and everyday work.", true),
+        ],
+        ..CodexInfo::default()
+    };
+    shell.codex_info("codex", Ok(codex), &mut Vec::new());
     let listed = vec![
         Model { id: "anthropic/claude-opus-5.5".into(), name: "Claude Opus 5.5".into(), ..Model::default() },
         Model { id: "openai/gpt-5".into(), name: "GPT-5".into(), ..Model::default() },
