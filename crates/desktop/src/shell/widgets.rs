@@ -24,11 +24,50 @@ pub(super) struct Scroll {
     pos: f32,
     target: f32,
     max: f32,
+    /// Where its bar was last drawn: over what area, for content how long,
+    /// and whether it runs across (else down).
+    bar: Option<(Rect, f32, bool)>,
+    /// While the bar's thumb is dragged: where along it the mouse holds it.
+    grab: Option<f32>,
+}
+
+/// How wide the strip along a view's edge is that takes hold of its scroll bar.
+const ZONE: f32 = 12.0;
+
+/// Where a scroll bar is: the strip that takes the mouse, where its track
+/// starts and how long it is, and how long its thumb is.
+struct Track {
+    zone: Rect,
+    start: f32,
+    len: f32,
+    thumb: f32,
+}
+
+impl Track {
+    /// The bar of a view over `area` (along its right edge, or its foot when
+    /// `across`) for content `content` long.
+    fn of(area: Rect, content: f32, across: bool) -> Self {
+        // Wide enough for the thickened thumb, narrow enough to stay off the controls rows end in.
+        let (zone, start, view) = if across {
+            (Rect::new(area.x, area.bottom() - ZONE, area.w, ZONE), area.x + 8.0, area.w)
+        } else {
+            (Rect::new(area.right() - ZONE, area.y, ZONE, area.h), area.y + 8.0, area.h)
+        };
+        let len = view - 16.0;
+        Self { zone, start, len, thumb: thumb(len, view, content) }
+    }
 }
 
 impl Scroll {
-    /// Takes the wheel (when `hovered`) and returns the offset to draw at.
+    /// Takes the wheel (when `hovered`) and a drag of the bar, and returns
+    /// the offset to draw at. Call before drawing what scrolls, so a press
+    /// on the bar is the bar's alone.
     pub fn update(&mut self, ui: &mut Ui, hovered: bool) -> f32 {
+        if self.drag(ui) {
+            // The view goes where the mouse takes it, at once.
+            self.pos = self.target;
+            return self.pos.round();
+        }
         if hovered && ui.scroll != 0.0 {
             self.target = (self.target + ui.scroll).clamp(0.0, self.max);
         }
@@ -53,6 +92,37 @@ impl Scroll {
             self.pos = self.max;
             ui.animating = true;
         }
+    }
+
+    /// A press on the bar takes hold of its thumb (one beside the thumb
+    /// brings the thumb's middle there first), and moving the mouse moves
+    /// the view until the button is let go. Returns whether it is held.
+    fn drag(&mut self, ui: &mut Ui) -> bool {
+        let Some((area, content, across)) = self.bar else { return false };
+        let track = Track::of(area, content, across);
+        let along = |ui: &Ui| if across { ui.mouse.0 } else { ui.mouse.1 };
+        if self.grab.is_none() && ui.pressed && self.max > 0.0 && ui.hovered(track.zone) {
+            let at = track.start + (track.len - track.thumb) * self.progress().unwrap_or(0.0);
+            let on = along(ui) - at;
+            self.grab = Some(if (0.0..=track.thumb).contains(&on) { on } else { track.thumb * 0.5 });
+        }
+        let Some(grab) = self.grab else { return false };
+        if !ui.down {
+            self.grab = None;
+            return false;
+        }
+        ui.held = true;
+        let free = track.len - track.thumb;
+        if free > 0.0 {
+            let progress = ((along(ui) - grab - track.start) / free).clamp(0.0, 1.0);
+            self.target = progress * self.max;
+        }
+        true
+    }
+
+    /// Whether its bar is being dragged.
+    pub fn dragging(&self) -> bool {
+        self.grab.is_some()
     }
 
     /// Whether the view is headed for its end.
@@ -92,13 +162,34 @@ impl Scroll {
         (self.pos, self.target) = (0.0, 0.0);
     }
 
-    /// A thin bar at the right edge of `area` showing where the view is.
-    pub fn bar(&self, p: &mut Painter, area: Rect, content: f32) {
+    /// A thin bar at the right edge of `area` showing where the view is,
+    /// over content `content` tall. It thickens under the mouse, and its
+    /// thumb can be dragged.
+    pub fn bar(&mut self, p: &mut Painter, ui: &mut Ui, area: Rect, content: f32) {
+        self.draw_bar(p, ui, area, content, false);
+    }
+
+    /// The same along the foot of `area`, for a view that scrolls across
+    /// content `content` wide.
+    pub fn bar_across(&mut self, p: &mut Painter, ui: &mut Ui, area: Rect, content: f32) {
+        self.draw_bar(p, ui, area, content, true);
+    }
+
+    fn draw_bar(&mut self, p: &mut Painter, ui: &mut Ui, area: Rect, content: f32, across: bool) {
+        self.bar = Some((area, content, across));
         let Some(progress) = self.progress() else { return };
-        let track = area.h - 16.0;
-        let thumb = thumb(track, area.h, content);
-        let at = area.y + 8.0 + (track - thumb) * progress;
-        p.rect(Rect::new(area.right() - 7.0, at, 3.0, thumb), fade(p.theme.text_faint, 0.35), 1.5);
+        let track = Track::of(area, content, across);
+        let near = self.dragging() || ui.hovered(track.zone);
+        let lit = ui.anim(id(("scroll-bar", area.x as i32, area.y as i32, across)), f32::from(u8::from(near)));
+        let at = track.start + (track.len - track.thumb) * progress;
+        // Its outer edge stays put; it grows inwards.
+        let thick = 3.0 + 3.0 * lit;
+        let thumb = if across {
+            Rect::new(at, area.bottom() - 4.0 - thick, track.thumb, thick)
+        } else {
+            Rect::new(area.right() - 4.0 - thick, at, thick, track.thumb)
+        };
+        p.rect(thumb, fade(p.theme.text_faint, 0.35 + 0.4 * lit), thick * 0.5);
     }
 }
 
@@ -320,6 +411,46 @@ pub(super) fn chip(p: &mut Painter, ui: &mut Ui, rect: Rect, label: &str, select
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_bar_is_dragged_and_holds_the_mouse_until_let_go() {
+        // A view 216 tall over 1080 of content: a track of 200, a thumb of 40.
+        let area = Rect::new(0.0, 0.0, 300.0, 216.0);
+        let mut scroll = Scroll::default();
+        let mut ui = Ui::default();
+        ui.dt = 0.016;
+        scroll.update(&mut ui, true);
+        scroll.finish(&mut ui, 1080.0, area.h);
+        scroll.bar = Some((area, 1080.0, false));
+        // A press on the thumb (at the top) and a drag halfway down the track's free part.
+        (ui.mouse, ui.pressed, ui.down) = ((292.0, 20.0), true, true);
+        scroll.update(&mut ui, true);
+        assert!(scroll.dragging() && ui.held, "the bar has the mouse");
+        assert!(!ui.hovered(area), "and nothing under it reacts");
+        (ui.pressed, ui.mouse.1) = (false, 100.0);
+        let offset = scroll.update(&mut ui, true);
+        assert!((offset - 432.0).abs() < 1.0, "half of the 864 there is to scroll, at once: {offset}");
+        // Past the end it stops there; let go, it lets go.
+        ui.mouse.1 = 900.0;
+        assert!((scroll.update(&mut ui, true) - 864.0).abs() < 1.0);
+        assert!(scroll.at_end());
+        ui.down = false;
+        scroll.update(&mut ui, true);
+        assert!(!scroll.dragging());
+        ui.end();
+        assert!(!ui.held);
+        // A press on the track away from the thumb brings the thumb's middle there.
+        (ui.mouse, ui.pressed, ui.down) = ((292.0, 28.0), true, true);
+        let offset = scroll.update(&mut ui, true);
+        assert!(offset < 50.0, "the thumb's middle went to the press: {offset}");
+        // Away from the bar, a press is the content's.
+        (ui.down, ui.pressed) = (false, false);
+        scroll.update(&mut ui, true);
+        ui.end();
+        (ui.mouse, ui.pressed, ui.down) = ((100.0, 100.0), true, true);
+        scroll.update(&mut ui, true);
+        assert!(!scroll.dragging() && !ui.held);
+    }
 
     #[test]
     fn scrolling_stays_inside_the_content_and_eases() {

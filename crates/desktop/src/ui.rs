@@ -50,9 +50,38 @@ pub struct Ui {
     pub blocker: Option<Rect>,
     /// Set when something is mid-animation and needs another frame.
     pub animating: bool,
+    /// A scroll bar holds the mouse (it is being dragged): nothing else is
+    /// hovered or clicked until the button is let go.
+    pub held: bool,
     /// Animated values with the frame they were last used in.
     anims: HashMap<u64, (f32, u64)>,
     frame: u64,
+    /// What the mouse rests on that has a tooltip, and since when.
+    resting: Option<(u64, f32)>,
+    /// Whether this frame drew something with a tooltip under the mouse.
+    rested: bool,
+    /// The tooltip to show over everything this frame, with what it is of.
+    tip: Option<(u64, Rect, Tip)>,
+}
+
+/// How long the mouse rests on something before its tooltip shows, in seconds.
+const TIP_DELAY: f32 = 0.45;
+
+/// What a tooltip says: a paragraph, then rows of a name and a value.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tip {
+    /// The words, wrapped; empty for none.
+    pub text: String,
+    /// Rows under them, the value at the right.
+    pub rows: Vec<(String, String)>,
+}
+
+impl Tip {
+    /// A tooltip of just `text`.
+    #[must_use]
+    pub fn text(text: impl Into<String>) -> Self {
+        Self { text: text.into(), rows: Vec::new() }
+    }
 }
 
 impl Ui {
@@ -62,6 +91,11 @@ impl Ui {
         self.time = time;
         self.cursor = CursorIcon::Default;
         self.animating = false;
+        // The mouse left whatever had a tooltip: resting starts over.
+        if !self.rested {
+            self.resting = None;
+        }
+        (self.rested, self.tip) = (false, None);
         // Forget widgets that were not drawn last frame so the map stays small.
         let frame = self.frame;
         self.anims.retain(|_, (_, used)| *used == frame);
@@ -85,12 +119,16 @@ impl Ui {
         self.released = false;
         self.scroll = 0.0;
         self.scroll_x = 0.0;
+        // Held through the frame the button went up in, so that release clicks nothing under it.
+        if !self.down {
+            self.held = false;
+        }
     }
 
     /// Whether the mouse is over `rect` and not over an overlay.
     #[must_use]
     pub fn hovered(&self, rect: Rect) -> bool {
-        rect.contains(self.mouse) && !self.blocker.is_some_and(|b| b.contains(self.mouse))
+        rect.contains(self.mouse) && !self.held && !self.blocker.is_some_and(|b| b.contains(self.mouse))
     }
 
     /// Whether `rect` was clicked (pressed and released inside) this frame.
@@ -125,6 +163,33 @@ impl Ui {
         *value
     }
 
+    /// Offers `tip` for `anchor` (under the key `key`): once the mouse has
+    /// rested on it a moment, [`draw_tip`] shows it over everything.
+    pub fn tip(&mut self, key: u64, anchor: Rect, tip: impl FnOnce() -> Tip) {
+        if !self.hovered(anchor) || self.down {
+            return;
+        }
+        self.rested = true;
+        let since = match self.resting {
+            Some((rested, since)) if rested == key => since,
+            _ => {
+                self.resting = Some((key, self.time));
+                self.time
+            }
+        };
+        if self.time - since >= TIP_DELAY {
+            self.tip = Some((key, anchor, tip()));
+        }
+    }
+
+    /// Seconds until the tooltip the mouse rests on shows, if one is coming.
+    #[must_use]
+    pub fn next_tip(&self) -> Option<f32> {
+        let (_, since) = self.resting?;
+        let left = TIP_DELAY - (self.time - since);
+        (left > 0.0).then_some(left)
+    }
+
     /// Whether the caret should be drawn right now.
     #[must_use]
     pub fn caret_visible(&self) -> bool {
@@ -137,6 +202,43 @@ impl Ui {
         let phase = (self.time - self.last_edit).rem_euclid(1.0);
         if phase < 0.55 { 0.55 - phase } else { 1.0 - phase }
     }
+}
+
+/// Draws the tooltip offered this frame, if any, below what it is of (or
+/// above it, where there is no room below), inside `view`. Call last, so it
+/// lies over everything.
+pub fn draw_tip(p: &mut Painter, ui: &mut Ui, view: Rect) {
+    let Some((key, anchor, tip)) = ui.tip.take() else { return };
+    let t = p.theme;
+    let (pad, row_h) = (12.0, 22.0);
+    let width = 300.0_f32.min(view.w - 24.0);
+    let inner = width - 2.0 * pad;
+    let text = (!tip.text.is_empty()).then(|| p.layout(&tip.text, theme::SMALL, Some(inner)));
+    let text_h = text.as_ref().map_or(0.0, TextLayout::height);
+    let gap = if text.is_some() && !tip.rows.is_empty() { 8.0 } else { 0.0 };
+    let height = 2.0 * pad - 2.0 + text_h + gap + tip.rows.len() as f32 * row_h;
+    let below = anchor.bottom() + 6.0;
+    let y = if below + height <= view.bottom() - 8.0 { below } else { (anchor.y - 6.0 - height).max(view.y + 8.0) };
+    let x = anchor.x.min(view.right() - width - 12.0).max(view.x + 12.0);
+    let card = Rect::new(x, y, width, height);
+    let appear = ui.appear(id(("tip", key)));
+    let clip = p.push_clip(view);
+    p.shadow(Rect::new(card.x, card.y + 6.0, card.w, card.h), fade(t.shadow, appear), theme::RADIUS, 20.0);
+    p.bordered(card, fade(t.surface, appear), theme::RADIUS, 1.0, fade(t.border_strong, appear));
+    let mut top = card.y + pad - 1.0;
+    if let Some(text) = &text {
+        p.text(text, card.x + pad, top, fade(t.text, appear));
+        top += text_h + gap;
+    }
+    for (name, value) in &tip.rows {
+        let mut name = p.layout(name, theme::SMALL, None);
+        let value = p.layout(value, theme::SMALL, None);
+        name.truncate(p.fonts, inner - value.width() - 12.0);
+        p.text(&name, card.x + pad, top + 2.0, fade(t.text_muted, appear));
+        p.text(&value, card.right() - pad - value.width(), top + 2.0, fade(t.text, appear));
+        top += row_h;
+    }
+    p.set_clip(clip);
 }
 
 /// Stable widget identity from any hashable key.
@@ -389,9 +491,34 @@ pub fn edit_key(editor: &mut Editor, event: &KeyEvent, mods: ModifiersState, cb:
 
 #[cfg(test)]
 mod tests {
-    use super::icon;
+    use super::{Rect, TIP_DELAY, Tip, Ui, icon};
     use crate::text::{FontId, Fonts, TextLayout};
     use crate::theme;
+
+    #[test]
+    fn a_tooltip_shows_once_the_mouse_has_rested() {
+        let mut ui = Ui { mouse: (5.0, 5.0), ..Ui::default() };
+        let row = Rect::new(0.0, 0.0, 10.0, 10.0);
+        let at = |ui: &mut Ui, time: f32| {
+            ui.begin(0.1, time);
+            ui.tip(1, row, || Tip::text("whole"));
+            ui.tip.as_ref().map(|(_, _, tip)| tip.text.clone())
+        };
+        assert_eq!(at(&mut ui, 1.0), None, "not at once");
+        assert!(ui.next_tip().is_some_and(|left| (left - TIP_DELAY).abs() < 1e-4), "the app wakes for it");
+        assert_eq!(at(&mut ui, 1.2), None);
+        assert_eq!(at(&mut ui, 1.5).as_deref(), Some("whole"));
+        assert_eq!(ui.next_tip(), None);
+        // The mouse leaves and comes back: it waits again.
+        ui.mouse = (50.0, 50.0);
+        assert_eq!(at(&mut ui, 1.6), None);
+        ui.mouse = (5.0, 5.0);
+        ui.begin(0.1, 1.7);
+        assert_eq!(at(&mut ui, 1.8), None);
+        // A press puts it away.
+        ui.down = true;
+        assert_eq!(at(&mut ui, 3.0), None);
+    }
 
     #[test]
     fn icons_are_square_glyphs_of_the_icon_font() {

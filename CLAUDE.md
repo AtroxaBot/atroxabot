@@ -86,7 +86,8 @@ which platform a provider is. Never use one as the app's own branding.
   cards for one of a few that need explaining, a switch for on or off, an icon where one is understood.
   Adding something is a button, then a choice of what, then only the fields that choice needs.
 - Whatever scrolls uses `widgets::Scroll`: the wheel moves a target that never leaves the content, and the
-  view eases after it.
+  view eases after it. Call its `update` before drawing what scrolls and its `bar` after: the bar thickens
+  under the mouse and drags, and while it is held (`Ui::held`) nothing else is hovered or clicked.
 - Colours and sizes live in `theme.rs`, from the active `Palette` (`p.theme`), never hard-coded, so every
   theme (Black default, White, Amber) keeps working.
 - Icons come from the Lucide font (`ui::icon`): add a glyph by its codepoint from `lucide-static`'s

@@ -26,7 +26,7 @@ use crate::client::{Client, Model};
 use crate::error::Error;
 use crate::mcp::{McpHub, McpTool};
 use crate::responses::{Completion, InputItem, ResponseRequest, Role, StreamEvent, ToolCall, ToolSpec, Usage};
-use crate::session::{Block, Entry, Reply, Session, ToolUse};
+use crate::session::{Block, ContextPart, Entry, Reply, Session, ToolUse};
 use crate::tools::{self, Risk, Workspace};
 
 /// Most model requests one turn may make before it is stopped.
@@ -110,6 +110,8 @@ pub enum AgentEvent {
     Window(u64),
     /// Where the account's plan limits stand.
     Limits(Limits),
+    /// What the context holds, by kind (system prompt, tools, messages, …).
+    Context(Vec<ContextPart>),
     /// The Claude Agent's own session id, to resume it later.
     Remote(String),
     /// The turn took in a message the user sent while it ran: the model
@@ -242,6 +244,11 @@ impl Session {
             }
             AgentEvent::Note(text) => self.entries.push(Entry::Note { text: text.clone() }),
             AgentEvent::Window(window) => self.window = *window,
+            // Not a change to the conversation: what it fills is only noted.
+            AgentEvent::Context(parts) => {
+                self.context.clone_from(parts);
+                return;
+            }
             AgentEvent::ReplyEnded { raw, model, usage, cost, problem } => self.with_reply(|reply| {
                 reply.raw.clone_from(raw);
                 reply.model.clone_from(model);
@@ -452,6 +459,17 @@ impl ApiEngine {
                 parameters: &tool.schema,
             }))
             .collect();
+        // How much of each kind the request holds, in characters: what tells its tokens apart.
+        let (prompt, notes) = self.system.split_once(crate::agent::NOTES_HEADING).unwrap_or((&self.system, ""));
+        let (own, rest) = specs.split_at(definitions.len().min(specs.len()));
+        let (skills, theirs) = rest.split_at(skill.iter().count().min(rest.len()));
+        let fixed = [
+            ("System prompt", prompt.chars().count()),
+            ("System tools", spec_size(own)),
+            ("MCP tools", spec_size(theirs)),
+            ("Skills", spec_size(skills)),
+            ("Memory files", notes.chars().count()),
+        ];
         let window = self.pricing.as_ref().map_or(0, |model| model.context_window);
         let mut compacted = false;
         for _ in 0..MAX_ROUNDS {
@@ -505,6 +523,7 @@ impl ApiEngine {
                     problem: problem.clone(),
                 },
             );
+            emit(session, AgentEvent::Context(context_parts(&fixed, session.context_tokens())));
             if !finished {
                 return Err(problem);
             }
@@ -759,6 +778,37 @@ fn ended(problem: &str) -> AgentEvent {
     }
 }
 
+/// How many characters `specs` take as the model is sent them.
+fn spec_size(specs: &[ToolSpec<'_>]) -> usize {
+    specs
+        .iter()
+        .map(|spec| spec.name.len() + spec.description.chars().count() + spec.parameters.to_string().len())
+        .sum()
+}
+
+/// What a context of `total` tokens (as the provider counted them) holds,
+/// by kind: each of the `fixed` parts (a name and its size in characters)
+/// at about four characters a token, and the conversation the rest. Parts
+/// that take nothing are left out; empty while nothing was counted.
+fn context_parts(fixed: &[(&str, usize)], total: u64) -> Vec<ContextPart> {
+    if total == 0 {
+        return Vec::new();
+    }
+    let estimated: Vec<u64> = fixed.iter().map(|(_, size)| (*size as u64).div_ceil(4)).collect();
+    let sum: u64 = estimated.iter().sum();
+    // The estimates are rough: they never take more than the provider counted.
+    let scale = if sum > total { total as f64 / sum as f64 } else { 1.0 };
+    let mut parts: Vec<ContextPart> = fixed
+        .iter()
+        .zip(estimated)
+        .map(|((name, _), tokens)| ContextPart { name: (*name).to_owned(), tokens: (tokens as f64 * scale) as u64 })
+        .collect();
+    let held: u64 = parts.iter().map(|part| part.tokens).sum();
+    parts.push(ContextPart { name: "Messages".to_owned(), tokens: total.saturating_sub(held) });
+    parts.retain(|part| part.tokens > 0);
+    parts
+}
+
 /// The request input for `entries`, from the latest summary on. For Claude
 /// (`messages`), replies go back as the blocks they arrived as; elsewhere as
 /// text and calls. Every call is answered, as both APIs require.
@@ -831,6 +881,22 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn the_context_is_told_apart_by_kind() {
+        let fixed = [("System prompt", 4_000), ("System tools", 8_000), ("MCP tools", 0), ("Memory files", 400)];
+        let parts = context_parts(&fixed, 10_000);
+        let seen: Vec<_> = parts.iter().map(|part| (part.name.as_str(), part.tokens)).collect();
+        assert_eq!(
+            seen,
+            [("System prompt", 1_000), ("System tools", 2_000), ("Memory files", 100), ("Messages", 6_900)],
+            "what takes nothing is left out, and the conversation has the rest"
+        );
+        // Estimates over the count shrink to fit it; nothing counted, nothing to say.
+        let tight = context_parts(&fixed, 1_000);
+        assert_eq!(tight.iter().map(|part| part.tokens).sum::<u64>(), 1_000);
+        assert!(context_parts(&fixed, 0).is_empty());
+    }
 
     fn tool(id: &str, output: Option<&str>) -> Block {
         Block::Tool(ToolUse {

@@ -9,7 +9,7 @@ use atroxabot_core::skills::{self, Catalog, Elsewhere, Group, Origin, Skill, Sou
 use atroxabot_core::stats::{Ledger, Record, day_of};
 use atroxabot_core::{
     Agent, AgentEvent, Ask, Autonomy, ClaudeInfo, ClaudeMcpServer, ClaudeModel, Config, Connection, ConnectionKind,
-    LimitWindow, Limits, McpServer, Model, Session, ToolUse, Usage, VoiceSettings, unix_now,
+    ContextPart, LimitWindow, Limits, McpServer, Model, Session, ToolUse, Usage, VoiceSettings, unix_now,
 };
 use atroxabot_voice::CallState;
 
@@ -190,25 +190,55 @@ fn snapshots() {
             ["src/tokenizer.rs", "tests/tokenizer.rs", "docs/tokens.md", "src/parser/expr.rs"].map(String::from).into(),
         );
         // The agent keeps a task list: the side panel shows it, the conversation the task in hand.
-        let mut tasks = panel();
-        let turn = tasks.current.clone().unwrap_or_default();
-        tasks.send("Fix the escape handling and cover it with tests", false, Vec::new(), &mut Vec::new());
-        let subjects =
-            ["Read the tokenizer", "Fix the escape branch", "Add a test for escaped quotes", "Run the tests"];
-        for (number, subject) in (1..).zip(subjects) {
-            let input = serde_json::json!({ "subject": subject, "activeForm": format!("{subject}…") }).to_string();
-            let id = format!("t{number}");
-            let created = ToolUse { id: id.clone(), name: "TaskCreate".into(), input, ..ToolUse::default() };
-            tasks.agent_event(&turn, AgentEvent::ToolCall(created), &mut Vec::new());
-            let output = format!("Task #{number} created successfully: {subject}");
-            tasks.agent_event(&turn, AgentEvent::ToolResult { id, output, is_error: false }, &mut Vec::new());
-        }
-        for (id, status) in [("1", "completed"), ("2", "in_progress")] {
-            let input = serde_json::json!({ "taskId": id, "status": status }).to_string();
-            let updated = ToolUse { id: format!("u{id}"), name: "TaskUpdate".into(), input, ..ToolUse::default() };
-            tasks.agent_event(&turn, AgentEvent::ToolCall(updated), &mut Vec::new());
-            let done = AgentEvent::ToolResult { id: format!("u{id}"), output: "Updated".into(), is_error: false };
-            tasks.agent_event(&turn, done, &mut Vec::new());
+        let tasks = || {
+            let mut tasks = panel();
+            let turn = tasks.current.clone().unwrap_or_default();
+            tasks.send("Fix the escape handling and cover it with tests", false, Vec::new(), &mut Vec::new());
+            let subjects = [
+                ("Read the tokenizer", ""),
+                ("Fix the escape branch", ""),
+                (
+                    "Add a test for escaped quotes and backslashes at the end of a string",
+                    "Cover `\\\"` mid-string and a lone backslash before the closing quote.",
+                ),
+                ("Run the tests", ""),
+            ];
+            for (number, (subject, description)) in (1..).zip(subjects) {
+                let input = serde_json::json!({ "subject": subject, "description": description, "activeForm": format!("{subject}…") });
+                let id = format!("t{number}");
+                let created = ToolUse {
+                    id: id.clone(),
+                    name: "TaskCreate".into(),
+                    input: input.to_string(),
+                    ..ToolUse::default()
+                };
+                tasks.agent_event(&turn, AgentEvent::ToolCall(created), &mut Vec::new());
+                let output = format!("Task #{number} created successfully: {subject}");
+                tasks.agent_event(&turn, AgentEvent::ToolResult { id, output, is_error: false }, &mut Vec::new());
+            }
+            for (id, status) in [("1", "completed"), ("2", "in_progress")] {
+                let input = serde_json::json!({ "taskId": id, "status": status }).to_string();
+                let updated = ToolUse { id: format!("u{id}"), name: "TaskUpdate".into(), input, ..ToolUse::default() };
+                tasks.agent_event(&turn, AgentEvent::ToolCall(updated), &mut Vec::new());
+                let done = AgentEvent::ToolResult { id: format!("u{id}"), output: "Updated".into(), is_error: false };
+                tasks.agent_event(&turn, done, &mut Vec::new());
+            }
+            tasks
+        };
+        // What the context holds, as Claude Code reports it, under the mouse.
+        let mut context = panel();
+        if let Some(thread) = context.thread_mut() {
+            let part = |name: &str, tokens: u64| ContextPart { name: name.into(), tokens };
+            thread.session.window = 200_000;
+            thread.session.context = vec![
+                part("System prompt", 3_213),
+                part("System tools", 10_977),
+                part("MCP tools", 604),
+                part("MCP server instructions", 1_106),
+                part("Memory files", 2_797),
+                part("Skills", 5_351),
+                part("Messages", 24_162),
+            ];
         }
         // Messages sent while the agent works wait above the message box: one handed over, one not yet.
         let mut queued = shell();
@@ -377,7 +407,7 @@ fn snapshots() {
             ("question", asked),
             ("slash", slash),
             ("mention", mention),
-            ("tasks", tasks),
+            ("tasks", tasks()),
             ("queued", queued),
             ("menu-branch", branch),
             ("diff", diff),
@@ -398,8 +428,11 @@ fn snapshots() {
             ("agent", editor),
             ("call", call),
         ];
-        for (name, mut shell) in screens {
-            let pixels = frame(&mut gpu, &fonts, scheme, &mut |p, ui, view| {
+        // Tooltips: the mouse rests on a row of the side panel (which starts at x 1112).
+        let hovered = [("tip-task", tasks(), (1200.0, 313.0)), ("tip-context", context, (1180.0, 90.0))];
+        let screens = screens.into_iter().map(|(name, shell)| (name, shell, (-1.0, -1.0))).chain(hovered);
+        for (name, mut shell, mouse) in screens {
+            let pixels = frame(&mut gpu, &fonts, scheme, mouse, &mut |p, ui, view| {
                 shell.draw(p, ui, view, scheme, &mut Vec::new());
             });
             write_png(&dir.join(format!("{name}-{}.png", scheme.key())), SIZE, &pixels);
@@ -473,23 +506,24 @@ fn ledger(agents: [&str; 2]) -> Ledger {
     Ledger { records }
 }
 
-/// Draws a screen with `draw` until its animations settled, then renders
-/// the last frame.
+/// Draws a screen with `draw`, the mouse resting at `mouse`, until its
+/// animations settled (and a tooltip there showed), then renders the last frame.
 fn frame(
     gpu: &mut Offscreen,
     fonts: &Fonts,
     scheme: Scheme,
+    mouse: (f32, f32),
     draw: &mut dyn FnMut(&mut Painter, &mut Ui, Rect),
 ) -> Vec<u8> {
     let (mut atlas, mut images) = (GlyphAtlas::default(), ImageAtlas::default());
     let mut ui = Ui::default();
-    (ui.focused, ui.mouse) = (true, (-1.0, -1.0));
+    (ui.focused, ui.mouse) = (true, mouse);
     let view = Rect::new(0.0, 0.0, SIZE.0 as f32, SIZE.1 as f32);
     let palette = scheme.palette();
     let mut instances = Vec::new();
-    for _ in 0..5 {
-        // A long frame: every ease lands at once.
-        ui.begin(1.0, 10.0);
+    for second in 0..5u8 {
+        // A long frame: every ease lands at once. Whole seconds pass, so the caret blinks alike in each.
+        ui.begin(1.0, 10.0 + f32::from(second));
         let mut p = Painter::new(fonts, (&mut atlas, &mut images), &mut instances, 1.0, view, palette);
         draw(&mut p, &mut ui, view);
         crate::titlebar::draw(&mut p, &mut ui, view, false);

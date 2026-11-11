@@ -207,6 +207,15 @@ impl Session {
         self.request(&json!({"subtype": "mcp_status"}))
     }
 
+    /// Asks what the context window holds, by kind, as `/context` shows it; the answer arrives as an
+    /// [`Event::ContextUsage`]. Claude Code works it out itself: no message is sent, so nothing is used.
+    ///
+    /// # Errors
+    /// [`Error::Closed`] after the session closed, [`Error::Io`] when the write fails.
+    pub fn context_usage(&self) -> Result<(), Error> {
+        self.request(&json!({"subtype": "get_context_usage", "detail": "summary"}))
+    }
+
     /// Changes the model for the following turns; `None` returns to the default model.
     ///
     /// # Errors

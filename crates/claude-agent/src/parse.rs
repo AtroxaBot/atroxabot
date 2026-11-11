@@ -7,8 +7,8 @@ use serde_json::Value;
 
 use crate::cli::preview;
 use crate::{
-    Account, Block, Event, Info, Init, McpServerStatus, ModelInfo, PermissionRequest, RateLimit, RateWindow,
-    SlashCommand, Task, TaskState, TurnResult, Usage,
+    Account, Block, ContextCategory, ContextUsage, Event, Info, Init, McpServerStatus, ModelInfo, PermissionRequest,
+    RateLimit, RateWindow, SlashCommand, Task, TaskState, TurnResult, Usage,
 };
 
 /// What a line of output amounts to.
@@ -109,12 +109,19 @@ pub(crate) fn parse_line(line: &str) -> Parsed {
         "control_response" => {
             let response = field(&data, "response");
             if field(response, "subtype").as_str() != Some("error") {
-                // Only the answer to `initialize` lists models, only that to `mcp_status` servers.
+                // Only the answer to `initialize` lists models, only that to `mcp_status` servers, only
+                // that to `get_context_usage` categories.
                 let answer = field(response, "response");
                 return if answer.get("models").is_some() {
                     Parsed::Event(Event::Ready(info(answer)))
                 } else if let Some(servers) = answer.get("mcpServers").and_then(Value::as_array) {
                     Parsed::Event(Event::McpStatus(servers.iter().filter_map(mcp_server).collect()))
+                } else if let Some(categories) = answer.get("categories").and_then(Value::as_array) {
+                    Parsed::Event(Event::ContextUsage(ContextUsage {
+                        categories: categories.iter().take(64).filter_map(context_category).collect(),
+                        total: number(answer, "totalTokens"),
+                        max: number(answer, "maxTokens"),
+                    }))
                 } else {
                     Parsed::Nothing
                 };
@@ -128,6 +135,20 @@ pub(crate) fn parse_line(line: &str) -> Parsed {
         "control_cancel_request" => Event::PermissionCancelled { request_id: text(&data, "request_id") },
         "rate_limit_event" => Event::RateLimit(rate_limit(field(&data, "rate_limit_info"))),
         _ => Event::Other { subtype: text(&data, "subtype"), kind, raw: data },
+    })
+}
+
+/// One kind of thing the context holds, of the answer to `get_context_usage`; `None` without a name.
+fn context_category(category: &Value) -> Option<ContextCategory> {
+    let name = text(category, "name");
+    if name.is_empty() {
+        return None;
+    }
+    Some(ContextCategory {
+        id: text(category, "id"),
+        name,
+        tokens: number(category, "tokens"),
+        kind: text(category, "kind"),
     })
 }
 
@@ -706,6 +727,25 @@ mod tests {
         assert_eq!(servers[2].error, "spawn ENOENT");
         let none = r#"{"type":"control_response","response":{"subtype":"success","response":{"mcpServers":[]}}}"#;
         assert_eq!(event(none), Event::McpStatus(Vec::new()));
+    }
+
+    #[test]
+    fn context_usage_answers() {
+        // As Claude Code 2.1.322 answers `get_context_usage` (shortened: it also sends the grid it draws and
+        // what each memory file, skill and MCP tool takes).
+        let line = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_3","response":{
+            "categories":[{"id":"system_prompt","name":"System prompt","tokens":3213,"color":"promptBorder",
+            "kind":"used"},{"id":"mcp_tools_deferred","name":"MCP tools (deferred)","tokens":32959,
+            "isDeferred":true,"kind":"deferred"},{"tokens":5},"junk",{"id":"messages","name":"Messages",
+            "tokens":-4,"kind":"used"}],"totalTokens":24058,"maxTokens":1000000,"gridRows":[[]]}}}"#;
+        let Event::ContextUsage(usage) = event(&line.replace('\n', " ")) else { panic!("not a context usage") };
+        assert_eq!((usage.total, usage.max), (24_058, 1_000_000));
+        let seen: Vec<_> = usage.categories.iter().map(|c| (c.id.as_str(), c.tokens, c.kind.as_str())).collect();
+        assert_eq!(
+            seen,
+            [("system_prompt", 3213, "used"), ("mcp_tools_deferred", 32_959, "deferred"), ("messages", 0, "used")]
+        );
+        assert_eq!(usage.categories[0].name, "System prompt");
     }
 
     #[test]

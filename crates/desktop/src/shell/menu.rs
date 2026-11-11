@@ -654,7 +654,7 @@ impl Shell {
             if row.bottom() < list.y || row.y > list.bottom() {
                 continue;
             }
-            let hovered = !item.inert && row.contains(ui.mouse) && list.contains(ui.mouse);
+            let hovered = !item.inert && !ui.held && row.contains(ui.mouse) && list.contains(ui.mouse);
             if hovered || item.selected {
                 p.rect(row, if hovered { t.hover } else { fade(t.hover, 0.6) }, theme::RADIUS_SM);
             }
@@ -691,6 +691,7 @@ impl Shell {
         }
         p.set_clip(clip);
         scroll.finish(ui, content, list.h);
+        scroll.bar(p, ui, list, content);
 
         // Effort: how hard the model thinks, as a row of pills under its list.
         let mut effort = None;
@@ -714,7 +715,8 @@ impl Shell {
         }
 
         // A click anywhere else puts it away.
-        let outside = ui.released && !rect.contains(ui.mouse) && !anchor.contains(ui.mouse);
+        // Letting go of its scroll bar outside it keeps it open.
+        let outside = ui.released && !ui.held && !rect.contains(ui.mouse) && !anchor.contains(ui.mouse);
         if let Some(state) = &mut self.menu {
             (state.rect, state.scroll) = (rect, scroll);
         }

@@ -8,7 +8,7 @@
 
 use atroxabot_core::git::{Change, GitFile, GitStatus, Job, Report};
 use atroxabot_core::stats::Ledger;
-use atroxabot_core::{ConnectionKind, Limits, TodoState};
+use atroxabot_core::{ConnectionKind, ContextPart, Limits, Todo, TodoState};
 use winit::window::CursorIcon;
 
 use super::menu::Menu;
@@ -19,7 +19,7 @@ use crate::app::Action;
 use crate::paint::{Color, Painter, Rect, fade, mix};
 use crate::text::Style;
 use crate::theme::{self, Palette};
-use crate::ui::{Ui, icon, icon_button, id};
+use crate::ui::{Tip, Ui, icon, icon_button, id};
 
 /// The panel's width.
 pub(super) const WIDTH: f32 = 320.0;
@@ -216,16 +216,11 @@ impl DiffView {
         p.set_clip(clip);
         let content = text.lines().count() as f32 * LINE_H + 16.0;
         self.scroll.finish(ui, content, body.h);
-        self.scroll.bar(p, body, content);
+        self.scroll.bar(p, ui, body, content);
         let widest = text.lines().map(|line| line.chars().count() + (TAB.len() - 1) * line.matches('\t').count()).max();
         let wide = widest.unwrap_or(0) as f32 * column + 40.0;
         self.across.finish(ui, wide, body.w);
-        if let Some(progress) = self.across.progress() {
-            let track = body.w - 16.0;
-            let thumb = super::widgets::thumb(track, body.w, wide);
-            let at = Rect::new(body.x + 8.0 + (track - thumb) * progress, body.bottom() - 7.0, thumb, 3.0);
-            p.rect(at, fade(t.text_faint, 0.35), 1.5);
-        }
+        self.across.bar_across(p, ui, body, wide);
         close
     }
 }
@@ -294,8 +289,9 @@ impl Shell {
         }
     }
 
-    /// What the open session used, as rows of a name and a number. Returns where they end.
-    fn draw_usage(&self, p: &mut Painter, (x, mut y, w): (f32, f32, f32)) -> f32 {
+    /// What the open session used, as rows of a name and a number; resting
+    /// the mouse on the context shows what it holds. Returns where they end.
+    fn draw_usage(&self, p: &mut Painter, ui: &mut Ui, (x, mut y, w): (f32, f32, f32)) -> f32 {
         let t = p.theme;
         let Some(thread) = self.thread().filter(|thread| thread.session.tokens() > 0) else {
             p.label("Nothing used yet", theme::SMALL, x, y, t.text_faint);
@@ -325,6 +321,10 @@ impl Shell {
             let value = p.layout(&value, theme::SMALL, None);
             p.text(&value, x + w - value.width(), y, t.text);
             y += 24.0;
+            if index == 0 {
+                let row = Rect::new(x - 8.0, y - 28.0, w + 16.0, if window > 0 { 42.0 } else { 28.0 });
+                ui.tip(id("context"), row, || context_tip(&thread.session.context, window));
+            }
             if index == 0 && window > 0 {
                 let full = (context as f32 / window as f32).clamp(0.0, 1.0);
                 p.rect(Rect::new(x, y, w, 4.0), t.hover, 2.0);
@@ -343,7 +343,8 @@ impl Shell {
     /// doing now and what is still to do. With more than fit, the ones
     /// around the task in hand are shown. Returns where it ends (`y` itself
     /// when there is no list).
-    fn draw_todos(&self, p: &mut Painter, (x, mut y, w): (f32, f32, f32)) -> f32 {
+    /// Resting the mouse on a task cut short shows it in full, with what the agent wrote of it.
+    fn draw_todos(&self, p: &mut Painter, ui: &mut Ui, (x, mut y, w): (f32, f32, f32)) -> f32 {
         let t = p.theme;
         let todos = self.thread().map(|thread| thread.session.todos()).unwrap_or_default();
         if todos.is_empty() {
@@ -375,8 +376,13 @@ impl Shell {
                 }
             };
             let mut subject = p.layout(&todo.subject, theme::SMALL, None);
+            // Only a task cut short, or with more to it, has anything to add.
+            let more = subject.width() > w - 22.0 || !todo.detail.trim().is_empty();
             subject.truncate(p.fonts, w - 22.0);
             p.text(&subject, x + 22.0, y, ink);
+            if more {
+                ui.tip(id(("task", &todo.id)), Rect::new(x - 8.0, y - 4.0, w + 16.0, 24.0), || todo_tip(todo));
+            }
             y += 24.0;
         }
         let hidden = todos.len().saturating_sub(first + TASKS_SHOWN);
@@ -481,8 +487,8 @@ impl Shell {
         let clip = p.push_clip(rect);
         let (x, w) = (rect.x + 16.0, rect.w - 32.0);
         field_label(p, icon::LAYERS, "SESSION", x, rect.y + 20.0);
-        let mut y = self.draw_usage(p, (x, rect.y + 48.0, w)) + 8.0;
-        y = self.draw_todos(p, (x, y, w));
+        let mut y = self.draw_usage(p, ui, (x, rect.y + 48.0, w)) + 8.0;
+        y = self.draw_todos(p, ui, (x, y, w));
         y = self.draw_subagents(p, ui, (x, y, w));
         y = self.draw_limits(p, (x, y, w));
         p.rect(Rect::new(rect.x, y, rect.w, 1.0), t.border, 0.0);
@@ -577,7 +583,9 @@ impl Shell {
             }
         }
         p.set_clip(clip);
-        self.git.scroll.finish(ui, row_y + offset - list.y, list.h);
+        let content = row_y + offset - list.y;
+        self.git.scroll.finish(ui, content, list.h);
+        self.git.scroll.bar(p, ui, list, content);
         if let Some(file) = open {
             actions.push(Action::Git { folder: self.git.folder.clone(), job: Job::Diff(file.clone()) });
             self.modal = Some(Modal::Diff(Box::new(DiffView::new(file))));
@@ -585,11 +593,62 @@ impl Shell {
     }
 }
 
+/// The tooltip of the context: what it holds, by kind, and what is left
+/// of a `window` of that many tokens (0 when unknown).
+fn context_tip(parts: &[ContextPart], window: u64) -> Tip {
+    if parts.is_empty() {
+        return Tip::text("What the context holds is known after the agent's next reply.");
+    }
+    let mut rows: Vec<(String, String)> = parts.iter().map(|part| (part.name.clone(), compact(part.tokens))).collect();
+    let held: u64 = parts.iter().map(|part| part.tokens).sum();
+    if window > held {
+        rows.push(("Free space".to_owned(), compact(window - held)));
+    }
+    Tip { text: "What the context holds".to_owned(), rows }
+}
+
+/// The tooltip of a task: its subject in full, then what the agent wrote of it.
+fn todo_tip(todo: &Todo) -> Tip {
+    let detail = todo.detail.trim();
+    let text = if detail.is_empty() {
+        todo.subject.clone()
+    } else {
+        format!(
+            "{}
+
+{detail}",
+            todo.subject
+        )
+    };
+    Tip::text(text)
+}
+
 #[cfg(test)]
 mod tests {
     use atroxabot_core::{Agent, Config};
 
     use super::*;
+
+    #[test]
+    fn tooltips_say_what_a_row_cuts_short() {
+        let todo = Todo { subject: "Fix it".into(), detail: " In the parser ".into(), ..Todo::default() };
+        assert_eq!(
+            todo_tip(&todo).text,
+            "Fix it
+
+In the parser"
+        );
+        assert_eq!(todo_tip(&Todo { subject: "Fix it".into(), ..Todo::default() }).text, "Fix it");
+        let parts = [
+            ContextPart { name: "System prompt".into(), tokens: 3_000 },
+            ContextPart { name: "Messages".into(), tokens: 7_000 },
+        ];
+        let tip = context_tip(&parts, 200_000);
+        let rows: Vec<_> = tip.rows.iter().map(|(name, value)| (name.as_str(), value.as_str())).collect();
+        assert_eq!(rows, [("System prompt", "3.0k"), ("Messages", "7.0k"), ("Free space", "190.0k")]);
+        assert!(context_tip(&parts, 0).rows.iter().all(|(name, _)| name != "Free space"), "no window, no free space");
+        assert!(context_tip(&[], 200_000).rows.is_empty(), "not known yet: a line says when it will be");
+    }
 
     #[test]
     fn limit_windows_are_named_as_claude_code_names_them() {

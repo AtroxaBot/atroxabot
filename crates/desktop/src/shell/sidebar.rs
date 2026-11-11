@@ -214,6 +214,7 @@ impl Shell {
         }
         let content = y + offset - list.y;
         self.sidebar_scroll.finish(ui, content, list.h);
+        self.sidebar_scroll.bar(p, ui, list, content);
         if content > list.h {
             // The list fades out at its edges rather than being cut.
             if offset > 0.5 {

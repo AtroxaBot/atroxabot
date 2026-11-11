@@ -567,6 +567,10 @@ impl Thread {
         if hovered && ui.scroll > 0.0 && self.sub_scroll.at_end() {
             self.sub_follow = true;
         }
+        if self.sub_scroll.dragging() {
+            // Dragged to the end, it follows the newest words again; anywhere else, it stays.
+            self.sub_follow = self.sub_scroll.at_end();
+        }
         if live && self.sub_follow && !self.sub_scroll.at_end() {
             self.sub_scroll.follow_end();
             ui.animating = true;
@@ -574,7 +578,7 @@ impl Thread {
         if self.busy {
             ui.animating = true;
         }
-        self.sub_scroll.bar(p, area, content);
+        self.sub_scroll.bar(p, ui, area, content);
     }
 
     /// The whole conversation.
@@ -639,6 +643,10 @@ impl Thread {
         if hovered && ui.scroll > 0.0 && self.scroll.at_end() {
             self.follow = true;
         }
+        if self.scroll.dragging() {
+            // Dragged to the end, it follows the newest message again; anywhere else, it stays.
+            self.follow = self.scroll.at_end();
+        }
         if std::mem::take(&mut self.fresh) {
             self.scroll.jump_to_end();
             ui.animating = true;
@@ -650,7 +658,7 @@ impl Thread {
         if self.busy {
             ui.animating = true;
         }
-        self.scroll.bar(p, area, content);
+        self.scroll.bar(p, ui, area, content);
     }
 
     /// The user's message: what they sent along (pictures as thumbnails, a

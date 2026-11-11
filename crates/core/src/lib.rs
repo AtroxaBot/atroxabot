@@ -43,5 +43,6 @@ pub use error::{Error, Result};
 pub use mcp::{McpHub, claude_mcp_config};
 pub use responses::{Completion, InputItem, ResponseRequest, Role, StreamEvent, ToolCall, ToolChoice, ToolSpec, Usage};
 pub use session::{
-    Block, Entry, Reply, SearchHit, Session, SessionStore, SessionSummary, Todo, TodoState, ToolUse, new_id, unix_now,
+    Block, ContextPart, Entry, Reply, SearchHit, Session, SessionStore, SessionSummary, Todo, TodoState, ToolUse,
+    new_id, unix_now,
 };

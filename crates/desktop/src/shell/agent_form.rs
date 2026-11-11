@@ -320,7 +320,7 @@ impl AgentForm {
 
         self.scroll.finish(ui, y + offset - body.y, body.h);
         p.set_clip(clip);
-        self.scroll.bar(p, body, y + offset - body.y);
+        self.scroll.bar(p, ui, body, y + offset - body.y);
 
         // Foot: delete on the left, cancel and save on the right.
         p.rect(Rect::new(footer.x + 1.0, footer.y, footer.w - 2.0, 1.0), t.border, 0.0);

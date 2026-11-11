@@ -287,6 +287,8 @@ pub enum Event {
     },
     /// The answer to [`Session::mcp_status`]: the session's MCP servers and how each is doing.
     McpStatus(Vec<McpServerStatus>),
+    /// The answer to [`Session::context_usage`]: what the context window holds.
+    ContextUsage(ContextUsage),
     /// A complete piece of an assistant message. The binary sends one of these per content block, each repeating
     /// the message's `usage`, so add up [`TurnResult::usage`] rather than these.
     Assistant {
@@ -390,6 +392,32 @@ pub struct McpServerStatus {
     pub error: String,
     /// How many tools it offers.
     pub tools: usize,
+}
+
+/// What the context window holds, as Claude Code's `/context` shows it, from [`Session::context_usage`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextUsage {
+    /// What it holds, by kind, in Claude Code's order.
+    pub categories: Vec<ContextCategory>,
+    /// The tokens in use.
+    pub total: u64,
+    /// How many the window takes.
+    pub max: u64,
+}
+
+/// One kind of thing the context window holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ContextCategory {
+    /// Claude Code's key for it: `system_prompt`, `system_tools`, `mcp_tools`, `mcp_instructions`,
+    /// `memory_files`, `skills`, `messages`, `free_space` and others.
+    pub id: String,
+    /// Its name as Claude Code shows it ("System prompt", "MCP tools", …).
+    pub name: String,
+    /// The tokens it takes.
+    pub tokens: u64,
+    /// `used` (in the context), `deferred` (tools loaded only when searched for, not in it), `buffer`
+    /// (kept free for summarising) or `free`.
+    pub kind: String,
 }
 
 /// The session's settings, from `system`/`init`.

@@ -206,7 +206,7 @@ impl StatsView {
         let content = y + offset - body.y + 16.0;
         p.set_clip(clip);
         self.scroll.finish(ui, content, body.h);
-        self.scroll.bar(p, body, content);
+        self.scroll.bar(p, ui, body, content);
         if let Some(metric) = metric {
             self.metric = metric;
         }

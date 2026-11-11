@@ -37,7 +37,8 @@ cargo clippy --workspace --all-targets -- -D warnings
   session's place (what it was asked, what it said and every tool it called), under a bar that leads back.
 - **Tasks.** When an agent keeps a task list (Claude Code's `TaskCreate` and `TaskUpdate`, or `TodoWrite`),
   the side panel shows it: what is done, what it is doing now and what is still to do; while it works,
-  the conversation names the task in hand. Claude Code gives a session an app starts those tools only
+  the conversation names the task in hand. Resting the mouse on a task that is cut short (or that the
+  agent described) shows it whole, with its description. Claude Code gives a session an app starts those tools only
   when they are named as allowed (`--allowedTools`), so AtroxaBot names them.
 - **Commands and skills.** Type `/` in the message box for the list: `/clear` empties the session (its
   messages are deleted and the agent starts over with an empty context, while the session keeps its place,
@@ -121,7 +122,12 @@ cargo clippy --workspace --all-targets -- -D warnings
   things to do (a new session, a new agent, the statistics, the settings, the side panel). Arrows move,
   Enter opens, Esc closes.
 - **The side panel** (the last icon of the top bar) shows what the session used and how full its context
-  is, and the git repository of its folder: the branch (a click switches it), how far it is from what it
+  is; resting the mouse on the context shows what it holds: the system prompt, the tools (the app's or
+  Claude Code's own, and those of MCP servers), the skills, memory files, the messages and the free
+  space. A Claude account says so itself after each turn (`get_context_usage`, as `/context` shows it,
+  which uses nothing); for an API provider the app sizes each part of its request and gives the
+  conversation the rest of the tokens the provider counted. The session keeps the latest breakdown. It
+  also shows the git repository of its folder: the branch (a click switches it), how far it is from what it
   tracks, and the changed files with their added and removed lines (a click opens the diff). Committing
   and pushing are left to the agent: the panel only shows. It uses the `git` you have installed and reads
   the repository again when a turn ends and when you come back to the window. For a Claude account it also

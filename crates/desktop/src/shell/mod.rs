@@ -875,6 +875,10 @@ impl Shell {
             AgentEvent::Status(status) => thread.status = status,
             AgentEvent::Summarized(_) => thread.invalidate(),
             AgentEvent::Remote(_) => actions.push(Action::SaveSession(Box::new(thread.session.clone()))),
+            // Claude Code says what its context holds after the turn, which saved the session already.
+            AgentEvent::Context(_) if !thread.busy => {
+                actions.push(Action::SaveSession(Box::new(thread.session.clone())));
+            }
             // Taken in: it is in the conversation now.
             AgentEvent::FollowUp { id, .. } => thread.follow_ups.retain(|waiting| waiting.message.id != id),
             AgentEvent::Queued(count) => thread.more = count,
@@ -882,6 +886,8 @@ impl Shell {
                 let (hurried, stopped) = (std::mem::take(&mut thread.hurry), thread.stopping);
                 thread.end_turn(problem);
                 actions.push(Action::SaveSession(Box::new(thread.session.clone())));
+                // A Claude account's process is asked what its context holds now (an API engine said so itself).
+                actions.push(Action::AskContext(session.to_owned()));
                 if speaking {
                     actions.push(Action::FinishReply);
                 }
@@ -1045,6 +1051,8 @@ impl Shell {
         ui.blocker = None;
         self.draw_menu(p, ui, actions);
         self.draw_notices(p, ui, canvas);
+        // A tooltip lies over everything.
+        crate::ui::draw_tip(p, ui, view);
     }
 
     /// The open modal, over the screen.

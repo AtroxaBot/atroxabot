@@ -220,12 +220,15 @@ impl Agent {
             let notes = fs::read_to_string(&path).unwrap_or_default();
             let notes = tail(notes.trim(), MEMORY_BUDGET);
             if !notes.is_empty() {
-                let _ = write!(prompt, "\n\nYour notes so far:\n\n{notes}");
+                let _ = write!(prompt, "{NOTES_HEADING}{notes}");
             }
         }
         prompt
     }
 }
+
+/// What comes before an agent's notes at the end of its system prompt.
+pub const NOTES_HEADING: &str = "\n\nYour notes so far:\n\n";
 
 /// What an agent is told, ahead of the user's first words, when a voice
 /// call begins. It rides on that message rather than in the system prompt,

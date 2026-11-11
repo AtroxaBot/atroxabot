@@ -70,8 +70,22 @@ pub struct Session {
     /// How hard it thinks; empty for the model's usual effort.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub effort: String,
+    /// What the context held after the latest turn, by kind, as far as the
+    /// engine said; empty when it did not.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub context: Vec<ContextPart>,
     /// What was said and done, oldest first.
     pub entries: Vec<Entry>,
+}
+
+/// One kind of thing a context holds, and the tokens it takes.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextPart {
+    /// What it is: "System prompt", "MCP tools", "Messages", …
+    pub name: String,
+    /// The tokens it takes.
+    pub tokens: u64,
 }
 
 /// One step of a conversation.
@@ -180,6 +194,8 @@ pub struct Todo {
     pub subject: String,
     /// How it reads while it is being done ("Fixing the bug"); may be empty.
     pub doing: String,
+    /// What the agent wrote of it beyond its subject; may be empty.
+    pub detail: String,
     /// How far along it is.
     pub state: TodoState,
 }
@@ -239,6 +255,7 @@ impl Session {
                             id: number.to_string(),
                             subject: text(todo, "content"),
                             doing: text(todo, "activeForm"),
+                            detail: String::new(),
                             state: TodoState::from_key(&text(todo, "status")).unwrap_or_default(),
                         })
                         .filter(|todo| !todo.subject.is_empty())
@@ -255,6 +272,7 @@ impl Session {
                         id: named.map_or_else(|| (todos.len() + 1).to_string(), str::to_owned),
                         subject: text(&input, "subject"),
                         doing: text(&input, "activeForm"),
+                        detail: text(&input, "description"),
                         state: TodoState::Pending,
                     });
                 }
@@ -265,7 +283,12 @@ impl Session {
                     }
                     let Some(todo) = todos.iter_mut().find(|todo| todo.id == id) else { continue };
                     todo.state = TodoState::from_key(&status).unwrap_or(todo.state);
-                    for (key, field) in [("subject", &mut todo.subject), ("activeForm", &mut todo.doing)] {
+                    let fields = [
+                        ("subject", &mut todo.subject),
+                        ("activeForm", &mut todo.doing),
+                        ("description", &mut todo.detail),
+                    ];
+                    for (key, field) in fields {
                         if let Some(new) = input.get(key).and_then(Value::as_str) {
                             new.clone_into(field);
                         }
@@ -895,13 +918,18 @@ mod tests {
             update("1", "completed"),
             update("2", "in_progress"),
             update("9", "completed"),
-            call("TaskUpdate", serde_json::json!({ "taskId": "2", "subject": "Fix both bugs" }), None),
+            call(
+                "TaskUpdate",
+                serde_json::json!({ "taskId": "2", "subject": "Fix both bugs", "description": "In the parser" }),
+                None,
+            ),
             call("TaskUpdate", serde_json::json!("garbage"), None),
         ]));
         let todos = session.todos();
         let seen: Vec<_> = todos.iter().map(|todo| (todo.id.as_str(), todo.subject.as_str(), todo.state)).collect();
         assert_eq!(seen, [("1", "Read the file", TodoState::Done), ("2", "Fix both bugs", TodoState::Active)]);
         assert_eq!(todos[1].doing, "Fix the bug…");
+        assert_eq!(todos[1].detail, "In the parser", "what the agent wrote of it is kept for its tooltip");
 
         // Deleting takes one off; a task added once all are done starts a new list.
         session.entries.push(reply(vec![

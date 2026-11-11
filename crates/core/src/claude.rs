@@ -23,7 +23,7 @@ use crate::engine::{AgentEvent, Ask, FollowUp, LimitWindow, Limits, Verdict};
 use crate::responses::Usage;
 #[cfg(test)]
 use crate::session::TodoState;
-use crate::session::{Session, ToolUse};
+use crate::session::{ContextPart, Session, ToolUse};
 use crate::tools;
 
 /// Where the user's Claude Code binary is, if it is installed.
@@ -201,6 +201,13 @@ impl ClaudeAgent {
         };
         // Fails if the request was withdrawn or the process is gone.
         let _ = self.session.respond(id, decision);
+    }
+
+    /// Asks what the context holds; the answer comes as an
+    /// [`AgentEvent::Context`]. Claude Code works it out itself, so nothing is used.
+    pub fn ask_context(&self) {
+        // Fails only if the process is gone, and then there is nothing to show.
+        let _ = self.session.context_usage();
     }
 
     /// Ends the process. Also happens when the value is dropped.
@@ -474,6 +481,13 @@ impl Mapper {
                 if self.agents.contains(&task.tool_use_id) {
                     out.push(AgentEvent::Activity { text: activity(&task), id: task.tool_use_id });
                 }
+            }
+            sdk::Event::ContextUsage(usage) => {
+                // What is in the context; deferred tools, the summary buffer and free space are not.
+                let used = usage.categories.into_iter().filter(|part| part.kind == "used" && part.tokens > 0);
+                out.push(AgentEvent::Context(
+                    used.map(|part| ContextPart { name: part.name, tokens: part.tokens }).collect(),
+                ));
             }
             sdk::Event::RateLimit(limit) => {
                 let window =

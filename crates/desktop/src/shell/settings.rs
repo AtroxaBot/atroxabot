@@ -331,7 +331,7 @@ impl Settings {
         p.set_clip(clip);
         let content = end + offset - area.y + 24.0;
         self.scroll.finish(ui, content, area.h);
-        self.scroll.bar(p, area, content);
+        self.scroll.bar(p, ui, area, content);
         leave
     }
 

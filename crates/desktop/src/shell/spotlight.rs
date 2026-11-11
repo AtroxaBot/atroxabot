@@ -247,7 +247,7 @@ impl Spotlight {
             if row.bottom() < list.y || row.y > list.bottom() {
                 continue;
             }
-            let hovered = row.contains(ui.mouse) && list.contains(ui.mouse);
+            let hovered = !ui.held && row.contains(ui.mouse) && list.contains(ui.mouse);
             if hovered && moved {
                 self.selected = index;
             }
@@ -282,7 +282,9 @@ impl Spotlight {
             }
         }
         p.set_clip(clip);
-        self.scroll.finish(ui, entries.len() as f32 * ROW + 12.0, list.h);
+        let content = entries.len() as f32 * ROW + 12.0;
+        self.scroll.finish(ui, content, list.h);
+        self.scroll.bar(p, ui, list, content);
 
         p.rect(Rect::new(card.x + 1.0, list.bottom(), card.w - 2.0, 1.0), t.border, 0.0);
         let keys = "↑↓ to move      ↵ to open      esc to close";

@@ -173,6 +173,8 @@ pub enum Action {
     },
     /// End the Claude Agent process of this session, if it has one.
     CloseLive(String),
+    /// Ask the Claude Agent process of this session, if it has one, what its context holds.
+    AskContext(String),
     /// Read a session's messages.
     LoadSession(String),
     /// Write a session to disk.
@@ -788,6 +790,11 @@ impl App {
                     retire(live);
                 }
             }
+            Action::AskContext(session) => {
+                if let Some(live) = self.live.get(&session) {
+                    live.ask_context();
+                }
+            }
             Action::LoadSession(session) => {
                 if let Some(store) = self.sessions_dir.clone().map(SessionStore::at) {
                     self.spawn(move || WorkerEvent::SessionLoaded {
@@ -1183,10 +1190,12 @@ impl App {
         }
     }
 
-    /// How long the event loop may sleep: until the caret blinks next.
+    /// How long the event loop may sleep: until the caret blinks next, or a tooltip shows.
     pub fn control_flow(&self) -> ControlFlow {
         let blink = self.ui.focused.then(|| self.last_frame + Duration::from_secs_f32(self.ui.next_blink().max(0.01)));
-        match blink.into_iter().chain(self.gpu_retry).min() {
+        // A tooltip shows once the mouse has rested a moment, with nothing else moving.
+        let tip = self.ui.next_tip().map(|left| self.last_frame + Duration::from_secs_f32(left.max(0.01)));
+        match blink.into_iter().chain(tip).chain(self.gpu_retry).min() {
             Some(at) => ControlFlow::WaitUntil(at),
             None => ControlFlow::Wait,
         }
