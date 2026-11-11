@@ -27,6 +27,9 @@ arboard = { version = "3.7.0", default-features = false }
 png = "0.18.1"
 zune-jpeg = { version = "0.5.15", default-features = false, features = ["std", "x86", "neon"] }
 image-webp = "0.2.4"
+# why: skills come from GitHub as .tar.gz; inflating gzip by hand is not worth the risk on
+# downloaded input. Already built for `png`, so it adds nothing new to the tree.
+flate2 = "1.1.11"
 # why: microphone capture and speaker playback for voice calls; WASAPI, CoreAudio
 # and ALSA are three large unsafe FFI surfaces we cannot reasonably write by hand.
 cpal = "0.18.2"

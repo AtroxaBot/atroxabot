@@ -179,6 +179,7 @@ version = "0.1.0"
 dependencies = [
  "atroxabot-claude-agent",
  "atroxabot-mcp",
+ "flate2",
  "serde",
  "serde_json",
  "ureq",

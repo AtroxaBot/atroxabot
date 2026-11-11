@@ -171,6 +171,10 @@ pub(crate) fn build_args(options: &Options) -> Result<Vec<OsString>, Error> {
         args.push("--add-dir".into());
         args.push(dir.into());
     }
+    for dir in &options.plugin_dirs {
+        args.push("--plugin-dir".into());
+        args.push(dir.into());
+    }
     if let Some(config) = &options.mcp_config {
         add(&mut args, &["--mcp-config", config]);
     }
@@ -233,6 +237,7 @@ mod tests {
             fork_session: true,
             max_turns: Some(3),
             add_dirs: vec![PathBuf::from("extra")],
+            plugin_dirs: vec![PathBuf::from("library")],
             mcp_config: Some("{\"mcpServers\":{}}".into()),
             strict_mcp_config: true,
             setting_sources: Some(vec!["user".into(), "project".into()]),
@@ -266,6 +271,8 @@ mod tests {
             "--resume=abc-123",
             "--add-dir",
             "extra",
+            "--plugin-dir",
+            "library",
             "--mcp-config",
             "{\"mcpServers\":{}}",
             "--include-partial-messages",

@@ -61,6 +61,10 @@ cargo clippy --workspace --all-targets -- -D warnings
   it at once, with everything it did so far; Stop (or Esc) stops the turn and puts what waits back in the
   message box. A command (`/compact`) waits for the turn to end. On a Claude account this is Claude Code's
   own queue: the app hands a message over while a tool runs, and Claude Code says when it takes it in.
+  Claude Code also carries on by itself when something sent to the background (a subagent, a command)
+  ends after the turn did: a line in the conversation says what ended, and the agent shows it is working
+  from the moment Claude Code says it runs again ("Thinking…" while it reasons, since summarised reasoning
+  only arrives once it is done).
 - **A folder per session.** The folder chip at the right of the top bar says where the session works;
   click it for the folders used lately, or to choose another. A new session starts in the folder the
   agent's last one worked in.
@@ -81,13 +85,37 @@ cargo clippy --workspace --all-targets -- -D warnings
   its `/models`. The provider's default is the one in use until you pick another; any model id can be
   typed. The same menu sets the effort, which is always one of the model's own levels: Opus, Haiku and
   Fable start at medium, Sonnet at high, and picking another model starts at that model's level. A model
-  that takes no effort shows none.
+  that takes no effort shows none. Picking an effort closes the menu. The model and effort are the
+  session's: each session keeps its own, so switching sessions switches them too, and a new session starts
+  with the last ones picked. A session moved to another provider takes that provider's choice. A message
+  typed and not sent stays with its session (until the app quits), files attached included.
 - **Autonomy**, set in the agent's editor: *Ask first*, *Edit freely*, *Auto* (what a new agent starts
   with: Claude Code's auto mode, with a Claude account), *Full autonomy* or *Read only*. A call that needs approval waits on a card above
   the message box: Enter allows it, Esc denies it, *Always allow* stops asking for the session. The app's
   own data folder, which holds API keys, is off limits to every agent's file tools.
-- **MCP servers** (Settings, MCP servers): local commands or remote addresses whose tools every agent
-  gets. Claude accounts also keep the servers you set up in Claude Code itself.
+- **Integrations** (Settings, Integrations): MCP servers, local commands or remote addresses whose tools
+  every agent gets. Claude accounts also keep what each account has: the connectors added on claude.ai (Gmail, Drive,
+  Slack, …) and the servers set up in Claude Code itself. The same page lists those per account, as
+  Claude Code reports them (`mcp_status`, asked without sending a message, so nothing is used): which are
+  connected and with how many tools, which failed, and which are still to connect on claude.ai (a button
+  opens claude.ai's connector page). They are only shown: they belong to the account, and only its own
+  sessions get them.
+- **Skills** (Settings, Skills): folders of instructions (a `SKILL.md` and the files it needs) that every
+  agent has, on every Claude account and every API provider. An agent sees each skill's name and
+  description and reads the rest only when a task calls for it. Skills come from repositories: Anthropic's
+  `anthropics/skills` is on the list from the start, and *Add repository* takes `owner/repo` (with `#ref`
+  or `@ref`), a GitHub page (`…/tree/<branch>/<folder>` too), any Git address, or a folder on this computer,
+  the way Claude Code's `plugin marketplace add` takes them. A repository opens to what it offers: a
+  Claude Code plugin marketplace (`.claude-plugin/marketplace.json`) is read as Claude Code reads it, its
+  skills grouped by plugin, and a plugin it lists from another repository opens in turn; any other
+  repository is searched for `SKILL.md` files. GitHub repositories come as GitHub's own archive, so they
+  need no Git (a private one is fetched with your Git and its sign-in); other repositories need Git.
+  *Install* copies a skill into the library; when its repository has changed it since, the skill offers
+  *Update*. An agent on a Claude account gets the library as a plugin for the session (`--plugin-dir`), so
+  its skills are also listed as `library:<name>` there; an agent on an API gets a `skill` tool that lists
+  them and loads one, and may read a skill's files. A change reaches an agent's next session (an API
+  session keeps the skills it started with while the app runs, so its tool list stays the same). Skills you
+  installed in Claude Code itself, and a project's own `.claude/skills/`, still work on Claude accounts.
 - **Spotlight.** Ctrl/Cmd+K (or the magnifier over the agents) opens one field over everything:
   it finds sessions by title at once and by what was said in them a moment later, agents by name, and
   things to do (a new session, a new agent, the statistics, the settings, the side panel). Arrows move,
@@ -156,11 +184,16 @@ is written to keep them there:
   with its own sign-in, settings and history. The first account, "Claude", is the Claude Code setup you
   already have: whoever `claude` is signed in as in your terminal, with your skills, plugins and settings.
   An added account starts without those (install them in it by running `claude` with its
-  `CLAUDE_CONFIG_DIR`). If you would rather have every account explicit, take "Claude" off the list in
+  `CLAUDE_CONFIG_DIR`); the skills in Settings, Skills reach every account without that. If you would rather have every account explicit, take "Claude" off the list in
   Settings; it can be put back there. AtroxaBot only tells Claude Code which folder to use; what is in it
   is Claude Code's.
 - The account's email and plan shown in Settings, the model list, the commands and skills, and the plan's
   usage limits are what Claude Code itself reports.
+- **The skill library** reaches Claude Code through its documented `--plugin-dir` flag, which loads a
+  plugin for that session only: nothing is installed into, or read from, an account's folder.
+- Besides `CLAUDE_CONFIG_DIR`, AtroxaBot sets what the official Agent SDK sets so that Claude Code reports
+  when it runs a turn (`CLAUDE_CODE_SDK_READS_SESSION_STATE`). It does not set the variables that would say
+  it is Anthropic's SDK (`CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`).
 - An agent on a Claude account runs with **the agent's own system prompt**, not Claude Code's: who it is,
   your instructions, and a short section on how to work (act rather than describe, read before changing,
   check its work, be careful with what cannot be undone, ask with questions, delegate to subagents, use
@@ -189,7 +222,7 @@ against Claude Code 2.1.322.
 |---|---|
 | `crates/claude-agent` (`atroxabot-claude-agent`) | Rust port of the Claude Agent SDK's transport and control protocol. Only dependency: `serde_json`. |
 | `crates/mcp` (`atroxabot-mcp`) | A small MCP client (stdio and Streamable HTTP): lists a server's tools and calls them. |
-| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Messages and Chat Completions); the agent loop and its tools; the Claude Agent engine; usage statistics (`stats.rs`) and git through the `git` CLI (`git.rs`). No GUI. |
+| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Messages and Chat Completions); the agent loop and its tools; the Claude Agent engine; usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
 | `crates/voice` (`atroxabot-voice`) | Fish Audio and ElevenLabs speech-to-text and text-to-speech, voice-activity detection, the call loop, and audio devices (`cpal`). |
 | `crates/desktop` | The app (`atroxabot`): winit window, wgpu renderer, text engine, immediate-mode UI. |
 
@@ -201,8 +234,8 @@ those into the saved transcript, so the app shows a Claude session and an API se
 (drawing and widgets), `orb.rs` (the agents' faces), `logo.rs` (the app's own mark, three bodies in a line, and the platforms' marks, from the outlines in
 `assets/logos/`), `tray.rs` (what closing the window does, and the Windows tray icon, through Win32 directly),
 `shell/` (the screen: `sidebar.rs`, `thread.rs`, `composer.rs`, `queue.rs`, `question.rs`,
-`menu.rs`, `panel.rs`, `picture.rs`, `spotlight.rs`, `stats.rs`, `agent_form.rs`, `settings.rs`, `call.rs`,
-`widgets.rs`), `app.rs` (events, threads, engines).
+`menu.rs`, `panel.rs`, `picture.rs`, `spotlight.rs`, `stats.rs`, `agent_form.rs`, `settings.rs`, `skills.rs`,
+`call.rs`, `widgets.rs`), `app.rs` (events, threads, engines).
 
 The app redraws only when something changes. Model requests, tools, the Claude Agent's process, calls and
 file reads run on other threads and post results to the event loop; every file write goes through one
@@ -225,7 +258,11 @@ Everything lives in `~/.atroxabot/`:
 - `icons/`: your own pictures of providers (see *Provider marks*). The app only reads it.
 - `attachments/`: pictures you pasted into a message, one PNG each.
 - `agents/<id>.json`: one file per agent. `memory/<id>/notes.md`: its notes.
-- `sessions/<id>.json`: one file per session, with its folder; `.index.json` next to them holds titles.
+- `library/`: the installed skills (`skills/<name>/`), laid out as a Claude Code plugin
+  (`.claude-plugin/plugin.json`), and `library.json`: the repositories you look in and where each skill came
+  from. A skill folder you put in `skills/` yourself works too. `cache/repositories/`: the last download
+  of each repository looked at, read again on the next look.
+- `sessions/<id>.json`: one file per session, with its folder and the model and effort chosen in it; `.index.json` next to them holds titles.
 - `claude/<id>/`: the Claude Code configuration folder of each extra Claude account. Claude Code owns what
   is in it. Removing an account in Settings leaves the folder, and so its sign-in, where it is.
 - `desktop.log`, `desktop-crash.log`, `desktop.lock`.
@@ -252,8 +289,13 @@ saved for.
 - Files that are not pictures go to the agent by path: an API provider's agent asks before reading one
   outside its folder. A picture is read from where it is each time it is sent, so one that was moved or
   deleted later is only named. Pasting copied files works on Windows; elsewhere only a copied picture.
-- Questions, subagents, skills, the task list, `/compact` and the plan's limits are Claude Code's, so they
-  exist on Claude accounts only. A message sent while an agent works is read after the tool calls in
+- Skills: a marketplace's plugins that come from npm, an archive or a command are not offered (only
+  their GitHub and Git sources are), and only a plugin's skills are taken, not its commands, agents, hooks
+  or MCP servers. A repository's `.json` address alone cannot be read; add the repository it is in.
+  Repositories are not looked at by themselves: those your skills came from are read once when the Skills
+  page first opens, to find updates.
+- Questions, subagents, the task list, `/compact` and the plan's limits are Claude Code's, so they
+  exist on Claude accounts only (skills work on every provider). A message sent while an agent works is read after the tool calls in
   progress: one long call (a test run, a subagent) keeps it waiting until it is done, unless you use
   *Send now*, which stops that call. A Claude Code older than about 2.1.219 cannot drop a message it was
   handed when you press Stop: it answers it after all. A turn's file changes cannot be undone (rewound) yet. A subagent's

@@ -243,6 +243,9 @@ pub(super) struct Thread {
     doing: String,
     /// A picture of the conversation that was just clicked, for the shell to open whole.
     pub clicked_picture: Option<String>,
+    /// The model and effort the last message went with: a Claude account's
+    /// process keeps the ones it started with, so other ones need a new process.
+    pub sent_with: Option<(String, String)>,
 }
 
 impl Thread {
@@ -275,6 +278,7 @@ impl Thread {
             drawn: 0,
             doing: String::new(),
             clicked_picture: None,
+            sent_with: None,
         }
     }
 

@@ -4,6 +4,8 @@
 //! call waiting for approval sits on top of it, where the answer is one key
 //! away.
 
+use std::collections::HashMap;
+
 use arboard::Clipboard;
 use atroxabot_core::attach::media_type;
 use atroxabot_core::{Agent, Ask, ConnectionKind, Verdict};
@@ -57,6 +59,25 @@ pub(super) struct Composer {
     selecting: bool,
     /// Last frame's layout and origin, for moving the caret by lines.
     layout: Option<(TextLayout, (f32, f32))>,
+    /// Whose message is being written: a session's id, or [`next_of`] an
+    /// agent; empty until the shell first says.
+    owner: String,
+    /// What was written for the others and not sent, by owner.
+    drafts: HashMap<String, Draft>,
+}
+
+/// A message written for one session (or an agent's next one) and not
+/// sent, put aside while another is open.
+#[derive(Default)]
+struct Draft {
+    editor: Editor,
+    files: Vec<String>,
+}
+
+/// The owner of what is written for `agent`'s next session, before it has one.
+pub(super) fn next_of(agent: &str) -> String {
+    // Session ids are file-name safe, so they never hold a colon.
+    format!("new:{agent}")
 }
 
 impl Composer {
@@ -79,6 +100,36 @@ impl Composer {
     pub fn commit(&mut self, text: &str) {
         self.preedit = None;
         self.editor.insert(text);
+    }
+
+    /// Shows the message being written for `owner`, putting aside the one
+    /// shown until now (its text, caret and files) for when it is back.
+    pub fn show(&mut self, owner: &str) {
+        if self.owner == owner {
+            return;
+        }
+        let previous = std::mem::replace(&mut self.owner, owner.to_owned());
+        // Written before anyone owned it: it is the first owner's.
+        if previous.is_empty() {
+            return;
+        }
+        let draft = Draft { editor: std::mem::take(&mut self.editor), files: std::mem::take(&mut self.files) };
+        if !draft.editor.text().is_empty() || !draft.files.is_empty() {
+            self.drafts.insert(previous, draft);
+        }
+        let Draft { editor, files } = self.drafts.remove(owner).unwrap_or_default();
+        (self.editor, self.files) = (editor, files);
+        (self.preedit, self.layout, self.scroll, self.selecting) = (None, None, 0.0, false);
+        (self.slash, self.slash_off, self.mention, self.mention_off, self.listed_at) = (0, false, 0, false, None);
+    }
+
+    /// Drops what was written for `owner`, a session that is gone.
+    pub fn forget(&mut self, owner: &str) {
+        self.drafts.remove(owner);
+        if self.owner == owner {
+            self.editor.take();
+            self.files.clear();
+        }
     }
 
     /// Puts a message that was not sent back, before what is being written.
@@ -311,6 +362,7 @@ impl Shell {
 
     /// Files were picked to go with the message (none when the picker was cancelled).
     pub fn files_picked(&mut self, files: Vec<String>) {
+        self.show_draft();
         for file in files {
             if !self.composer.files.contains(&file) {
                 self.composer.files.push(file);
@@ -670,6 +722,34 @@ mod tests {
     use atroxabot_core::{Agent, Config};
 
     use super::*;
+
+    #[test]
+    fn each_session_keeps_what_was_written_for_it() {
+        let mut composer = Composer::default();
+        composer.editor.insert("typed before anything opened");
+        composer.show("a");
+        assert_eq!(composer.editor.text(), "typed before anything opened", "the first owner keeps it");
+        composer.files.push("notes.md".into());
+        composer.show("b");
+        assert!(composer.editor.text().is_empty() && composer.files.is_empty(), "another session starts empty");
+        composer.editor.insert("for b");
+        composer.show(&next_of("scout"));
+        assert!(composer.editor.text().is_empty());
+        composer.show("a");
+        assert_eq!(
+            (composer.editor.text(), composer.files.as_slice()),
+            ("typed before anything opened", &["notes.md".to_owned()][..])
+        );
+        composer.forget("b");
+        composer.show("b");
+        assert!(composer.editor.text().is_empty(), "a forgotten draft is gone");
+        // What was sent leaves nothing behind to come back.
+        composer.show("a");
+        composer.editor.take();
+        composer.files.clear();
+        composer.show("c");
+        assert!(!composer.drafts.contains_key("a"));
+    }
 
     #[test]
     fn an_at_word_is_found_at_the_caret() {

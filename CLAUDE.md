@@ -19,10 +19,12 @@ cargo fmt --all --check
 - **Anthropic's terms, for Claude accounts.** Run the user's installed Claude Code binary as published:
   never bundle, modify or wrap it, and never pass `--bare`. Never read, store, set, strip or forward its
   credentials (no credentials files, no `ANTHROPIC_API_KEY`, no OAuth tokens), and never add a Claude
-  sign-in to the app: signing in is `claude auth login`, started in a terminal the user sees. The one
-  thing the app sets is `CLAUDE_CONFIG_DIR`, to select an extra account's configuration folder, which is
-  how Anthropic documents using several accounts; the app never looks inside that folder. Do not set
-  `CLAUDE_CODE_ENTRYPOINT` or `CLAUDE_AGENT_SDK_VERSION`. The UI says "Claude", never "Claude Code" as a
+  sign-in to the app: signing in is `claude auth login`, started in a terminal the user sees. The app
+  sets `CLAUDE_CONFIG_DIR` to select an extra account's configuration folder, which is how Anthropic
+  documents using several accounts (the app never looks inside that folder), and, as the official Agent
+  SDK does, `CLAUDE_CODE_SDK_READS_SESSION_STATE`. Whatever else the official SDK does is fine to do when
+  it serves the app better than our own way; but do not set `CLAUDE_CODE_ENTRYPOINT` or
+  `CLAUDE_AGENT_SDK_VERSION`, which would say the app is Anthropic's SDK. The UI says "Claude", never "Claude Code" as a
   product name of ours (a plain statement that it runs the user's Claude Code is fine). The README's
   section on this is the reference; re-read Anthropic's pages linked there before changing how the binary
   is started.
@@ -41,7 +43,8 @@ cargo fmt --all --check
   appended to (this keeps the prompt cache and Claude's thinking blocks valid). Never edit or reorder
   earlier turns of a request; add a note to the newest user message instead (see `CALL_STARTED`).
 - **Secrets:** never log an API key. Config files are written atomically, `0600` on Unix. A key is only
-  sent to the address it was saved for. Agents' file tools never reach `~/.atroxabot` (`tools::risk`).
+  sent to the address it was saved for. Agents' file tools never reach `~/.atroxabot` (`tools::risk`),
+  except to read the installed skills (`library/skills/`).
 - **Safety:** links from replies only open `http(s)` and `mailto`. A tool call that changes something,
   runs a command or goes online is asked about unless the agent's autonomy allows it.
 - **Testing:** the owner tests the GUI. Don't drive the app with computer use; `cargo build`, `clippy`

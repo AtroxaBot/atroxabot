@@ -18,6 +18,7 @@ mod question;
 mod queue;
 mod settings;
 mod sidebar;
+mod skills;
 #[cfg(test)]
 mod snapshot;
 mod spotlight;
@@ -31,8 +32,8 @@ use std::time::Instant;
 use arboard::Clipboard;
 use atroxabot_core::stats::Ledger;
 use atroxabot_core::{
-    Agent, AgentEvent, CALL_ENDED, CALL_STARTED, ClaudeError, ClaudeInfo, Config, Connection, ConnectionKind, Error,
-    Limits, Model, SearchHit, Session, SessionSummary, Verdict, unix_now,
+    Agent, AgentEvent, CALL_ENDED, CALL_STARTED, ClaudeError, ClaudeInfo, ClaudeMcpServer, Config, Connection,
+    ConnectionKind, Error, Limits, Model, SearchHit, Session, SessionSummary, Verdict, unix_now,
 };
 use atroxabot_voice::CallEvent;
 use winit::event::KeyEvent;
@@ -46,6 +47,7 @@ use self::menu::{Menu, MenuState, folder_name};
 use self::panel::{DiffView, GitView};
 use self::question::QuestionForm;
 use self::settings::{Settings, Tab};
+use self::skills::SkillsView;
 use self::spotlight::{Spotlight, Target};
 use self::stats::StatsView;
 use self::thread::Thread;
@@ -87,6 +89,18 @@ enum Models {
     /// What the provider listed.
     Ready(Vec<Model>),
     /// Why they could not be listed.
+    Failed(String),
+}
+
+/// The MCP servers Claude Code gives a Claude account's sessions (its
+/// claude.ai connectors among them), as far as it was asked.
+#[derive(Debug, Clone)]
+pub(super) enum Connectors {
+    /// Being asked.
+    Loading,
+    /// The servers and how each is doing.
+    Ready(Vec<ClaudeMcpServer>),
+    /// Why Claude Code could not say.
     Failed(String),
 }
 
@@ -147,6 +161,11 @@ pub struct Shell {
     /// The session the mouse holds in the sidebar, and whether it has been
     /// moved far enough to be a drag and not a click.
     drag: Option<(String, bool)>,
+    /// The skill library, and the repositories looked in.
+    skills: SkillsView,
+    /// Each Claude account's MCP servers and connectors, by connection id,
+    /// once the MCP settings asked for them.
+    connectors: HashMap<String, Connectors>,
 }
 
 impl Shell {
@@ -185,17 +204,27 @@ impl Shell {
             was_on_call: false,
             pending_folder: String::new(),
             drag: None,
+            skills: SkillsView::default(),
+            connectors: HashMap::new(),
         }
     }
 
     /// Opens the selected agent's latest session and asks Claude Code about
     /// every Claude account; call once after `new`.
     pub fn start(&mut self, actions: &mut Vec<Action>) {
+        self.skills.start(atroxabot_core::skills::Job::Load, actions);
         for connection in self.config.all_connections() {
             self.probe(&connection, actions);
         }
         if let Some(agent) = self.agent.clone() {
             self.select_agent(&agent, actions);
+        }
+    }
+
+    /// What a skill library job came to.
+    pub fn skills_report(&mut self, report: atroxabot_core::skills::Report) {
+        if let Some(problem) = self.skills.report(report) {
+            self.notify(problem);
         }
     }
 
@@ -228,6 +257,16 @@ impl Shell {
         self.claude.insert(connection.to_owned(), account);
     }
 
+    /// Claude Code said (or could not say) which MCP servers a Claude account's sessions get.
+    pub fn connectors_loaded(&mut self, connection: &str, result: Result<Vec<ClaudeMcpServer>, ClaudeError>) {
+        let connectors = match result {
+            Ok(servers) => Connectors::Ready(servers),
+            Err(ClaudeError::NotFound) => Connectors::Failed("Claude Code is not installed.".to_owned()),
+            Err(e) => Connectors::Failed(e.to_string()),
+        };
+        self.connectors.insert(connection.to_owned(), connectors);
+    }
+
     /// The window has the user's attention again: an account they may just
     /// have signed in to (in the terminal the app opened) is asked about anew.
     pub fn focused(&mut self, actions: &mut Vec<Action>) {
@@ -237,6 +276,8 @@ impl Shell {
         if !matches!(self.modal, Some(Modal::Settings(_))) {
             return;
         }
+        // A connector may have been added on claude.ai meanwhile: the MCP settings ask again.
+        self.connectors.retain(|_, connectors| matches!(connectors, Connectors::Loading));
         for connection in self.config.all_connections() {
             let signed_in =
                 matches!(self.claude.get(&connection.id), Some(Account::Ready(info)) if !info.account.email.is_empty());
@@ -264,6 +305,38 @@ impl Shell {
 
     fn selected_agent(&self) -> Option<&Agent> {
         self.agent.as_deref().and_then(|id| self.agents.iter().find(|a| a.id == id))
+    }
+
+    /// The selected agent as the open session thinks with it: with the
+    /// model and effort chosen there, if any were.
+    fn agent_in_use(&self) -> Option<Agent> {
+        let mut agent = self.selected_agent()?.clone();
+        if let Some(thread) = self.thread().filter(|thread| thread.loaded) {
+            thread.session.apply_choice(&mut agent);
+        }
+        Some(agent)
+    }
+
+    /// Makes the model and effort of `agent` (as [`Shell::agent_in_use`]
+    /// gave it) the open session's, and the agent's own for the sessions it
+    /// starts next.
+    fn choose_thinking(&mut self, agent: Agent, actions: &mut Vec<Action>) {
+        if let Some(thread) = self.thread_mut().filter(|thread| thread.loaded) {
+            thread.session.keep_choice(&agent);
+            actions.push(Action::SaveSession(Box::new(thread.session.clone())));
+        }
+        self.update_agent(agent, actions);
+    }
+
+    /// Has the message box show what was written for the open session, or
+    /// for the selected agent's next one.
+    fn show_draft(&mut self) {
+        let owner = match (&self.current, &self.agent) {
+            (Some(session), _) => session.clone(),
+            (None, Some(agent)) => composer::next_of(agent),
+            (None, None) => return,
+        };
+        self.composer.show(&owner);
     }
 
     fn thread(&self) -> Option<&Thread> {
@@ -485,11 +558,13 @@ impl Shell {
             None => {
                 let Some(agent) = self.selected_agent().cloned() else { return };
                 let owner = agent.id.clone();
-                if self.ready(agent).is_none() {
+                if self.ready(agent.clone()).is_none() {
                     return;
                 }
                 let mut session = Session::new(&owner);
                 session.workdir.clone_from(&self.pending_folder);
+                // It keeps the model and effort it starts with.
+                session.keep_choice(&agent);
                 let id = session.id.clone();
                 self.sessions.insert(0, session.summary());
                 self.threads.insert(id.clone(), Thread::new(session));
@@ -584,9 +659,11 @@ impl Shell {
         let Some(thread) = self.threads.get(session) else { return false };
         // A session still loading has no agent named yet: it is the selected one's.
         let owner = Some(thread.session.agent.as_str()).filter(|agent| !agent.is_empty()).or(self.agent.as_deref());
-        let Some(agent) = self.agents.iter().find(|agent| Some(agent.id.as_str()) == owner).cloned() else {
+        let Some(mut agent) = self.agents.iter().find(|agent| Some(agent.id.as_str()) == owner).cloned() else {
             return false;
         };
+        thread.session.apply_choice(&mut agent);
+        let chosen = agent.clone();
         let Some((agent, connection)) = self.ready(agent) else { return false };
         if text.starts_with("/compact") && connection.kind != ConnectionKind::ClaudeAgent {
             self.notify(format!(
@@ -627,6 +704,17 @@ impl Shell {
             thread.session.remote.clear();
             thread.session.account.clone_from(&connection.id);
         }
+        // A session that chose nothing on this provider keeps what it answers with now.
+        if thread.loaded && thread.session.provider != chosen.connection {
+            thread.session.keep_choice(&chosen);
+        }
+        // A Claude account's process thinks with what it was started with: other choices need a new one.
+        let with = (agent.model.clone(), agent.effort.clone());
+        if connection.kind == ConnectionKind::ClaudeAgent && thread.sent_with.as_ref().is_some_and(|sent| *sent != with)
+        {
+            actions.push(Action::CloseLive(session.to_owned()));
+        }
+        thread.sent_with = Some(with);
         thread.session.prompt(text, &note);
         thread.session.attach(files);
         thread.begin_turn();
@@ -656,6 +744,9 @@ impl Shell {
             created: old.created,
             workdir: old.workdir.clone(),
             window: old.window,
+            provider: old.provider.clone(),
+            model: old.model.clone(),
+            effort: old.effort.clone(),
             ..Session::new(&old.agent)
         };
         *thread = Thread::new(fresh);
@@ -751,7 +842,8 @@ impl Shell {
             actions.push(Action::LogUsage(Box::new(record)));
         }
         // Claude Code started a turn by itself: a follow-up of its own queue, or a background task that ended.
-        if !thread.busy && matches!(event, AgentEvent::ReplyStarted | AgentEvent::FollowUp { .. }) {
+        if !thread.busy && matches!(event, AgentEvent::Working | AgentEvent::ReplyStarted | AgentEvent::FollowUp { .. })
+        {
             thread.begin_turn();
         }
         let (mut resend, mut give_back, mut send_waiting) = (None, false, None);
@@ -888,6 +980,7 @@ impl Shell {
         actions.push(Action::DeleteSession(session.to_owned()));
         self.threads.remove(session);
         self.sessions.retain(|s| s.id != session);
+        self.composer.forget(session);
         if self.current.as_deref() == Some(session) {
             self.current = None;
         }
@@ -994,7 +1087,7 @@ impl Shell {
     /// The session page: a header, the conversation and the composer.
     fn draw_chat(&mut self, p: &mut Painter, ui: &mut Ui, canvas: Rect, actions: &mut Vec<Action>) {
         let t = p.theme;
-        let Some(agent) = self.selected_agent().cloned() else {
+        let Some(agent) = self.agent_in_use() else {
             self.draw_first_run(p, ui, canvas);
             return;
         };
@@ -1007,7 +1100,9 @@ impl Shell {
             let wash = Rect::new(canvas.x, canvas.y, canvas.w, 260.0_f32.min(canvas.h));
             p.gradient(wash, fade(color, 0.07), fade(color, 0.0), theme::CANVAS_RADIUS);
         }
-        // The composer first: the conversation fills what it leaves.
+        // The composer first: the conversation fills what it leaves. A click
+        // in the sidebar this frame may have opened another session.
+        self.show_draft();
         let composer_top = self.draw_composer(p, ui, canvas, &agent, actions);
         let area = Rect::new(canvas.x, header.bottom(), canvas.w, composer_top - header.bottom());
         let clip = p.push_clip(area);
@@ -1237,6 +1332,7 @@ impl Shell {
         actions: &mut Vec<Action>,
     ) {
         let primary = if cfg!(target_os = "macos") { mods.super_key() } else { mods.control_key() };
+        self.show_draft();
         if self.menu.is_some() {
             self.menu_key(event, mods, clipboard, actions);
             return;
@@ -1375,6 +1471,7 @@ impl Shell {
 
     /// Text committed by an input method.
     pub fn ime_commit(&mut self, text: &str, actions: &mut Vec<Action>) {
+        self.show_draft();
         let answering = self.answering();
         match &mut self.modal {
             Some(Modal::Agent(form)) => form.commit(text),
@@ -1814,6 +1911,33 @@ mod tests {
     }
 
     #[test]
+    fn a_turn_claude_code_starts_by_itself_shows_as_working() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        shell.start(&mut actions);
+        signed_in(&mut shell);
+        shell.send("Start the build in the background", false, Vec::new(), &mut actions);
+        let session = shell.current.clone().unwrap();
+        shell.agent_event(&session, AgentEvent::Text("Started.".into()), &mut actions);
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        assert!(!shell.is_busy());
+        // The build ends; Claude Code says so, starts a turn of its own and thinks before it writes.
+        let note = "A background task finished: Build it";
+        shell.agent_event(&session, AgentEvent::Note(note.into()), &mut actions);
+        shell.agent_event(&session, AgentEvent::Working, &mut actions);
+        assert!(shell.is_busy(), "working from the moment Claude Code says so");
+        shell.agent_event(&session, AgentEvent::ReplyStarted, &mut actions);
+        shell.agent_event(&session, AgentEvent::Status("Thinking…".into()), &mut actions);
+        let thread = &shell.threads[&session];
+        assert!(thread.busy && thread.status == "Thinking…", "working, and saying what at");
+        let entries = &thread.session.entries;
+        assert!(matches!(&entries[entries.len() - 2], Entry::Note { text } if text == note), "why it went on");
+        assert!(matches!(entries.last(), Some(Entry::Reply(reply)) if reply.blocks.is_empty()));
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        assert!(!shell.is_busy());
+    }
+
+    #[test]
     fn another_claude_account_is_told_what_was_said() {
         let agent = Agent::new("Scout");
         let mut config = Config::default();
@@ -1854,6 +1978,68 @@ mod tests {
         let (text, remote, account) = taken_over.expect("the message is sent");
         assert!(text.contains("User: Hello") && text.contains("You: Hi there.") && text.ends_with("And now?"));
         assert_eq!((remote.as_str(), account.as_str()), ("", "work"));
+    }
+
+    #[test]
+    fn each_session_keeps_its_model_effort_and_draft() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        let mut info = ClaudeInfo::default();
+        info.account.email = "me@example.com".into();
+        let model = |value: &str, resolved: &str| atroxabot_core::ClaudeModel {
+            value: value.into(),
+            resolved: resolved.into(),
+            efforts: vec!["low".into(), "medium".into(), "high".into()],
+            ..atroxabot_core::ClaudeModel::default()
+        };
+        info.models = vec![model("default", "claude-sonnet-5-5"), model("haiku", "claude-haiku-5-5")];
+        shell.claude_info(Connection::CLAUDE_AGENT, Ok(info));
+        let sent = |actions: &[Action]| {
+            actions.iter().find_map(|a| match a {
+                Action::Send { agent, .. } => Some((agent.model.clone(), agent.effort.clone())),
+                _ => None,
+            })
+        };
+
+        // The first session answers with Haiku at low effort.
+        shell.send("One", false, Vec::new(), &mut actions);
+        let first = shell.current.clone().unwrap();
+        shell.agent_event(&first, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        shell.choose(Menu::Model, "haiku", &mut actions);
+        let mut agent = shell.agent_in_use().unwrap();
+        agent.effort = "low".into();
+        shell.choose_thinking(agent, &mut actions);
+        shell.show_draft();
+        shell.composer.editor.insert("half a thought");
+
+        // A second one is set back to the default model; the first keeps its own.
+        shell.new_session(&mut actions);
+        shell.show_draft();
+        assert!(shell.composer.editor.text().is_empty(), "a new session starts with an empty message box");
+        actions.clear();
+        shell.send("Two", false, Vec::new(), &mut actions);
+        assert_eq!(sent(&actions), Some(("haiku".into(), "low".into())), "a new session starts with the last choice");
+        let second = shell.current.clone().unwrap();
+        shell.agent_event(&second, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        shell.choose(Menu::Model, "default", &mut actions);
+        assert_eq!(shell.agent_in_use().unwrap().model, "");
+
+        shell.open_session(&first, &mut actions);
+        shell.show_draft();
+        let agent = shell.agent_in_use().unwrap();
+        assert_eq!((agent.model.as_str(), agent.effort.as_str()), ("haiku", "low"));
+        assert_eq!(shell.composer.editor.text(), "half a thought");
+        actions.clear();
+        shell.send("Three", false, Vec::new(), &mut actions);
+        assert_eq!(sent(&actions), Some(("haiku".into(), "low".into())));
+        shell.agent_event(&first, AgentEvent::TurnEnded { problem: None }, &mut actions);
+
+        shell.open_session(&second, &mut actions);
+        actions.clear();
+        shell.send("Four", false, Vec::new(), &mut actions);
+        assert_eq!(sent(&actions), Some((String::new(), "high".into())), "Sonnet, at its usual effort");
+        // Its process was started with Haiku: the new model needs a new one.
+        assert!(matches!(&actions[0], Action::CloseLive(id) if *id == second));
     }
 
     /// A shell whose agent (on a Claude account) is answering "Fix the bug": the session's id.

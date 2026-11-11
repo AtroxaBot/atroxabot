@@ -34,6 +34,8 @@ pub fn find_claude() -> Option<PathBuf> {
 
 /// How long Claude Code gets to say what it offers.
 const INFO_TIMEOUT: Duration = Duration::from_secs(40);
+/// How long it gets to connect an account's MCP servers and say how they are doing.
+const CONNECTORS_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// What Claude Code offers for the Claude account `connection`: its models
 /// (the default first), the account it is signed in to, and its version.
@@ -45,6 +47,18 @@ const INFO_TIMEOUT: Duration = Duration::from_secs(40);
 /// started, or did not answer.
 pub fn claude_info(connection: &Connection) -> Result<sdk::Info, sdk::Error> {
     sdk::info(&sdk::Options { env: account_env(connection), ..sdk::Options::default() }, INFO_TIMEOUT)
+}
+
+/// The MCP servers a session on the Claude account `connection` gets (the
+/// account's claude.ai connectors and those set up in Claude Code itself)
+/// and how each is doing. Starts the binary without sending it a message,
+/// so nothing is used; the connectors connect after the start, so this
+/// takes some seconds. Call it off the UI thread.
+///
+/// # Errors
+/// The binary is not installed, could not be started, or did not answer.
+pub fn claude_connectors(connection: &Connection) -> Result<Vec<sdk::McpServerStatus>, sdk::Error> {
+    sdk::mcp_servers(&sdk::Options { env: account_env(connection), ..sdk::Options::default() }, CONNECTORS_TIMEOUT)
 }
 
 /// A command to run in a terminal the user sees.
@@ -251,6 +265,8 @@ fn options(agent: &Agent, connection: &Connection, session: &Session) -> sdk::Op
         permission_mode: Some(permission_mode),
         resume,
         add_dirs: agent.memory_dir().into_iter().collect(),
+        // The skills every agent has, for this session only: nothing is put in the account's folder.
+        plugin_dirs: crate::skills::Library::open().ok().and_then(|library| library.plugin_dir()).into_iter().collect(),
         include_partial_messages: true,
         ask_permissions,
         // Claude Code gives a session an app starts its task list tools only when they are named here.
@@ -340,6 +356,12 @@ struct Mapper {
     /// The follow-ups sent and not taken in yet, by the id they were sent
     /// under; shared with [`ClaudeAgent::follow_up`].
     follow_ups: Arc<Mutex<HashMap<String, FollowUp>>>,
+    /// "Thinking…" is the status, until the reasoning or an answer arrives:
+    /// summarised reasoning comes whole, once it is done.
+    thinking: bool,
+    /// What each task (a subagent, a command sent to the background) was
+    /// started for, by the call that started it.
+    tasks: HashMap<String, String>,
 }
 
 impl Mapper {
@@ -352,8 +374,32 @@ impl Mapper {
 
     fn map(&mut self, event: sdk::Event) -> Vec<AgentEvent> {
         let mut out = Vec::new();
+        // What the model writes ends its "Thinking…".
+        if self.thinking
+            && matches!(
+                &event,
+                sdk::Event::TextDelta { parent_tool_use_id: None, .. }
+                    | sdk::Event::ThinkingDelta { parent_tool_use_id: None, .. }
+                    | sdk::Event::Assistant { parent_tool_use_id: None, .. }
+                    | sdk::Event::Result(_)
+            )
+        {
+            self.thinking = false;
+            out.push(AgentEvent::Status(String::new()));
+        }
         match event {
             sdk::Event::Init(init) => out.push(AgentEvent::Remote(init.session_id)),
+            // Claude Code says it runs a turn, at its very start, its own turns included.
+            sdk::Event::SessionState(state) if state == "running" => out.push(AgentEvent::Working),
+            // The model starts answering: the earliest sign of a turn, and the only one of a turn Claude Code
+            // starts by itself (when a task sent to the background ends) until it writes something.
+            sdk::Event::MessageStart { parent_tool_use_id: None } => self.begin(&mut out),
+            // Summarised reasoning arrives whole once it is done: until then, say it is under way.
+            sdk::Event::ThinkingStarted { parent_tool_use_id: None } => {
+                self.begin(&mut out);
+                self.thinking = true;
+                out.push(AgentEvent::Status("Thinking…".to_owned()));
+            }
             sdk::Event::TextDelta { text, parent_tool_use_id: None } => {
                 self.begin(&mut out);
                 self.streamed = true;
@@ -418,6 +464,12 @@ impl Mapper {
                 let kind = task.task_type.as_str();
                 if kind.contains("agent") || kind.contains("teammate") {
                     self.agents.insert(task.tool_use_id.clone());
+                }
+                if task.state == sdk::TaskState::Started && !task.description.is_empty() {
+                    self.tasks.insert(task.tool_use_id.clone(), task.description.clone());
+                }
+                if let Some(note) = self.woken_by(&task) {
+                    out.push(AgentEvent::Note(note));
                 }
                 if self.agents.contains(&task.tool_use_id) {
                     out.push(AgentEvent::Activity { text: activity(&task), id: task.tool_use_id });
@@ -557,6 +609,27 @@ impl Mapper {
         out
     }
 
+    /// The line that says why the agent goes on by itself: a task sent to
+    /// the background ended while no turn ran, and Claude Code answers it in
+    /// a turn of its own. `None` for anything else.
+    fn woken_by(&mut self, task: &sdk::Task) -> Option<String> {
+        let how = match task.state {
+            sdk::TaskState::Completed => "finished",
+            sdk::TaskState::Failed => "failed",
+            sdk::TaskState::Stopped => "was stopped",
+            sdk::TaskState::Started | sdk::TaskState::Running => return None,
+        };
+        let what = self.tasks.remove(&task.tool_use_id);
+        if self.replying {
+            return None;
+        }
+        let kind = if self.agents.contains(&task.tool_use_id) { "A subagent" } else { "A background task" };
+        Some(match what {
+            Some(what) => format!("{kind} {how}: {what}"),
+            None => format!("{kind} {how}"),
+        })
+    }
+
     /// Starts the turn's reply if nothing did yet. The whole turn is one
     /// reply: the binary keeps the context, so nothing is replayed from it.
     fn begin(&mut self, out: &mut Vec<AgentEvent>) {
@@ -610,6 +683,68 @@ mod tests {
         // A call of another name is a subagent when its task says so.
         assert_eq!(news(mapper.map(task("r1", "remote_agent", sdk::TaskState::Started))), ["r1"]);
         assert_eq!(news(mapper.map(task("r1", "", sdk::TaskState::Completed))), ["r1"]);
+    }
+
+    /// Asks the installed Claude Code about its own account's MCP servers: it is only started, so nothing is used.
+    #[test]
+    #[ignore = "starts the installed Claude Code"]
+    fn lists_an_accounts_mcp_servers() {
+        let servers = claude_connectors(&Connection::claude_agent()).unwrap();
+        for server in &servers {
+            println!(
+                "{} · {} · {} · {} tools {}",
+                server.name, server.status, server.source, server.tools, server.error
+            );
+        }
+        assert!(!servers.is_empty() && servers.iter().all(|server| server.status != "pending"));
+    }
+
+    #[test]
+    fn a_turn_claude_code_starts_by_itself_shows_at_once() {
+        // As Claude Code 2.1.322 does it: a command sent to the background ends after the turn did; a new turn
+        // starts, the model thinks a while, and its summarised reasoning arrives whole.
+        let mut mapper = Mapper::default();
+        let task = |state: sdk::TaskState, description: &str| {
+            sdk::Event::Task(sdk::Task {
+                tool_use_id: "b1".into(),
+                task_type: "local_bash".into(),
+                state,
+                description: description.into(),
+                ..sdk::Task::default()
+            })
+        };
+        let started = mapper.map(sdk::Event::Assistant {
+            blocks: vec![sdk::Block::ToolUse { id: "b1".into(), name: "Bash".into(), input: json!({}) }],
+            model: "m".into(),
+            parent_tool_use_id: None,
+            usage: sdk::Usage::default(),
+            error: None,
+        });
+        assert_eq!(started[0], AgentEvent::ReplyStarted);
+        assert!(mapper.map(task(sdk::TaskState::Started, "Wait for the build")).is_empty());
+        mapper.map(result(false, None, 0.0));
+        // Between turns, its end says why the agent goes on.
+        assert_eq!(
+            mapper.map(task(sdk::TaskState::Completed, "")),
+            [AgentEvent::Note("A background task finished: Wait for the build".into())]
+        );
+        // Claude Code says it runs again before the model answers (an older one does not: the answer starts it).
+        assert_eq!(mapper.map(sdk::Event::SessionState("running".into())), [AgentEvent::Working]);
+        assert_eq!(mapper.map(sdk::Event::MessageStart { parent_tool_use_id: None }), [AgentEvent::ReplyStarted]);
+        assert_eq!(
+            mapper.map(sdk::Event::ThinkingStarted { parent_tool_use_id: None }),
+            [AgentEvent::Status("Thinking…".into())]
+        );
+        let thought =
+            mapper.map(sdk::Event::ThinkingDelta { text: "The build passed.".into(), parent_tool_use_id: None });
+        assert_eq!(thought, [AgentEvent::Status(String::new()), AgentEvent::Thinking("The build passed.".into())]);
+        // A subagent's message is not the agent's turn.
+        mapper.map(result(false, None, 0.0));
+        assert!(mapper.map(sdk::Event::MessageStart { parent_tool_use_id: Some("a1".into()) }).is_empty());
+        // A task that ends during a turn is part of it: no line.
+        mapper.map(sdk::Event::MessageStart { parent_tool_use_id: None });
+        mapper.map(task(sdk::TaskState::Started, "Run the tests"));
+        assert!(mapper.map(task(sdk::TaskState::Failed, "")).is_empty());
     }
 
     #[test]

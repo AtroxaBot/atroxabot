@@ -1,6 +1,7 @@
 //! The tools an agent has when it thinks through an API (the Claude Agent
 //! brings its own): reading, writing and editing files, listing and
-//! searching folders, running commands and fetching pages.
+//! searching folders, running commands and fetching pages; and, when the
+//! library has skills, loading one ([`crate::skills::TOOL`]).
 //!
 //! Each call is a typed action, so the app can judge it before it runs
 //! ([`risk`]) and show what it did. Outputs are bounded: a long file is read
@@ -12,12 +13,14 @@ use std::fs;
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
 use crate::config::Config;
+use crate::skills::{self, Skill};
 
 /// Most lines one `read` returns.
 const READ_LINES: usize = 1_500;
@@ -45,6 +48,10 @@ pub struct Workspace {
     pub dir: PathBuf,
     /// The agent's notes folder, which it may always read and write.
     pub memory: Option<PathBuf>,
+    /// The folder of the installed skills, which it may read.
+    pub library: Option<PathBuf>,
+    /// The skills it has, as they were when its session began.
+    pub skills: Arc<Vec<Skill>>,
 }
 
 impl Workspace {
@@ -53,7 +60,14 @@ impl Workspace {
     #[must_use]
     pub fn new(dir: &Path, memory: Option<&Path>) -> Self {
         let real = |path: &Path| resolve(&path.to_string_lossy(), &Self::default());
-        Self { dir: real(dir), memory: memory.map(real) }
+        Self { dir: real(dir), memory: memory.map(real), library: None, skills: Arc::default() }
+    }
+
+    /// The same workspace with the installed `skills`, whose folders are in `library`.
+    #[must_use]
+    pub fn with_skills(self, library: &Path, skills: Arc<Vec<Skill>>) -> Self {
+        let library = Some(resolve(&library.to_string_lossy(), &Self::default()));
+        Self { library, skills, ..self }
     }
 }
 
@@ -145,9 +159,13 @@ pub fn risk(name: &str, input: &Value, workspace: &Workspace) -> Risk {
     let path = input.get("path").and_then(Value::as_str);
     let path = path.map_or_else(|| workspace.dir.clone(), |path| resolve(path, workspace));
     let notes = workspace.memory.as_deref().is_some_and(|memory| path.starts_with(memory));
+    let library = workspace.library.as_deref().is_some_and(|library| path.starts_with(library));
     let private = !notes && Config::dir().is_ok_and(|dir| path.starts_with(dir));
     let inside = notes || path.starts_with(&workspace.dir);
     match name {
+        skills::TOOL => Risk::Safe,
+        // A skill's files are read, never changed, by an agent.
+        "read" | "list" | "search" if library => Risk::Safe,
         "read" | "list" | "search" | "write" | "edit" if private => Risk::Forbidden,
         "read" | "list" | "search" if inside => Risk::Safe,
         "write" | "edit" if notes => Risk::Safe,
@@ -188,6 +206,7 @@ pub fn run(name: &str, input: &Value, workspace: &Workspace, cancel: &AtomicBool
         "search" => search(&path("path"), need("text")?, text("match")),
         "shell" => shell(need("command")?, input.get("timeout").and_then(Value::as_u64), &workspace.dir, cancel),
         "fetch" => fetch(need("url")?),
+        skills::TOOL => skills::load(&workspace.skills, input),
         other => Err(format!("there is no tool named `{other}`")),
     }
 }
@@ -605,7 +624,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(dir.join("src")).unwrap();
         let dir = strip_verbatim(fs::canonicalize(dir).unwrap());
-        Workspace { memory: Some(dir.join("notes")), dir }
+        Workspace { memory: Some(dir.join("notes")), dir, ..Workspace::default() }
     }
 
     fn call(name: &str, input: &Value, workspace: &Workspace) -> Result<String, String> {
@@ -654,6 +673,15 @@ mod tests {
         if let Ok(private) = Config::dir() {
             let config = private.join("config.json");
             assert_eq!(risk("read", &json!({ "path": config.to_str().unwrap() }), &ws), Risk::Forbidden);
+            // The skill library is read, never written; the rest stays off limits.
+            let ws = ws.clone().with_skills(&private.join("library").join("skills"), Arc::default());
+            let script = private.join("library").join("skills").join("pdf").join("fill.py");
+            assert_eq!(risk("read", &json!({ "path": script.to_str().unwrap() }), &ws), Risk::Safe);
+            assert_eq!(risk("write", &json!({ "path": script.to_str().unwrap() }), &ws), Risk::Forbidden);
+            assert_eq!(risk("read", &json!({ "path": config.to_str().unwrap() }), &ws), Risk::Forbidden);
+            let record = private.join("library").join("library.json");
+            assert_eq!(risk("read", &json!({ "path": record.to_str().unwrap() }), &ws), Risk::Forbidden);
+            assert_eq!(risk(skills::TOOL, &json!({ "name": "pdf" }), &ws), Risk::Safe);
         }
         fs::remove_dir_all(&ws.dir).unwrap();
     }

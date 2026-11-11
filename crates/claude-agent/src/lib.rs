@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 pub use cli::{cli_version, find_cli};
 pub use serde_json::Value;
-pub use session::{Decision, Session, info};
+pub use session::{Decision, Session, info, mcp_servers};
 
 /// How to launch the Claude Code binary. `Options::default()` is a plain session in the current directory.
 #[derive(Debug, Clone, Default)]
@@ -48,6 +48,8 @@ pub struct Options {
     pub max_turns: Option<u32>,
     /// Extra directories tools may access (`--add-dir`).
     pub add_dirs: Vec<PathBuf>,
+    /// Plugins to load for this session only, each a folder (`--plugin-dir`).
+    pub plugin_dirs: Vec<PathBuf>,
     /// MCP servers as JSON text or a path to a JSON file (`--mcp-config`).
     pub mcp_config: Option<String>,
     /// Use only the servers from [`Options::mcp_config`] (`--strict-mcp-config`).
@@ -271,6 +273,20 @@ pub enum Event {
         /// Set when the thinking comes from a subagent: the id of the tool call that started it.
         parent_tool_use_id: Option<String>,
     },
+    /// The model began a message (`message_start`; needs [`Options::include_partial_messages`]). The earliest
+    /// sign of a reply, also of a turn the binary starts by itself (when a task sent to the background ends).
+    MessageStart {
+        /// Set inside a subagent: the id of the tool call that started it.
+        parent_tool_use_id: Option<String>,
+    },
+    /// The model began thinking (a thinking block's `content_block_start`). Summarised thinking arrives only once
+    /// the block is complete, so until then this is all there is to show.
+    ThinkingStarted {
+        /// Set inside a subagent: the id of the tool call that started it.
+        parent_tool_use_id: Option<String>,
+    },
+    /// The answer to [`Session::mcp_status`]: the session's MCP servers and how each is doing.
+    McpStatus(Vec<McpServerStatus>),
     /// A complete piece of an assistant message. The binary sends one of these per content block, each repeating
     /// the message's `usage`, so add up [`TurnResult::usage`] rather than these.
     Assistant {
@@ -323,6 +339,10 @@ pub enum Event {
     Task(Task),
     /// `system`/`status`: what the binary is busy with besides the model (`compacting`), `None` once it is done.
     Status(Option<String>),
+    /// `system`/`session_state_changed`: the binary is `running` a turn (one it started by itself too, when a
+    /// task sent to the background ended), is `idle`, or waits on the caller (`requires_action`). Sent because
+    /// [`Session::connect`] asks for it, as the official SDK does.
+    SessionState(String),
     /// `system`/`compact_boundary`: the conversation was summarised to make room.
     Compacted {
         /// Whether the user asked for it (`/compact`) rather than the context filling up.
@@ -354,6 +374,22 @@ pub enum Event {
         /// Set for a non-zero exit or a broken pipe.
         error: Option<String>,
     },
+}
+
+/// An MCP server of a session and how it is doing, from [`Session::mcp_status`]. A Claude account's claude.ai
+/// connectors are among them (`source` `claudeai`, names starting `claude.ai `).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpServerStatus {
+    /// Its name.
+    pub name: String,
+    /// `connected`, `pending`, `needs-auth`, `failed` or `disabled`.
+    pub status: String,
+    /// Where it is configured: `claudeai`, `user`, `project`, `local`, `dynamic` (`--mcp-config`) and others.
+    pub source: String,
+    /// Why it failed, when it did.
+    pub error: String,
+    /// How many tools it offers.
+    pub tools: usize,
 }
 
 /// The session's settings, from `system`/`init`.

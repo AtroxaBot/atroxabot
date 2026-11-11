@@ -120,6 +120,7 @@ impl Shell {
         if self.current.as_deref() != Some(session) {
             return;
         }
+        self.show_draft();
         let Some(thread) = self.threads.get_mut(session) else { return };
         let waiting = std::mem::take(&mut thread.follow_ups);
         for waiting in waiting.into_iter().rev() {

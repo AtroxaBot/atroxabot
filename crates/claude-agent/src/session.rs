@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 
 use crate::cli::{build_args, command};
 use crate::parse::{Parsed, parse_line};
-use crate::{Error, Event, Info, Options, PermissionMode, find_cli};
+use crate::{Error, Event, Info, McpServerStatus, Options, PermissionMode, find_cli};
 
 /// Longest line accepted from the binary; a longer one is dropped and reported.
 const MAX_LINE: usize = 8 * 1024 * 1024;
@@ -64,6 +64,9 @@ struct Shared {
     ask_permissions: bool,
 }
 
+/// The variable the official SDK sets so that the binary reports its session state.
+const READS_SESSION_STATE: &str = "CLAUDE_CODE_SDK_READS_SESSION_STATE";
+
 /// Locks `mutex`; a panic in the caller's callback must not take the session down with it.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -90,7 +93,13 @@ impl Session {
         command.args(build_args(options)?).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
         // The environment is inherited as is. Only CLAUDECODE goes, as in the SDK, so that a launch from inside
         // a Claude Code session is not taken for a nested one.
-        command.env_remove("CLAUDECODE").envs(options.env.iter().map(|(key, value)| (key, value)));
+        command.env_remove("CLAUDECODE");
+        // As the official SDK does (unless the caller says otherwise): the binary then says when it runs a turn,
+        // one it starts by itself included, and when it is idle ([`Event::SessionState`]).
+        if !options.env.iter().any(|(key, _)| key.eq_ignore_ascii_case(READS_SESSION_STATE)) {
+            command.env(READS_SESSION_STATE, "1");
+        }
+        command.envs(options.env.iter().map(|(key, value)| (key, value)));
         if let Some(cwd) = &options.cwd {
             if !cwd.is_dir() {
                 return Err(Error::InvalidOption(format!("working directory does not exist: {}", cwd.display())));
@@ -188,6 +197,16 @@ impl Session {
         self.request(&json!({"subtype": "set_permission_mode", "mode": mode.as_str()}))
     }
 
+    /// Asks how the session's MCP servers are doing; the answer arrives as an [`Event::McpStatus`]. Servers
+    /// (a Claude account's claude.ai connectors among them) connect in the background after the start, so an
+    /// early answer may list none or some still `pending`.
+    ///
+    /// # Errors
+    /// [`Error::Closed`] after the session closed, [`Error::Io`] when the write fails.
+    pub fn mcp_status(&self) -> Result<(), Error> {
+        self.request(&json!({"subtype": "mcp_status"}))
+    }
+
     /// Changes the model for the following turns; `None` returns to the default model.
     ///
     /// # Errors
@@ -268,6 +287,60 @@ pub fn info(options: &Options, timeout: Duration) -> Result<Info, Error> {
         Ok(Ok(info)) => Ok(info),
         Ok(Err(why)) => Err(Error::NoInfo(why)),
         Err(_) => Err(Error::NoInfo("it did not answer in time".to_owned())),
+    }
+}
+
+/// Asks the binary which MCP servers a session of it gets (a Claude account's claude.ai connectors among them)
+/// and how each is doing, without sending it a message, so nothing is used. Asks every second until the list
+/// stops changing and nothing is `pending`, or until `timeout`, then stops it.
+///
+/// # Errors
+/// The binary could not be started, ended first, or never answered.
+pub fn mcp_servers(options: &Options, timeout: Duration) -> Result<Vec<McpServerStatus>, Error> {
+    /// How long one answer may take.
+    const ANSWER: Duration = Duration::from_secs(3);
+    let (answers, inbox) = mpsc::channel();
+    let session = Session::connect(options, move |event| {
+        let answer = match event {
+            Event::Ready(_) => Ok(None),
+            Event::McpStatus(servers) => Ok(Some(servers)),
+            Event::Closed { error, .. } => Err(error.unwrap_or_else(|| "it stopped before answering".to_owned())),
+            _ => return,
+        };
+        let _ = answers.send(answer);
+    })?;
+    let deadline = Instant::now() + timeout;
+    let mut latest: Option<Vec<McpServerStatus>> = None;
+    let outcome = loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match inbox.recv_timeout(left.min(ANSWER)) {
+            Ok(Ok(Some(servers))) => {
+                let settled = !servers.is_empty()
+                    && servers.iter().all(|server| server.status != "pending")
+                    && latest.as_ref() == Some(&servers);
+                latest = Some(servers);
+                if settled {
+                    break Ok(());
+                }
+                thread::sleep(Duration::from_secs(1).min(deadline.saturating_duration_since(Instant::now())));
+            }
+            Ok(Err(why)) => break Err(why),
+            Err(_) if left.is_zero() => break Ok(()),
+            // Ready (ask now), or no answer yet (ask again).
+            Ok(Ok(None)) | Err(_) => {}
+        }
+        if Instant::now() >= deadline {
+            break Ok(());
+        }
+        if let Err(e) = session.mcp_status() {
+            break Err(e.to_string());
+        }
+    };
+    session.close();
+    match (outcome, latest) {
+        (Ok(()), Some(servers)) => Ok(servers),
+        (Ok(()), None) => Err(Error::NoInfo("it did not answer in time".to_owned())),
+        (Err(why), _) => Err(Error::NoInfo(why)),
     }
 }
 

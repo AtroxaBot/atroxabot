@@ -8,6 +8,8 @@
 //!   loop over Anthropic's Messages API or any OpenAI-compatible gateway
 //!   with the tools in [`tools`]. Both report a turn as [`AgentEvent`]s.
 //!
+//! * [`skills`]: the skills every agent has, and the repositories they come from.
+//!
 //! All network calls and tools are blocking; run them off the UI thread.
 
 mod agent;
@@ -23,15 +25,17 @@ mod mcp;
 mod messages;
 mod responses;
 mod session;
+pub mod skills;
 mod sse;
 pub mod stats;
 pub mod tools;
 
 pub use agent::{Agent, AgentVoice, Autonomy, CALL_ENDED, CALL_STARTED, FOLLOW_UP, INTERRUPTING, Records};
 pub use atroxabot_claude_agent::{
-    Error as ClaudeError, Info as ClaudeInfo, ModelInfo as ClaudeModel, SlashCommand as ClaudeCommand,
+    Error as ClaudeError, Info as ClaudeInfo, McpServerStatus as ClaudeMcpServer, ModelInfo as ClaudeModel,
+    SlashCommand as ClaudeCommand,
 };
-pub use claude::{ClaudeAgent, TerminalCommand, claude_info, claude_login, find_claude};
+pub use claude::{ClaudeAgent, TerminalCommand, claude_connectors, claude_info, claude_login, find_claude};
 pub use client::{Client, Model};
 pub use config::{Config, Connection, ConnectionKind, McpServer, VoiceSettings, lock_instance};
 pub use engine::{AgentEvent, ApiEngine, Ask, Control, FollowUp, Inbox, LimitWindow, Limits, Verdict};

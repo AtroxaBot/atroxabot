@@ -1,6 +1,7 @@
 //! The settings, a modal with a section per page: how the app looks, the
 //! providers agents think through (Claude accounts and API providers), the
-//! voice providers, and the MCP servers.
+//! voice providers, the integrations (MCP servers, and what Claude
+//! accounts bring of their own), and the skills (`skills.rs`).
 //!
 //! Adding something is always the same three steps: a button, a choice of
 //! what to add, then only the fields that choice needs.
@@ -8,14 +9,15 @@
 #![expect(clippy::many_single_char_names, reason = "p, t, x, y and w are the drawing code's names everywhere")]
 
 use arboard::Clipboard;
-use atroxabot_core::{Connection, ConnectionKind, McpServer, new_id};
+use atroxabot_core::{ClaudeMcpServer, Connection, ConnectionKind, McpServer, new_id};
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::CursorIcon;
 
 use super::menu::Menu;
+use super::skills::SkillsPage;
 use super::widgets::{Scroll, chip, dropdown, line_field, logo_badge, modal, row, tile, toggle};
-use super::{Account, Shell};
+use super::{Account, Connectors, Shell};
 use crate::app::Action;
 use crate::editor::Editor;
 use crate::form::Fields;
@@ -44,19 +46,22 @@ pub(super) enum Tab {
     Providers,
     /// Voice providers for calls.
     Voice,
-    /// MCP servers.
-    Mcp,
+    /// Integrations: MCP servers, and each Claude account's own.
+    Integrations,
+    /// The skills every agent has.
+    Skills,
 }
 
 impl Tab {
-    const ALL: [Self; 4] = [Self::General, Self::Providers, Self::Voice, Self::Mcp];
+    const ALL: [Self; 5] = [Self::General, Self::Providers, Self::Voice, Self::Integrations, Self::Skills];
 
     fn label(self) -> (&'static str, char) {
         match self {
             Self::General => ("General", icon::SETTINGS),
             Self::Providers => ("Providers", icon::PLUG),
             Self::Voice => ("Voice", icon::AUDIO),
-            Self::Mcp => ("MCP servers", icon::SERVER),
+            Self::Integrations => ("Integrations", icon::LINK),
+            Self::Skills => ("Skills", icon::SPARKLES),
         }
     }
 }
@@ -108,6 +113,8 @@ pub(super) struct Settings {
     /// Enter was pressed while renaming: the name is kept on the next frame.
     renamed: bool,
     scroll: Scroll,
+    /// The skills page's own state.
+    skills: SkillsPage,
 }
 
 impl Settings {
@@ -123,6 +130,7 @@ impl Settings {
             renaming: None,
             renamed: false,
             scroll: Scroll::default(),
+            skills: SkillsPage::new(),
         }
     }
 
@@ -138,13 +146,19 @@ impl Settings {
         }
     }
 
+    /// Opens a repository on the skills page, as a click on it would.
+    #[cfg(test)]
+    pub(super) fn open_skills(&mut self, source: atroxabot_core::skills::Source) {
+        self.skills.show(source);
+    }
+
     /// The fields on screen now, in order: Tab moves among these.
     fn visible(&self) -> Vec<usize> {
         match (self.tab, self.adding) {
             (Tab::Providers, Adding::ClaudeAccount) => vec![NAME],
             (Tab::Providers, Adding::Provider(CUSTOM)) => vec![NAME, URL, KEY],
             (Tab::Providers, Adding::Provider(_)) | (Tab::Voice, Adding::Voice(_)) => vec![KEY],
-            (Tab::Mcp, Adding::Mcp(_)) => vec![NAME, URL, VARS],
+            (Tab::Integrations, Adding::Mcp(_)) => vec![NAME, URL, VARS],
             _ => Vec::new(),
         }
     }
@@ -162,6 +176,9 @@ impl Settings {
                 }
             }
             return false;
+        }
+        if self.tab == Tab::Skills {
+            return self.skills.key(event, mods, clipboard);
         }
         let visible = self.visible();
         match &event.logical_key {
@@ -187,6 +204,8 @@ impl Settings {
     pub fn commit(&mut self, text: &str) {
         if let Some((_, editor)) = &mut self.renaming {
             editor.insert(text);
+        } else if self.tab == Tab::Skills {
+            self.skills.commit(text);
         } else if self.visible().contains(&self.fields.focused()) {
             self.fields.insert(text);
         }
@@ -194,6 +213,9 @@ impl Settings {
 
     /// Where the caret is, for the input method's window.
     pub fn caret(&self) -> Option<Rect> {
+        if self.tab == Tab::Skills {
+            return self.skills.caret();
+        }
         self.fields.caret()
     }
 
@@ -285,6 +307,7 @@ impl Settings {
                 if ui.clicked(item) && !selected {
                     self.tab = tab;
                     self.add(Adding::Nothing);
+                    self.skills = SkillsPage::new();
                     self.scroll.reset();
                 }
             }
@@ -302,7 +325,8 @@ impl Settings {
             Tab::General => Self::general(p, ui, (x, top, w), shell, scheme, actions),
             Tab::Providers => self.providers(p, ui, (x, top, w), shell, actions),
             Tab::Voice => self.voice(p, ui, (x, top, w), shell, actions),
-            Tab::Mcp => self.mcp(p, ui, (x, top, w), shell, actions),
+            Tab::Integrations => self.integrations(p, ui, (x, top, w), shell, actions),
+            Tab::Skills => self.skills.draw(p, ui, (x, top, w), (area.y, area.bottom()), shell, actions),
         };
         p.set_clip(clip);
         let content = end + offset - area.y + 24.0;
@@ -841,7 +865,7 @@ impl Settings {
         y
     }
 
-    fn mcp(
+    fn integrations(
         &mut self,
         p: &mut Painter,
         ui: &mut Ui,
@@ -850,11 +874,12 @@ impl Settings {
         actions: &mut Vec<Action>,
     ) -> f32 {
         let t = p.theme;
-        let about = "MCP servers give every agent more tools: your files, your tracker, your database.";
-        let mut y = Self::title(p, (x, y, w), "MCP servers", about);
+        let about = "What agents can reach besides their folder: your files, your tracker, your mail. Each comes \
+                     from an MCP server.";
+        let mut y = Self::title(p, (x, y, w), "Integrations", about);
         let mut changed = false;
         let adding = matches!(self.adding, Adding::Mcp(_));
-        if Self::heading(p, ui, (x, y, w), "Servers", (!adding).then_some("Add server")) {
+        if Self::heading(p, ui, (x, y, w), "MCP servers", (!adding).then_some("Add server")) {
             self.add(Adding::Mcp(false));
         }
         y += 40.0;
@@ -941,10 +966,124 @@ impl Settings {
         y = Self::note(
             p,
             (x, y + 2.0, w),
-            "Agents on a Claude account also get the MCP servers you set up in Claude Code itself. A change here applies to the next message.",
+            "Every agent gets these, on every provider. A change here applies to the next message.",
         );
         if changed {
             actions.push(Action::SaveConfig);
+        }
+        Self::claude_servers(p, ui, (x, y + 30.0, w), shell, actions)
+    }
+
+    /// What Claude Code gives each Claude account's sessions besides the
+    /// servers above: the connectors added on claude.ai and the servers set
+    /// up in Claude Code itself. Only shown, never changed: they are the
+    /// account's. Claude Code is asked once the page is first shown.
+    fn claude_servers(
+        p: &mut Painter,
+        ui: &mut Ui,
+        (x, mut y, w): (f32, f32, f32),
+        shell: &mut Shell,
+        actions: &mut Vec<Action>,
+    ) -> f32 {
+        const MANAGE: &str = "https://claude.ai/customize/connectors";
+        let t = p.theme;
+        let accounts: Vec<Connection> = shell
+            .config
+            .all_connections()
+            .into_iter()
+            .filter(|connection| connection.kind == ConnectionKind::ClaudeAgent)
+            .collect();
+        if accounts.is_empty() {
+            return y;
+        }
+        p.label("From your Claude accounts", theme::LABEL, x, y + 6.0, t.text);
+        let loading = shell.connectors.values().any(|connectors| matches!(connectors, Connectors::Loading));
+        if icon_button(p, ui, Rect::new(x + w - 30.0, y + 1.0, 28.0, 28.0), icon::REFRESH, !loading) {
+            shell.connectors.clear();
+        }
+        y += 34.0;
+        y = Self::note(
+            p,
+            (x, y, w),
+            "Agents on a Claude account also get what that account has: the connectors added on claude.ai, and the \
+             servers set up in Claude Code itself. They are the account's own, so each account has its own.",
+        ) + 14.0;
+        for connection in accounts {
+            let known = shell.connectors.get(&connection.id).cloned();
+            if known.is_none() {
+                shell.connectors.insert(connection.id.clone(), Connectors::Loading);
+                actions.push(Action::ProbeConnectors(Box::new(connection.clone())));
+            }
+            p.label(&connection.name, theme::SMALL, x, y, t.text_muted);
+            y += 26.0;
+            let servers = match known {
+                Some(Connectors::Ready(servers)) => servers,
+                Some(Connectors::Failed(problem)) => {
+                    y = Self::note(p, (x, y, w), &problem) + 16.0;
+                    continue;
+                }
+                _ => {
+                    p.label("Asking Claude Code…", theme::SMALL, x, y, t.text_faint);
+                    y += 34.0;
+                    continue;
+                }
+            };
+            // What agents can use, or are kept from by a failure, gets a row; the rest a line.
+            let (listed, waiting): (Vec<&ClaudeMcpServer>, Vec<&ClaudeMcpServer>) =
+                servers.iter().partition(|server| matches!(server.status.as_str(), "connected" | "pending" | "failed"));
+            for server in &listed {
+                let connector = server.source == "claudeai";
+                let name = server.name.strip_prefix("claude.ai ").unwrap_or(&server.name);
+                let kind = if connector { "claude.ai connector" } else { "Claude Code" };
+                let (state, detail) = match server.status.as_str() {
+                    "connected" => {
+                        let tools =
+                            if server.tools == 1 { "1 tool".to_owned() } else { format!("{} tools", server.tools) };
+                        ("Connected", format!("{kind} · {tools}"))
+                    }
+                    "pending" => ("Connecting…", kind.to_owned()),
+                    _ if server.error.is_empty() => ("Failed", kind.to_owned()),
+                    _ => ("Failed", format!("{kind} · {}", server.error.trim())),
+                };
+                let rect = Rect::new(x, y, w, 58.0);
+                let glyph = if connector { icon::GLOBE } else { icon::SERVER };
+                row(p, rect, (glyph, None), name, &detail, 110.0);
+                let width = p.layout(state, theme::SMALL, None).width();
+                p.label(state, theme::SMALL, rect.right() - 16.0 - width, rect.y + 20.0, t.text_faint);
+                y += 66.0;
+            }
+            let names = |status: &str| -> Vec<&str> {
+                waiting
+                    .iter()
+                    .filter(|server| server.status == status)
+                    .map(|server| server.name.strip_prefix("claude.ai ").unwrap_or(&server.name))
+                    .collect()
+            };
+            let (sign_in, off) = (names("needs-auth"), names("disabled"));
+            let mut lines = Vec::new();
+            if !sign_in.is_empty() {
+                lines.push(format!("Not connected yet: {}.", sign_in.join(", ")));
+            }
+            if !off.is_empty() {
+                lines.push(format!("Turned off: {}.", off.join(", ")));
+            }
+            if listed.is_empty() && lines.is_empty() {
+                lines.push("No connectors or servers.".to_owned());
+            }
+            if !lines.is_empty() {
+                // The line sits level with the button beside it.
+                let top = y + 2.0;
+                let mut bottom = Self::note(p, (x, top + 9.0, w - 172.0), &lines.join(" "));
+                if !sign_in.is_empty() {
+                    let at = Rect::new(x + w - 156.0, top, 156.0, 32.0);
+                    if button(p, ui, at, "Connect on claude.ai", ButtonStyle::Secondary, true) {
+                        actions.push(Action::OpenLink(MANAGE.to_owned()));
+                    }
+                    bottom = bottom.max(at.bottom());
+                }
+                y = bottom + 6.0;
+            }
+            y += 18.0;
         }
         y
     }
@@ -966,7 +1105,7 @@ mod tests {
         settings.add(Adding::Provider(CUSTOM));
         assert_eq!(settings.visible(), [NAME, URL, KEY]);
         assert_eq!(settings.fields.text(KEY), "", "what was typed for another provider is gone");
-        settings.tab = Tab::Mcp;
+        settings.tab = Tab::Integrations;
         settings.add(Adding::Mcp(true));
         assert_eq!((settings.visible(), settings.fields.focused()), (vec![NAME, URL, VARS], NAME));
     }

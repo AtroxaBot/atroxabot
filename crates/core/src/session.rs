@@ -24,6 +24,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::agent::Agent;
 use crate::config::{Config, write_private};
 use crate::error::{Error, Result};
 use crate::responses::Usage;
@@ -58,6 +59,17 @@ pub struct Session {
     pub account: String,
     /// How many tokens the model's context holds, as the engine last said; 0 when unknown.
     pub window: u64,
+    /// The provider (a connection's id) [`Session::model`] and
+    /// [`Session::effort`] were chosen on. Empty, or another provider than
+    /// the agent's, means the session thinks with the agent's own choice.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    /// The model the session answers with; empty for the provider's default.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// How hard it thinks; empty for the model's usual effort.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub effort: String,
     /// What was said and done, oldest first.
     pub entries: Vec<Entry>,
 }
@@ -276,6 +288,22 @@ impl Session {
             updated: now,
             ..Self::default()
         }
+    }
+
+    /// Gives `agent` the model and effort chosen in this session, when they
+    /// were chosen on the provider it thinks through now.
+    pub fn apply_choice(&self, agent: &mut Agent) {
+        if !self.provider.is_empty() && self.provider == agent.connection {
+            self.model.clone_into(&mut agent.model);
+            self.effort.clone_into(&mut agent.effort);
+        }
+    }
+
+    /// Makes `agent`'s provider, model and effort this session's own.
+    pub fn keep_choice(&mut self, agent: &Agent) {
+        agent.connection.clone_into(&mut self.provider);
+        agent.model.clone_into(&mut self.model);
+        agent.effort.clone_into(&mut self.effort);
     }
 
     /// The folder it works in: its own, or the home directory.
@@ -765,6 +793,30 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("atroxabot-{name}-{}", std::process::id())).join("sessions");
         let _ = fs::remove_dir_all(&dir);
         SessionStore::at(dir)
+    }
+
+    #[test]
+    fn a_choice_of_model_holds_only_on_its_own_provider() {
+        let mut agent = Agent::new("Scout");
+        (agent.connection, agent.model, agent.effort) = ("claude".into(), "opus".into(), "max".into());
+        let mut session = Session::new(&agent.id);
+        let mut seen = agent.clone();
+        session.apply_choice(&mut seen);
+        assert_eq!(seen.model, "opus", "a session that chose nothing thinks as its agent does");
+        session.keep_choice(&agent);
+        let json = serde_json::to_string(&session).unwrap();
+        let back: Session = serde_json::from_str(&json).unwrap();
+        assert_eq!((back.provider.as_str(), back.model.as_str(), back.effort.as_str()), ("claude", "opus", "max"));
+        // The agent moves on; the session keeps what it was set to.
+        (agent.model, agent.effort) = ("haiku".into(), String::new());
+        let mut seen = agent.clone();
+        back.apply_choice(&mut seen);
+        assert_eq!((seen.model.as_str(), seen.effort.as_str()), ("opus", "max"));
+        // On another provider those models mean nothing.
+        agent.connection = "openai".into();
+        let mut seen = agent.clone();
+        back.apply_choice(&mut seen);
+        assert_eq!(seen.model, "haiku");
     }
 
     fn session(agent: &str, prompt: &str, answer: &str) -> Session {

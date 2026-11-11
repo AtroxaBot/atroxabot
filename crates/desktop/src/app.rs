@@ -15,12 +15,13 @@ use std::time::{Duration, Instant};
 
 use arboard::Clipboard;
 use atroxabot_core::git;
+use atroxabot_core::skills::{self, Library, Skill};
 use atroxabot_core::stats::{self, Ledger, Record};
 use atroxabot_core::tools::Workspace;
 use atroxabot_core::{
-    Agent, AgentEvent, ApiEngine, ClaudeAgent, ClaudeError, ClaudeInfo, Client, Config, Connection, ConnectionKind,
-    Control, Error, FollowUp, Limits, McpHub, McpServer, Model, Records, SearchHit, Session, SessionStore,
-    SessionSummary, Verdict,
+    Agent, AgentEvent, ApiEngine, ClaudeAgent, ClaudeError, ClaudeInfo, ClaudeMcpServer, Client, Config, Connection,
+    ConnectionKind, Control, Error, FollowUp, Limits, McpHub, McpServer, Model, Records, SearchHit, Session,
+    SessionStore, SessionSummary, Verdict,
 };
 use atroxabot_voice::{Call, CallEvent, CallOptions, VoiceConfig};
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -94,6 +95,13 @@ pub enum WorkerEvent {
         /// Its models and who is signed in, or why it could not be asked.
         result: Result<ClaudeInfo, ClaudeError>,
     },
+    /// Claude Code said (or could not say) which MCP servers a Claude account's sessions get.
+    Connectors {
+        /// The account's connection id.
+        connection: String,
+        /// The servers and how each is doing, or why it could not be asked.
+        result: Result<Vec<ClaudeMcpServer>, ClaudeError>,
+    },
     /// Sessions whose messages hold the searched text.
     SearchResults {
         /// The search they answer, to drop a late one.
@@ -110,6 +118,8 @@ pub enum WorkerEvent {
         /// What came of it.
         report: git::Report,
     },
+    /// A skill library job is done.
+    Skills(skills::Report),
     /// A folder's files were listed, for naming one in a message.
     Files {
         /// The folder.
@@ -179,6 +189,8 @@ pub enum Action {
     LoadModels(Box<Connection>),
     /// Ask Claude Code what a Claude account offers.
     ProbeClaude(Box<Connection>),
+    /// Ask Claude Code which MCP servers (claude.ai connectors among them) a Claude account's sessions get.
+    ProbeConnectors(Box<Connection>),
     /// Open Claude Code's own sign-in for a Claude account, in a terminal.
     ClaudeLogin(Box<Connection>),
     /// Search every session's messages.
@@ -201,6 +213,8 @@ pub enum Action {
         /// What to do there.
         job: git::Job,
     },
+    /// Change the skill library, or read a repository of skills.
+    Skills(skills::Job),
     /// List a folder's files, for naming one in a message.
     ListFiles(String),
     /// Ask for a folder.
@@ -302,6 +316,9 @@ pub struct App {
     next_generation: u64,
     /// Tools approved for the rest of each API session.
     approved: HashMap<String, Arc<Mutex<HashSet<String>>>>,
+    /// The skills each API session has had since its first turn here: its
+    /// tool list stays as it began.
+    skill_sets: HashMap<String, Arc<Vec<Skill>>>,
     /// The user's MCP servers, connected for API sessions, and the settings they were made from.
     mcp: Option<(Vec<McpServer>, McpHub)>,
     /// The voice call in progress.
@@ -439,6 +456,7 @@ impl App {
             generations: HashMap::new(),
             next_generation: 1,
             approved: HashMap::new(),
+            skill_sets: HashMap::new(),
             mcp: None,
             call: None,
             scheme,
@@ -705,10 +723,17 @@ impl App {
                 }
                 self.shell.claude_info(&connection, result);
             }
+            WorkerEvent::Connectors { connection, result } => {
+                if let Err(e) = &result {
+                    log::error(format!("Claude Code could not say which MCP servers an account has: {e}"));
+                }
+                self.shell.connectors_loaded(&connection, result);
+            }
             WorkerEvent::SearchResults { generation, hits } => self.shell.search_results(generation, hits),
             WorkerEvent::Stats(ledger) => self.shell.stats_loaded(*ledger),
             WorkerEvent::Git { folder, report } => self.shell.git_report(&folder, report),
             WorkerEvent::Files { folder, files } => self.shell.files_listed(&folder, files),
+            WorkerEvent::Skills(report) => self.shell.skills_report(report),
             WorkerEvent::Problem(text) => self.shell.notify(text),
         }
         self.apply(actions);
@@ -774,6 +799,7 @@ impl App {
             Action::SaveSession(session) => self.writer.send(Job::SaveSession(session)),
             Action::DeleteSession(session) => {
                 self.approved.remove(&session);
+                self.skill_sets.remove(&session);
                 self.writer.send(Job::DeleteSession(session));
             }
             Action::SaveAgent(agent) => {
@@ -793,6 +819,10 @@ impl App {
             }),
             Action::ProbeClaude(connection) => self.spawn(move || WorkerEvent::ClaudeInfo {
                 result: atroxabot_core::claude_info(&connection),
+                connection: connection.id.clone(),
+            }),
+            Action::ProbeConnectors(connection) => self.spawn(move || WorkerEvent::Connectors {
+                result: atroxabot_core::claude_connectors(&connection),
                 connection: connection.id.clone(),
             }),
             Action::ClaudeLogin(connection) => {
@@ -828,6 +858,7 @@ impl App {
             Action::Git { folder, job } => {
                 self.spawn(move || WorkerEvent::Git { report: git::run(std::path::Path::new(&folder), job), folder });
             }
+            Action::Skills(job) => self.spawn(move || WorkerEvent::Skills(skills::run(job))),
             Action::ListFiles(folder) => {
                 self.spawn(move || WorkerEvent::Files { files: git::files(std::path::Path::new(&folder)), folder });
             }
@@ -979,12 +1010,21 @@ impl App {
             }
             return;
         }
+        let library = Library::open().ok();
+        let skill_set = self
+            .skill_sets
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(library.as_ref().map(Library::skills).unwrap_or_default()));
+        let mut workspace = Workspace::new(&session.folder(), agent.memory_dir().as_deref());
+        if let Some(library) = &library {
+            workspace = workspace.with_skills(&library.skills_dir(), Arc::clone(skill_set));
+        }
         let engine = ApiEngine {
             client: client_for(connection),
             model: agent.model.clone(),
             effort: Some(agent.effort.clone()).filter(|effort| !effort.is_empty()),
             system: agent.system_prompt(&session.folder()),
-            workspace: Workspace::new(&session.folder(), agent.memory_dir().as_deref()),
+            workspace,
             autonomy: agent.autonomy,
             // Anthropic's own web tools; other providers have none to offer here.
             web: connection.kind == ConnectionKind::ClaudeApi,

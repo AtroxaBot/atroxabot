@@ -305,8 +305,8 @@ impl Shell {
         let context = thread.session.context_tokens();
         // How much the model takes: what its engine said, or what its provider lists.
         let listed = || {
-            let agent = self.selected_agent()?;
-            let connection = self.connection(agent)?;
+            let agent = self.agent_in_use()?;
+            let connection = self.connection(&agent)?;
             self.model_info(&connection.id, &agent.model).map(|model| model.context_window)
         };
         let window = if thread.session.window > 0 { thread.session.window } else { listed().unwrap_or(0) };

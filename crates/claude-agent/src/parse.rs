@@ -7,8 +7,8 @@ use serde_json::Value;
 
 use crate::cli::preview;
 use crate::{
-    Account, Block, Event, Info, Init, ModelInfo, PermissionRequest, RateLimit, RateWindow, SlashCommand, Task,
-    TaskState, TurnResult, Usage,
+    Account, Block, Event, Info, Init, McpServerStatus, ModelInfo, PermissionRequest, RateLimit, RateWindow,
+    SlashCommand, Task, TaskState, TurnResult, Usage,
 };
 
 /// What a line of output amounts to.
@@ -109,10 +109,12 @@ pub(crate) fn parse_line(line: &str) -> Parsed {
         "control_response" => {
             let response = field(&data, "response");
             if field(response, "subtype").as_str() != Some("error") {
-                // Only the answer to `initialize` lists models.
+                // Only the answer to `initialize` lists models, only that to `mcp_status` servers.
                 let answer = field(response, "response");
                 return if answer.get("models").is_some() {
                     Parsed::Event(Event::Ready(info(answer)))
+                } else if let Some(servers) = answer.get("mcpServers").and_then(Value::as_array) {
+                    Parsed::Event(Event::McpStatus(servers.iter().filter_map(mcp_server).collect()))
                 } else {
                     Parsed::Nothing
                 };
@@ -126,6 +128,21 @@ pub(crate) fn parse_line(line: &str) -> Parsed {
         "control_cancel_request" => Event::PermissionCancelled { request_id: text(&data, "request_id") },
         "rate_limit_event" => Event::RateLimit(rate_limit(field(&data, "rate_limit_info"))),
         _ => Event::Other { subtype: text(&data, "subtype"), kind, raw: data },
+    })
+}
+
+/// One server of the answer to `mcp_status`; `None` without a name.
+fn mcp_server(server: &Value) -> Option<McpServerStatus> {
+    let name = text(server, "name");
+    if name.is_empty() {
+        return None;
+    }
+    Some(McpServerStatus {
+        name,
+        status: text(server, "status"),
+        source: opt_text(server, "source").unwrap_or_else(|| text(server, "scope")),
+        error: text(server, "error"),
+        tools: field(server, "tools").as_array().map_or(0, Vec::len),
     })
 }
 
@@ -232,14 +249,21 @@ fn system(data: Value) -> Parsed {
                 summary: text(&data, "summary"),
             })
         }
-        // Sent only to a host that set CLAUDE_CODE_SDK_READS_SESSION_STATE; never meant for the caller.
-        "session_state_changed" if flag(&data, "sdk_host_only") => return Parsed::Nothing,
+        // Sent to a host that set CLAUDE_CODE_SDK_READS_SESSION_STATE, as this crate does.
+        "session_state_changed" => Event::SessionState(text(&data, "state")),
         _ => Event::Other { kind: "system".into(), subtype, raw: data },
     })
 }
 
 fn stream_event(data: Value, parent_tool_use_id: Option<String>) -> Event {
     let event = field(&data, "event");
+    match field(event, "type").as_str() {
+        Some("message_start") => return Event::MessageStart { parent_tool_use_id },
+        Some("content_block_start") if field(field(event, "content_block"), "type").as_str() == Some("thinking") => {
+            return Event::ThinkingStarted { parent_tool_use_id };
+        }
+        _ => {}
+    }
     let delta = field(event, "delta");
     match field(delta, "type").as_str() {
         Some("text_delta") => Event::TextDelta { text: text(delta, "text"), parent_tool_use_id },
@@ -468,14 +492,27 @@ mod tests {
     }
 
     #[test]
+    fn starts_of_messages_and_thinking() {
+        let start =
+            r#"{"type":"stream_event","event":{"type":"message_start","message":{}},"parent_tool_use_id":null}"#;
+        assert_eq!(event(start), Event::MessageStart { parent_tool_use_id: None });
+        let thinking = r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,
+            "content_block":{"type":"thinking","thinking":""}},"parent_tool_use_id":"toolu_1"}"#;
+        assert_eq!(
+            event(&thinking.replace('\n', " ")),
+            Event::ThinkingStarted { parent_tool_use_id: Some("toolu_1".into()) }
+        );
+    }
+
+    #[test]
     fn other_stream_events_pass_through() {
         for line in [
-            r#"{"type":"stream_event","event":{"type":"message_start","message":{}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","content_block":{"type":"text","text":""}}}"#,
             r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{"}}}"#,
         ] {
             let Event::Other { kind, subtype, raw } = event(line) else { panic!("not other") };
             assert_eq!(kind, "stream_event");
-            assert!(subtype == "message_start" || subtype == "content_block_delta");
+            assert!(subtype == "content_block_start" || subtype == "content_block_delta");
             assert!(raw.get("event").is_some());
         }
         let Event::Other { kind, subtype, .. } = event(r#"{"type":"stream_event","event":7}"#) else {
@@ -648,6 +685,30 @@ mod tests {
     }
 
     #[test]
+    fn mcp_status_answers() {
+        // As Claude Code 2.1.322 answers: a connector of the account, one to sign in to, one that failed.
+        let line = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_2","response":{
+            "mcpServers":[{"name":"claude.ai Fish.Audio","status":"connected","transport":"claudeai-proxy",
+            "scope":"claudeai","source":"claudeai","tools":[{"name":"a"},{"name":"b"}]},
+            {"name":"claude.ai Gmail","status":"needs-auth","scope":"claudeai","tools":[]},
+            {"name":"files","status":"failed","scope":"user","error":"spawn ENOENT"},{"status":"connected"},7]}}}"#;
+        let Event::McpStatus(servers) = event(&line.replace('\n', " ")) else { panic!("not an MCP status") };
+        let seen: Vec<(&str, &str, &str, usize)> =
+            servers.iter().map(|s| (s.name.as_str(), s.status.as_str(), s.source.as_str(), s.tools)).collect();
+        assert_eq!(
+            seen,
+            [
+                ("claude.ai Fish.Audio", "connected", "claudeai", 2),
+                ("claude.ai Gmail", "needs-auth", "claudeai", 0),
+                ("files", "failed", "user", 0)
+            ]
+        );
+        assert_eq!(servers[2].error, "spawn ENOENT");
+        let none = r#"{"type":"control_response","response":{"subtype":"success","response":{"mcpServers":[]}}}"#;
+        assert_eq!(event(none), Event::McpStatus(Vec::new()));
+    }
+
+    #[test]
     fn cancel_request() {
         let line = r#"{"type":"control_cancel_request","request_id":"cli_7"}"#;
         assert_eq!(event(line), Event::PermissionCancelled { request_id: "cli_7".into() });
@@ -714,10 +775,11 @@ mod tests {
 
     #[test]
     fn session_state_frames() {
-        let host_only = r#"{"type":"system","subtype":"session_state_changed","state":"idle","sdk_host_only":true}"#;
-        assert_eq!(parse_line(host_only), Parsed::Nothing);
-        let opted_in = r#"{"type":"system","subtype":"session_state_changed","state":"idle"}"#;
-        assert!(matches!(event(opted_in), Event::Other { subtype, .. } if subtype == "session_state_changed"));
+        // As Claude Code 2.1.322 sends them to a host that asked.
+        let running = r#"{"type":"system","subtype":"session_state_changed","state":"running","sdk_host_only":true}"#;
+        assert_eq!(event(running), Event::SessionState("running".into()));
+        let idle = r#"{"type":"system","subtype":"session_state_changed","state":"idle"}"#;
+        assert_eq!(event(idle), Event::SessionState("idle".into()));
     }
 
     #[test]

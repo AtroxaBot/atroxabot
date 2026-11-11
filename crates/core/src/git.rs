@@ -73,7 +73,7 @@ impl Change {
 }
 
 /// Runs `git` in `folder` and returns what it printed, or what it complained about.
-fn git(folder: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+pub(crate) fn git(folder: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     let mut command = Command::new("git");
     command.args(args).current_dir(folder).stdin(Stdio::null());
     // Fail rather than wait for a password nobody can type.

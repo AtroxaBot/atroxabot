@@ -50,6 +50,9 @@ const SUMMARY_PROMPT: &str = "The conversation is getting long. Write a summary 
 pub enum AgentEvent {
     /// The model began a response.
     ReplyStarted,
+    /// A turn is under way, one Claude Code started by itself included
+    /// (after a task sent to the background ended); nothing to record yet.
+    Working,
     /// More of its answer.
     Text(String),
     /// More of its reasoning.
@@ -258,6 +261,7 @@ impl Session {
                 self.entries.push(Entry::User { text: text.clone(), note: note.clone(), files: files.clone() });
             }
             AgentEvent::Queued(_)
+            | AgentEvent::Working
             | AgentEvent::Permission(_)
             | AgentEvent::PermissionGone(_)
             | AgentEvent::Status(_)
@@ -432,9 +436,16 @@ impl ApiEngine {
             emit(session, AgentEvent::Status(problems.join(" ")));
         }
         let definitions = tools::definitions();
+        // The skills are those of the session's start, so the tool list stays as it was.
+        let skill = crate::skills::tool(&self.workspace.skills);
         let specs: Vec<ToolSpec<'_>> = definitions
             .iter()
             .map(|(name, description, parameters)| ToolSpec { name, description, parameters })
+            .chain(skill.iter().map(|(description, parameters)| ToolSpec {
+                name: crate::skills::TOOL,
+                description,
+                parameters,
+            }))
             .chain(remote.iter().map(|tool| ToolSpec {
                 name: &tool.name,
                 description: &tool.description,

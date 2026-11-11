@@ -5,10 +5,11 @@
 use std::path::{Path, PathBuf};
 
 use atroxabot_core::git::{Change, GitFile, GitStatus, Report};
+use atroxabot_core::skills::{self, Catalog, Elsewhere, Group, Origin, Skill, Source};
 use atroxabot_core::stats::{Ledger, Record, day_of};
 use atroxabot_core::{
-    Agent, AgentEvent, Ask, Autonomy, ClaudeInfo, ClaudeModel, Config, Connection, ConnectionKind, LimitWindow, Limits,
-    McpServer, Model, Session, ToolUse, Usage, VoiceSettings, unix_now,
+    Agent, AgentEvent, Ask, Autonomy, ClaudeInfo, ClaudeMcpServer, ClaudeModel, Config, Connection, ConnectionKind,
+    LimitWindow, Limits, McpServer, Model, Session, ToolUse, Usage, VoiceSettings, unix_now,
 };
 use atroxabot_voice::CallState;
 
@@ -17,6 +18,7 @@ use super::call::CallView;
 use super::menu::Menu;
 use super::panel::DiffView;
 use super::settings::{Adding, Settings, Tab};
+use super::skills::Fetched;
 use super::spotlight::Spotlight;
 use super::stats::StatsView;
 use super::thread::Thread;
@@ -251,6 +253,98 @@ fn snapshots() {
             shell.modal = Some(Modal::Settings(Box::new(settings)));
             shell
         };
+        // The skills: two installed (one with an update), Anthropic's repository read, another being read.
+        let skilled = |open: Option<usize>| {
+            let mut shell = shell();
+            let anthropic = skills::Record::default().repositories[0].clone();
+            let mine = Source::parse("acme/agent-skills").unwrap_or_else(|_| anthropic.clone());
+            let skill = |name: &str, description: &str, digest: &str| Skill {
+                name: name.into(),
+                description: description.into(),
+                path: format!("skills/{name}"),
+                digest: digest.into(),
+                ..Skill::default()
+            };
+            let pdf = "Read, fill, merge and split PDF files, and extract their text and tables.";
+            let notes = "Write release notes from the commits since the last tag, grouped by area.";
+            shell.skills.installed = vec![skill("pdf", pdf, "1"), skill("release-notes", notes, "7")];
+            let origin = |source: &Source, name: &str, digest: &str| Origin {
+                source: source.clone(),
+                path: format!("skills/{name}"),
+                digest: digest.into(),
+            };
+            shell.skills.record.repositories.push(mine.clone());
+            shell.skills.record.installed.insert("pdf".into(), origin(&anthropic, "pdf", "1"));
+            shell.skills.record.installed.insert("release-notes".into(), origin(&mine, "release-notes", "7"));
+            let documents = Group {
+                name: "document-skills".into(),
+                description: "Create, edit and analyse Word documents, spreadsheets, presentations and PDFs.".into(),
+                skills: vec![
+                    skill("pdf", pdf, "2"),
+                    skill("docx", "Create and edit Word documents, with tracked changes and comments.", "3"),
+                    skill("xlsx", "Build spreadsheets with formulas, formatting and charts.", "4"),
+                ],
+            };
+            let examples = Group {
+                name: "example-skills".into(),
+                description: "Skills that show what a skill can do: design, testing, building tools.".into(),
+                skills: vec![
+                    skill("frontend-design", "Design distinctive, production-grade web interfaces.", "5"),
+                    skill("mcp-builder", "Build MCP servers that give agents well-designed tools.", "6"),
+                ],
+            };
+            let elsewhere = Elsewhere {
+                name: "release-tools".into(),
+                description: "Changelogs and version bumps.".into(),
+                source: mine.clone(),
+            };
+            let catalog = Catalog {
+                name: "anthropic-agent-skills".into(),
+                groups: vec![documents, examples],
+                elsewhere: vec![elsewhere],
+            };
+            shell.skills.catalogs.insert(anthropic.clone(), Fetched::Ready(Box::new(catalog)));
+            shell.skills.catalogs.insert(mine, Fetched::Loading);
+            let mut settings = Settings::new(Tab::Skills);
+            if open.is_some() {
+                settings.open_skills(anthropic);
+            }
+            shell.modal = Some(Modal::Settings(Box::new(settings)));
+            shell
+        };
+        // The MCP servers, with what each Claude account brings: its connectors, connected or to connect.
+        let mut connected = settings(Tab::Integrations);
+        let server = |name: &str, status: &str, source: &str, tools: usize, error: &str| ClaudeMcpServer {
+            name: name.into(),
+            status: status.into(),
+            source: source.into(),
+            error: error.into(),
+            tools,
+        };
+        let servers = vec![
+            server("claude.ai Fish.Audio", "connected", "claudeai", 53, ""),
+            server("claude.ai Claude Docs", "connected", "claudeai", 8, ""),
+            server("playwright", "failed", "user", 0, "spawn npx ENOENT"),
+            server("claude.ai Gmail", "needs-auth", "claudeai", 0, ""),
+            server("claude.ai Google Drive", "needs-auth", "claudeai", 0, ""),
+            server("claude.ai Slack", "needs-auth", "claudeai", 0, ""),
+            server("claude.ai Linear", "needs-auth", "claudeai", 0, ""),
+        ];
+        let accounts: Vec<String> = connected
+            .config
+            .all_connections()
+            .into_iter()
+            .filter(|connection| connection.kind == ConnectionKind::ClaudeAgent)
+            .map(|connection| connection.id)
+            .collect();
+        for (index, id) in accounts.into_iter().enumerate() {
+            let known = if index == 0 {
+                super::Connectors::Ready(servers.clone())
+            } else {
+                super::Connectors::Ready(vec![server("claude.ai Gmail", "connected", "claudeai", 12, "")])
+            };
+            connected.connectors.insert(id, known);
+        }
         let mut editor = shell();
         editor.modal = Some(Modal::Agent(Box::new(AgentForm::new(editor.selected_agent()))));
         let mut call = shell();
@@ -293,12 +387,14 @@ fn snapshots() {
             ("menu-close", closing),
             ("settings-providers", settings(Tab::Providers)),
             ("settings-voice", settings(Tab::Voice)),
-            ("settings-mcp", settings(Tab::Mcp)),
+            ("settings-integrations", connected),
+            ("settings-skills", skilled(None)),
+            ("skills-repository", skilled(Some(0))),
             ("add-provider", adding(Tab::Providers, Adding::PickProvider)),
             ("add-provider-key", adding(Tab::Providers, Adding::Provider(1))),
             ("add-account", adding(Tab::Providers, Adding::ClaudeAccount)),
             ("add-voice", adding(Tab::Voice, Adding::Voice(1))),
-            ("add-mcp", adding(Tab::Mcp, Adding::Mcp(false))),
+            ("add-mcp", adding(Tab::Integrations, Adding::Mcp(false))),
             ("agent", editor),
             ("call", call),
         ];

@@ -423,8 +423,9 @@ impl Shell {
         let form = self.form();
         let agent = self.selected_agent();
         match menu {
-            Menu::Model => agent
-                .and_then(|agent| Some((self.connection(agent)?, agent)))
+            Menu::Model => self
+                .agent_in_use()
+                .and_then(|agent| Some((self.connection(&agent)?, agent)))
                 .map(|(connection, agent)| self.model_items(&connection, &agent.model, query))
                 .unwrap_or_default(),
             Menu::Provider => {
@@ -516,11 +517,11 @@ impl Shell {
     }
 
     /// Applies a choice.
-    fn choose(&mut self, menu: Menu, value: &str, actions: &mut Vec<Action>) {
+    pub(super) fn choose(&mut self, menu: Menu, value: &str, actions: &mut Vec<Action>) {
         self.menu = None;
         match menu {
             Menu::Model => {
-                let Some(mut agent) = self.selected_agent().cloned() else { return };
+                let Some(mut agent) = self.agent_in_use() else { return };
                 // The provider's default is not pinned: it stays the default when that changes.
                 let default = self.default_model(&agent.connection);
                 let model = if default.as_deref() == Some(value) { String::new() } else { value.to_owned() };
@@ -528,7 +529,7 @@ impl Shell {
                     // Another model thinks at its own usual effort.
                     agent.effort.clear();
                     agent.model = model;
-                    self.update_agent(agent, actions);
+                    self.choose_thinking(agent, actions);
                 }
             }
             Menu::Provider if value == "manage" => {
@@ -589,8 +590,8 @@ impl Shell {
         let items = self.menu_items(menu, state.query.text());
         let searchable = menu.typed() && (items.len() > 7 || !state.query.text().is_empty());
         // The composer's model list also sets the effort, at its foot.
-        let thinking = match (menu, self.selected_agent()) {
-            (Menu::Model, Some(agent)) => self.connection(agent).map(|connection| {
+        let thinking = match (menu, self.agent_in_use()) {
+            (Menu::Model, Some(agent)) => self.connection(&agent).map(|connection| {
                 let model = self.model_in_use(&connection, &agent.model);
                 let in_use = Self::effort_in_use(connection.kind, &model, &agent.effort);
                 (Self::effort_choices(connection.kind, &model), in_use)
@@ -718,9 +719,11 @@ impl Shell {
             (state.rect, state.scroll) = (rect, scroll);
         }
         if let Some(level) = effort {
-            if let Some(mut agent) = self.selected_agent().cloned() {
+            // An effort is most often the only thing changed: picking one puts the list away.
+            self.menu = None;
+            if let Some(mut agent) = self.agent_in_use().filter(|agent| agent.effort != level) {
                 agent.effort = level;
-                self.update_agent(agent, actions);
+                self.choose_thinking(agent, actions);
             }
         } else if let Some(value) = picked {
             self.choose(menu, &value, actions);
