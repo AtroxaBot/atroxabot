@@ -103,7 +103,7 @@ impl Shell {
     /// Turns the worktree of the open session (or the next one) on or off;
     /// the agent's next sessions start the same way.
     pub(super) fn toggle_worktree(&mut self, actions: &mut Vec<Action>) {
-        if !self.worktree_open() {
+        if !self.worktree_open() || self.loading() {
             return;
         }
         let on = !self.wants_worktree();

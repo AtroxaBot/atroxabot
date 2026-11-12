@@ -408,7 +408,7 @@ impl Shell {
         }
         let needle = needle.to_lowercase();
         let mut commands = vec![("clear".to_owned(), "Empty this session and start with a fresh context".to_owned())];
-        let connection = self.selected_agent().and_then(|agent| self.connection(agent));
+        let connection = self.agent_in_use().and_then(|agent| self.connection(&agent));
         // An API agent is summarised by the app, and has the library's skills.
         if connection.as_ref().is_some_and(|connection| !connection.kind.is_account()) {
             commands.push(("compact".to_owned(), "Summarise the conversation to free up its context".to_owned()));

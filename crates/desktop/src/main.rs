@@ -33,6 +33,7 @@ mod tray;
 mod ui;
 
 use std::process::ExitCode;
+use std::time::Duration;
 
 use winit::application::ApplicationHandler;
 use winit::event::{StartCause, WindowEvent};
@@ -40,6 +41,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
 
 use app::{App, WorkerEvent};
+use atroxabot_core::update;
 
 /// Bridges winit callbacks to the [`App`], which can only be created once
 /// the event loop is running.
@@ -88,10 +90,18 @@ impl ApplicationHandler<WorkerEvent> for Handler {
     }
 
     fn exiting(&mut self, _: &ActiveEventLoop) {
+        let restart = self.app.as_mut().and_then(App::take_restart);
         // On macOS, quitting from the menu (Cmd+Q) exits the process right
         // after this, so `run_app` never returns: drop the app here, which
         // finishes its queue of file writes.
         self.app = None;
+        // An update was moved in: the new version starts, and waits for this one to be gone.
+        if let Some(start) = restart
+            && let Err(e) = update::relaunch(&start)
+        {
+            log::error(format!("cannot start the new version at {}: {e}", start.display()));
+            platform::alert("AtroxaBot was updated", "It could not start again by itself: start it as you usually do.");
+        }
     }
 }
 
@@ -105,10 +115,25 @@ fn fail(message: &str) -> ExitCode {
     ExitCode::FAILURE
 }
 
+/// Takes the lock that keeps a second copy away. Started after an update
+/// (`patient`), the copy that made way may still be closing: it is waited
+/// for a while.
+fn lock_instance(patient: bool) -> atroxabot_core::Result<Option<std::fs::File>> {
+    let tries = if patient { 150 } else { 1 };
+    for attempt in 1..=tries {
+        match atroxabot_core::lock_instance(LOCK_FILE)? {
+            None if attempt < tries => std::thread::sleep(Duration::from_millis(100)),
+            lock => return Ok(lock),
+        }
+    }
+    Ok(None)
+}
+
 fn main() -> ExitCode {
     log::init();
+    let updated = std::env::args().any(|argument| argument == update::AFTER_UPDATE);
     // Two copies would write the same files over each other.
-    let _lock = match atroxabot_core::lock_instance(LOCK_FILE) {
+    let _lock = match lock_instance(updated) {
         Ok(Some(lock)) => Some(lock),
         Ok(None) => {
             // Perhaps it only waits in the tray: it shows its window instead.
@@ -123,6 +148,13 @@ fn main() -> ExitCode {
             None
         }
     };
+    #[cfg(windows)]
+    platform::mark_running();
+    // What an update left beside the app goes, off the start's way: nothing here looks for a new one.
+    let swept = std::thread::Builder::new().name("atroxabot-update".into()).spawn(move || update::sweep(updated));
+    if let Err(e) = swept {
+        log::error(format!("cannot spawn the thread that clears up after updates: {e}"));
+    }
     let event_loop = match EventLoop::<WorkerEvent>::with_user_event().build() {
         Ok(event_loop) => event_loop,
         Err(e) => return fail(&format!("The window system could not be started: {e}")),

@@ -18,6 +18,7 @@ use atroxabot_core::git;
 use atroxabot_core::skills::{self, Library, Skill};
 use atroxabot_core::stats::{self, Ledger, Record};
 use atroxabot_core::tools::{Jobs, Workspace};
+use atroxabot_core::update;
 use atroxabot_core::worktree;
 use atroxabot_core::{
     Agent, AgentEvent, ApiEngine, ClaudeAgent, ClaudeError, ClaudeInfo, ClaudeMcpServer, Client, CodexAgent,
@@ -152,6 +153,10 @@ pub enum WorkerEvent {
     Problem(String),
     /// The tray icon was clicked, or another start of the app asks for the window.
     Tray(TrayEvent),
+    /// What looking for an update or downloading one came to, or how far a download is.
+    Update(update::Report),
+    /// The app is to close: a new version is in place and starts once it has.
+    Quit,
 }
 
 /// A message on its way to an engine: what [`Action::Send`] carries.
@@ -297,6 +302,10 @@ pub enum Action {
     OpenDataDir,
     /// Open a link from a reply in the browser.
     OpenLink(String),
+    /// Look for a newer version, or download one: only ever because the user clicked.
+    Update(update::Job),
+    /// Move the downloaded version in and restart into it.
+    InstallUpdate(update::Staged),
     /// Put text on the clipboard.
     Copy(String),
     /// A turn finished or needs an answer: flash the window if it is in the background.
@@ -402,6 +411,8 @@ pub struct App {
     hidden: bool,
     /// When the title bar strip was last pressed, to maximize on a second press.
     title_press: Option<f32>,
+    /// The new version to start once the app has closed: an update was moved in.
+    restart: Option<PathBuf>,
 }
 
 impl App {
@@ -530,6 +541,7 @@ impl App {
             tray,
             hidden: false,
             title_press: None,
+            restart: None,
         };
         app.ui.focused = true;
         app.shell.set_icons(provider_icons());
@@ -746,12 +758,18 @@ impl App {
         self.window.request_redraw();
     }
 
+    /// The new version to start now that the app closes, if an update was moved in.
+    pub fn take_restart(&mut self) -> Option<PathBuf> {
+        self.restart.take()
+    }
+
     /// Applies a result from another thread.
     pub fn worker_event(&mut self, event_loop: &ActiveEventLoop, event: WorkerEvent) {
         let mut actions = Vec::new();
         match event {
             WorkerEvent::Tray(TrayEvent::Open) => self.restore(),
-            WorkerEvent::Tray(TrayEvent::Quit) => event_loop.exit(),
+            WorkerEvent::Tray(TrayEvent::Quit) | WorkerEvent::Quit => event_loop.exit(),
+            WorkerEvent::Update(report) => self.shell.update_report(report),
             WorkerEvent::Thumbnail(key, pixels) => self.images.insert(key, pixels),
             // From an engine that was replaced: nothing it says matters any more.
             WorkerEvent::Agent { session, generation, .. } if self.generations.get(&session) != Some(&generation) => {}
@@ -771,7 +789,9 @@ impl App {
                 }
                 self.shell.models_loaded(&connection, result);
             }
-            WorkerEvent::SessionLoaded { session, result } => self.shell.session_loaded(&session, result.map(|s| *s)),
+            WorkerEvent::SessionLoaded { session, result } => {
+                self.shell.session_loaded(&session, result.map(|s| *s), &mut actions);
+            }
             WorkerEvent::Call(event) => {
                 if matches!(event, CallEvent::Ended(_)) {
                     self.hang_up();
@@ -1068,6 +1088,23 @@ impl App {
                     log::error(format!("cannot open link: {e}"));
                 }
             }
+            Action::Update(job) => {
+                let proxy = self.proxy.clone();
+                self.spawn(move || {
+                    let said = |report| {
+                        let _ = proxy.send_event(WorkerEvent::Update(report));
+                    };
+                    WorkerEvent::Update(update::run(job, &said))
+                });
+            }
+            Action::InstallUpdate(staged) => match staged.install() {
+                // Closing as on Quit, so everything is saved; the new version starts after.
+                Ok(start) => {
+                    self.restart = Some(start);
+                    let _ = self.proxy.send_event(WorkerEvent::Quit);
+                }
+                Err(why) => self.shell.update_failed(why),
+            },
             Action::Copy(text) => copy(&mut self.clipboard, &text),
             Action::Attention if !self.ui.focused => {
                 self.window.request_user_attention(Some(UserAttentionType::Informational));

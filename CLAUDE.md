@@ -2,7 +2,7 @@
 
 AtroxaBot is a native desktop app for agents the user chats with and calls. It is a Cargo workspace:
 `crates/claude-agent` (the Rust port of the Claude Agent SDK's transport), `crates/codex` (the transport
-for the installed Codex CLI's app server), `crates/mcp` (a small MCP client), `crates/core` (agents, sessions, API client, agent loop and tools, usage statistics, git, the sessions' worktrees; no GUI), `crates/voice` (Fish
+for the installed Codex CLI's app server), `crates/mcp` (a small MCP client), `crates/core` (agents, sessions, API client, agent loop and tools, usage statistics, git, the sessions' worktrees, updating the app; no GUI), `crates/voice` (Fish
 Audio and ElevenLabs, the call loop, audio devices) and `crates/desktop` (the app; package and binary
 `atroxabot`). `README.md` describes every feature, the crate layout and the storage format: read it before
 changing behaviour, and keep it current when you do.
@@ -57,6 +57,13 @@ cargo fmt --all --check
   removes its worktree, and nothing is removed while a `worktree::Lease` is held or while it has
   uncommitted changes the user was not told of. A new way to make or drop a worktree gets a test against
   real git there.
+- **Updates only when asked** (`core/src/update.rs`, whose module comment is the rule book). The app never
+  looks for a release by itself: not at start, not on a timer, not in the background. Looking, downloading
+  and restarting are each the user's click in Settings, General. A release is taken only when its manifest
+  is signed with the key in `packaging/update-key.pub`, is newer than what runs, and the download has the
+  manifest's size and SHA-256: never weaken or skip one of these, and never put the key's private half in
+  the repository. The version lives only in `Cargo.toml`'s `[workspace.package]` (`packaging/release.sh`
+  changes it and tags it); the release pipeline, the installer and the app all read it from there.
 - **Safety:** links from replies only open `http(s)` and `mailto`. A tool call that changes something,
   runs a command or goes online is asked about unless the agent's autonomy allows it.
 - **Testing:** the owner tests the GUI. Don't drive the app with computer use; `cargo build`, `clippy`
@@ -88,6 +95,12 @@ which platform a provider is. Never use one as the app's own branding.
   session's until its worktree is made; what is on disk is listed in the settings (`shell/worktrees.rs`).
 - An agent has no model or effort in its editor: both are chosen under the message box. There is no
   "auto" effort; `Shell::effort_in_use` gives every model a level of its own.
+- The provider, model and effort are the session's (`Session::provider`, read through
+  `Shell::agent_in_use` and `Shell::agent_of`, never straight from `Agent::connection`): a session keeps
+  what it was left with, the top bar's chip swaps the open session's only, and the agent's own (its
+  editor's provider) is where its next sessions start.
+- Nothing of a session is changed or saved while its messages are still being read (`Shell::loading`):
+  it would be saved over them. What is sent meanwhile waits for them.
 - What the agent needs from the user rides on a card over the message box: an approval (`draw_ask`) or a
   question (`shell/question.rs`). What the user sends while the agent works waits in a tray just above the
   message box until the agent reads it at its next step (`shell/queue.rs`); it is never a separate list or

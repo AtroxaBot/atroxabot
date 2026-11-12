@@ -1,0 +1,2 @@
+# Shell scripts run on Linux and macOS, and in Git Bash: never with Windows line endings.
+*.sh text eol=lf

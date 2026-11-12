@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/Luvarly/atroxabot"
+repository = "https://github.com/Atroxabot/atroxabot"
 
 [workspace.dependencies]
 atroxabot-claude-agent = { path = "crates/claude-agent" }
@@ -34,6 +34,9 @@ flate2 = "1.1.11"
 # why: microphone capture and speaker playback for voice calls; WASAPI, CoreAudio
 # and ALSA are three large unsafe FFI surfaces we cannot reasonably write by hand.
 cpal = "0.18.2"
+# why: an update is believed by its Ed25519 signature and its SHA-256, and cryptography is not
+# written by hand. Already built for `ureq`'s TLS, so it adds nothing new to the tree.
+ring = "0.17.14"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

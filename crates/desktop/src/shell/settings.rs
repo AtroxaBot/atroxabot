@@ -484,6 +484,7 @@ impl Settings {
 
         p.label("On this computer", theme::LABEL, x, y, t.text);
         y += 30.0;
+        y = super::update::draw(p, ui, (x, y, w), shell, actions) + 8.0;
         let installed = shell.claude.values().find_map(|account| match account {
             Account::Ready(info) => Some(format!("Claude Code {}", info.version)),
             _ => None,

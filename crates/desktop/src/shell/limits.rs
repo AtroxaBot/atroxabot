@@ -4,7 +4,7 @@
 //! the same kind that has usage left, or stops there.
 //!
 //! A session goes on only while the user leaves it be. Whatever they do with
-//! it first (send something, switch its agent's provider, clear it, delete
+//! it first (send something, switch its provider, clear it, delete
 //! it, or cancel the wait in the tray above the message box) is what happens
 //! instead. A session that keeps running into the limit stops trying after
 //! a few turns. The wait lives in memory: it ends with the app.
@@ -107,10 +107,18 @@ impl Shell {
         matches!((kind(a), kind(b)), (Some(a), Some(b)) if a == b && a != ConnectionKind::OpenAi)
     }
 
-    /// Gives `agent` the model and effort `session` chose, if they hold on
-    /// the provider it thinks through now.
+    /// Gives `agent` the provider, model and effort `session` keeps, while
+    /// its provider exists: a session thinks through its own.
     pub(super) fn apply_choice(&self, session: &atroxabot_core::Session, agent: &mut Agent) {
-        session.apply_choice(agent, self.kin(&session.provider, &agent.connection));
+        session.apply_choice(agent, self.config.connection(&session.provider).is_some());
+    }
+
+    /// The agent of `session` as the session thinks with it.
+    pub(super) fn agent_of(&self, session: &str) -> Option<Agent> {
+        let thread = self.threads.get(session)?;
+        let mut agent = self.agents.iter().find(|agent| agent.id == thread.session.agent)?.clone();
+        self.apply_choice(&thread.session, &mut agent);
+        Some(agent)
     }
 
     /// Whether the provider `connection` offers `model`, as far as is known:
@@ -121,29 +129,60 @@ impl Shell {
         model.is_empty() || choices.is_empty() || choices.iter().any(|choice| choice.value == model)
     }
 
-    /// Moves `agent` to the provider `to`, as its menu in the top bar does.
-    /// Its model and effort go along where `to` offers the same models (from
-    /// one Claude account to another), and the notices of the account it
-    /// leaves go: they are no news for it any more.
-    pub(super) fn move_agent(&mut self, mut agent: Agent, to: &str, actions: &mut Vec<Action>) {
-        if agent.connection == to {
-            return;
-        }
+    /// `agent` on the provider `to`. Its model and effort go along where
+    /// `to` offers the same models (from one Claude account to another).
+    pub(super) fn moved(&self, mut agent: Agent, to: &str) -> Agent {
         let from = std::mem::replace(&mut agent.connection, to.to_owned());
         if !self.kin(&from, to) || !self.offers(to, &agent.model) {
             // Another provider has other models: its default, until one is picked.
             agent.model.clear();
             agent.effort.clear();
         }
+        agent
+    }
+
+    /// The provider menu of the top bar: the open session thinks through
+    /// `to` from now on, and so do the sessions its agent starts next. The
+    /// agent's other sessions stay where each was left. The notices of the
+    /// account it leaves go: they are no news for it any more.
+    pub(super) fn swap_provider(&mut self, to: &str, actions: &mut Vec<Action>) {
+        let Some(agent) = self.agent_in_use().filter(|agent| agent.connection != to) else { return };
+        if self.loading() {
+            return;
+        }
+        // The user chose where it goes on: it waits for no limit to lift any more.
+        if let Some(session) = self.current.clone() {
+            self.cancel_resume(&session);
+        }
+        let from = agent.connection.clone();
+        let agent = self.moved(agent, to);
         if let Some(connection) = self.config.connection(to) {
             self.want_models(&connection, actions);
         }
         let open = self.thread().map(|thread| thread.session.account.clone()).unwrap_or_default();
         self.notices.retain(|notice| notice.account.is_empty() || (notice.account != from && notice.account != open));
-        self.update_agent(agent, actions);
+        self.choose_thinking(agent, actions);
         // The account it goes to may have run out itself.
         if let Some(lifts) = self.out_until(to) {
             self.notify_limit(to, lifts);
+        }
+    }
+
+    /// Moves `session` to the account `to` by itself, the one it ran on
+    /// being out of usage. The sessions its agent starts next go there too,
+    /// if they would have started on the account that ran out.
+    fn take_over(&mut self, session: &str, to: &str, actions: &mut Vec<Action>) {
+        let Some(agent) = self.agent_of(session) else { return };
+        let from = agent.connection.clone();
+        let moved = self.moved(agent, to);
+        let Some(thread) = self.threads.get_mut(session) else { return };
+        thread.session.keep_choice(&moved);
+        actions.push(Action::SaveSession(Box::new(thread.session.clone())));
+        self.notices.retain(|notice| notice.account.is_empty() || notice.account != from);
+        let own = self.agents.iter().find(|own| own.id == moved.id && own.connection == from).cloned();
+        if let Some(own) = own {
+            let own = self.moved(own, to);
+            self.update_agent(own, actions);
         }
     }
 
@@ -209,12 +248,6 @@ impl Shell {
         fresh.into_iter().next().map(|account| account.id)
     }
 
-    /// The agent `session` belongs to.
-    fn owner(&self, session: &str) -> Option<Agent> {
-        let thread = self.threads.get(session)?;
-        self.agents.iter().find(|agent| agent.id == thread.session.agent).cloned()
-    }
-
     /// The usage limit of the account it ran on stopped the turn of
     /// `session`, which has ended: what the settings say happens next.
     pub(super) fn limit_stopped(&mut self, session: &str, actions: &mut Vec<Action>) {
@@ -236,8 +269,8 @@ impl Shell {
             self.notify(format!("\"{title}\" kept running into usage limits, so it no longer goes on by itself."));
             return;
         }
-        let Some(agent) = self.owner(session) else { return };
-        // Its agent was moved to another provider while the turn ran: the user chose where it goes on.
+        let Some(agent) = self.agent_of(session) else { return };
+        // It was moved to another provider while the turn ran: the user chose where it goes on.
         if mode == OutOfLimits::Wait && agent.connection != account {
             return;
         }
@@ -267,24 +300,23 @@ impl Shell {
 
     /// The limit that stopped `session` is behind it, or another account
     /// takes over: it goes on, with what the user sent meanwhile if anything.
-    /// With "Continue using different account" its agent moves to an account
-    /// that has usage left. Returns whether it went.
+    /// With "Continue using different account" it moves to an account that
+    /// has usage left. Returns whether it went.
     pub(super) fn go_on(&mut self, session: &str, actions: &mut Vec<Action>) -> bool {
         let Some(thread) = self.threads.get_mut(session).filter(|thread| thread.loaded && !thread.busy) else {
             return false;
         };
         thread.resume = None;
-        let Some(agent) = self.owner(session) else { return false };
+        let Some(agent) = self.agent_of(session) else { return false };
         if self.out_of_limits() == OutOfLimits::Switch
             && let Some(fresh) = self.fresh_account(&agent)
             && fresh != agent.connection
         {
-            self.move_agent(agent.clone(), &fresh, actions);
-            // Its other sessions waiting for the account it left go on with this one too.
+            self.take_over(session, &fresh, actions);
+            // The other sessions waiting for the account it left go on with another too.
             let mut waiting: Vec<String> = (self.threads.iter())
-                .filter(|(id, thread)| {
-                    id.as_str() != session && thread.session.agent == agent.id && thread.resume.is_some()
-                })
+                .filter(|(id, thread)| id.as_str() != session && thread.resume.is_some())
+                .filter(|(id, _)| self.agent_of(id).is_some_and(|other| other.connection == agent.connection))
                 .map(|(id, _)| id.clone())
                 .collect();
             waiting.sort();
@@ -307,15 +339,6 @@ impl Shell {
     /// The user takes `session` back: it no longer goes on by itself.
     pub(super) fn cancel_resume(&mut self, session: &str) {
         if let Some(thread) = self.threads.get_mut(session) {
-            thread.resume = None;
-            thread.tries = 0;
-        }
-    }
-
-    /// The user chose where the sessions of the agent `agent` go on: none
-    /// waits for a limit to lift any more.
-    pub(super) fn cancel_resumes_of(&mut self, agent: &str) {
-        for thread in self.threads.values_mut().filter(|thread| thread.session.agent == agent) {
             thread.resume = None;
             thread.tries = 0;
         }
@@ -345,7 +368,7 @@ impl Shell {
         if thread.busy {
             return;
         }
-        let Some(agent) = self.owner(session) else { return };
+        let Some(agent) = self.agent_of(session) else { return };
         let switching = self.out_of_limits() == OutOfLimits::Switch;
         if switching && self.fresh_account(&agent).is_some() {
             self.go_on(session, actions);
@@ -589,6 +612,26 @@ mod tests {
         assert!(thread.session.entries.iter().any(
             |entry| matches!(entry, Entry::Note { text } if text == "Claude is out of usage · going on with Work")
         ));
+        // The agent's next sessions start where there is usage too.
+        assert_eq!(shell.selected_agent().map(|agent| agent.connection.as_str()), Some("work"));
+    }
+
+    #[test]
+    fn only_the_session_that_ran_out_moves() {
+        let (mut shell, first, mut actions) = two_accounts(OutOfLimits::Switch);
+        shell.agent_event(&first, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        // A second session of the agent, on the same account, is the one that runs out.
+        shell.new_session(&mut actions);
+        shell.send("Something else", false, Vec::new(), &mut actions);
+        let second = shell.current.clone().expect("a session");
+        shell.agent_event(&second, AgentEvent::Remote("r2".into()), &mut actions);
+        run_out(&mut shell, &second, unix_now() + 3_600, &mut actions);
+        assert_eq!(shell.agent_of(&second).map(|agent| agent.connection).as_deref(), Some("work"));
+        // The first was not stopped by anything: it is where it was left, with its conversation.
+        let kept = shell.agent_of(&first).expect("agent");
+        assert_eq!((kept.connection.as_str(), kept.model.as_str()), (Connection::CLAUDE_AGENT, "opus"));
+        let thread = &shell.threads[&first];
+        assert_eq!((thread.session.account.as_str(), thread.session.remote.as_str()), (Connection::CLAUDE_AGENT, "r1"));
     }
 
     #[test]

@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use atroxabot_core::git::{Change, GitFile, GitStatus, Report};
 use atroxabot_core::skills::{self, Catalog, Elsewhere, Group, Origin, Skill, Source};
 use atroxabot_core::stats::{Ledger, Record, day_of};
+use atroxabot_core::update::{Release, Staged, Version};
 use atroxabot_core::worktree;
 use atroxabot_core::{
     Agent, AgentEvent, Ask, Autonomy, ClaudeInfo, ClaudeMcpServer, ClaudeModel, CodexAccount, CodexInfo, CodexModel,
@@ -24,6 +25,7 @@ use super::skills::Fetched;
 use super::spotlight::Spotlight;
 use super::stats::StatsView;
 use super::thread::Thread;
+use super::update::Updater;
 use super::{Modal, Shell};
 use crate::gpu::Offscreen;
 use crate::image::ImageAtlas;
@@ -98,6 +100,8 @@ fn snapshots() {
         branch.open_menu(Menu::Branch, Rect::new(1120.0, 318.0, 288.0, 36.0));
         let mut plain = panel();
         plain.git.status = None;
+        // Its account's limits were last reported a while ago: the panel says since when.
+        plain.set_limits([("claude-agent".to_owned(), seen([0.31, 0.61]))].into());
         // A turn with subagents: their cards in the conversation and their list in the side
         // panel, and one of them open.
         let delegate = |open: Option<&str>| {
@@ -295,6 +299,17 @@ fn snapshots() {
             shell.modal = Some(Modal::Settings(Box::new(Settings::new(tab))));
             shell
         };
+        // Updating the app, a click at a time: a newer version is out, comes down, waits for a restart; and a
+        // download that could not be saved.
+        let updating = |state: Updater| {
+            let mut shell = settings(Tab::General);
+            shell.updater = state;
+            shell
+        };
+        let newer = || Version::parse("0.2.0").expect("a version");
+        let downloading = Updater::Downloading { release: Release::unnamed(newer()), done: 43, size: 100 };
+        let unwritable = "AtroxaBot cannot write to the folder it runs from (C:\\Program Files\\AtroxaBot): Access is \
+            denied. Install the newest release instead.";
         // The close button's choices, open under their dropdown.
         let mut closing = settings(Tab::General);
         closing.open_menu(Menu::Close, Rect::new(905.0, 432.0, 240.0, 40.0));
@@ -502,6 +517,10 @@ fn snapshots() {
             ("menu-autonomy", autonomy),
             ("settings-general", settings(Tab::General)),
             ("menu-close", closing),
+            ("update-available", updating(Updater::Available(Release::unnamed(newer())))),
+            ("update-downloading", updating(downloading)),
+            ("update-ready", updating(Updater::Ready(Staged::nowhere(newer())))),
+            ("update-failed", updating(Updater::Failed(unwritable.into()))),
             ("settings-providers", settings(Tab::Providers)),
             ("settings-providers-private", private),
             ("menu-provider-private", private_menu),

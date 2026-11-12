@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::time::Instant;
 
 use atroxabot_core::attach::media_type;
-use atroxabot_core::{Ask, Block, Entry, Reply, Session, TodoState, ToolUse, tools};
+use atroxabot_core::{Ask, Block, Entry, Reply, Session, SessionSummary, TodoState, ToolUse, tools};
 use serde_json::Value;
 use winit::window::CursorIcon;
 
@@ -203,8 +203,9 @@ pub(super) struct Thread {
     pub status: String,
     /// Tool calls waiting for the user's approval, oldest first.
     pub asks: Vec<Ask>,
-    /// A message to send once the running turn has stopped: its words, whether
-    /// it was spoken, and the files that go with it.
+    /// A message to send once the running turn has stopped, or once the
+    /// session's messages are read: its words, whether it was spoken, and the
+    /// files that go with it.
     pub queued: Option<(String, bool, Vec<String>)>,
     /// Messages the user sent while the agent worked, oldest first, until
     /// it takes them in (`queue.rs`).
@@ -248,6 +249,8 @@ pub(super) struct Thread {
     /// The model and effort the last message went with: a Claude account's
     /// process keeps the ones it started with, so other ones need a new process.
     pub sent_with: Option<(String, String)>,
+    /// The provider the last message went to, which its turn runs on; empty before the first.
+    pub sent_on: String,
     /// The account's usage limit stopped the running turn, as its agent said.
     pub limited: bool,
     /// The account was refused during the running turn (it may still have
@@ -290,6 +293,7 @@ impl Thread {
             doing: String::new(),
             clicked_picture: None,
             sent_with: None,
+            sent_on: String::new(),
             limited: false,
             refused: false,
             resume: None,
@@ -297,9 +301,19 @@ impl Thread {
         }
     }
 
-    /// A saved session whose messages are being read.
-    pub fn loading(id: &str) -> Self {
-        let mut thread = Self::new(Session { id: id.to_owned(), ..Session::default() });
+    /// A saved session whose messages are being read. Until they are in
+    /// it shows what the sidebar `known` of it: whose it is, its title, and
+    /// the provider, model and effort it was left with.
+    pub fn loading(known: &SessionSummary) -> Self {
+        let mut thread = Self::new(Session {
+            id: known.id.clone(),
+            agent: known.agent.clone(),
+            title: known.title.clone(),
+            provider: known.provider.clone(),
+            model: known.model.clone(),
+            effort: known.effort.clone(),
+            ..Session::default()
+        });
         thread.loaded = false;
         thread
     }

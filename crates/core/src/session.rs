@@ -33,6 +33,9 @@ use crate::worktree::Worktree;
 /// Name of the index file. The leading dot keeps it out of session scans,
 /// since `.` is not a valid id character.
 const INDEX_FILE: &str = ".index.json";
+/// The index's format: one written in another is made again from the
+/// session files, so every summary holds what this version keeps in it.
+const INDEX_VERSION: u32 = 2;
 
 /// One conversation with an agent.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -64,9 +67,11 @@ pub struct Session {
     pub account: String,
     /// How many tokens the model's context holds, as the engine last said; 0 when unknown.
     pub window: u64,
-    /// The provider (a connection's id) [`Session::model`] and
-    /// [`Session::effort`] were chosen on. Empty, or another provider than
-    /// the agent's, means the session thinks with the agent's own choice.
+    /// The provider (a connection's id) the session thinks through, with
+    /// [`Session::model`] and [`Session::effort`]: its own, wherever its
+    /// agent goes on to start its next sessions. Empty (a session that
+    /// never chose), or a provider that no longer exists, means the
+    /// agent's own choice.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub provider: String,
     /// The model the session answers with; empty for the provider's default.
@@ -344,11 +349,13 @@ impl Session {
         }
     }
 
-    /// Gives `agent` the model and effort chosen in this session, when they
-    /// were chosen on the provider it thinks through now, or on one that
-    /// offers the same models (`kin`: another account of the same kind).
-    pub fn apply_choice(&self, agent: &mut Agent, kin: bool) {
-        if !self.provider.is_empty() && (kin || self.provider == agent.connection) {
+    /// Gives `agent` the provider, model and effort this session keeps,
+    /// when it keeps any and its provider still exists (`known`): a
+    /// session thinks with its own choice, not with what its agent was
+    /// given since.
+    pub fn apply_choice(&self, agent: &mut Agent, known: bool) {
+        if known && !self.provider.is_empty() {
+            self.provider.clone_into(&mut agent.connection);
             self.model.clone_into(&mut agent.model);
             self.effort.clone_into(&mut agent.effort);
         }
@@ -532,6 +539,9 @@ impl Session {
             cost: self.cost(),
             tokens: self.tokens(),
             worktree: self.worktree.clone().filter(Worktree::made),
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            effort: self.effort.clone(),
         }
     }
 }
@@ -559,6 +569,16 @@ pub struct SessionSummary {
     /// The worktree it works in, once made: what the cleaning up goes by.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worktree: Option<Worktree>,
+    /// The provider it thinks through ([`Session::provider`]): known
+    /// before its messages are read, so it opens showing its own.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub provider: String,
+    /// The model it answers with ([`Session::model`]).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub model: String,
+    /// How hard it thinks ([`Session::effort`]).
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub effort: String,
 }
 
 /// A session whose messages contain the search text.
@@ -666,10 +686,12 @@ impl SessionStore {
     pub fn list(&mut self) -> Result<(Vec<SessionSummary>, Vec<Error>)> {
         let index_path = self.dir.join(INDEX_FILE);
         let (mut index, index_time) = match fs::read(&index_path) {
-            // A corrupt index is rebuilt from the session files.
+            // A corrupt index, or one in another format, is rebuilt from the session files.
             Ok(bytes) => match serde_json::from_slice::<Index>(&bytes) {
-                Ok(index) => (index.sessions, fs::metadata(&index_path).and_then(|m| m.modified()).ok()),
-                Err(_) => (Vec::new(), None),
+                Ok(index) if index.version == INDEX_VERSION => {
+                    (index.sessions, fs::metadata(&index_path).and_then(|m| m.modified()).ok())
+                }
+                Ok(_) | Err(_) => (Vec::new(), None),
             },
             Err(e) if e.kind() == ErrorKind::NotFound => (Vec::new(), None),
             Err(e) => return Err(e.into()),
@@ -844,7 +866,7 @@ impl SessionStore {
     }
 
     fn write_index(&self) -> Result<()> {
-        let index = Index { version: 1, sessions: self.index.clone() };
+        let index = Index { version: INDEX_VERSION, sessions: self.index.clone() };
         write_private(&self.dir.join(INDEX_FILE), &serde_json::to_vec(&index)?)
     }
 }
@@ -885,32 +907,48 @@ mod tests {
     }
 
     #[test]
-    fn a_choice_of_model_holds_only_on_its_own_provider() {
+    fn a_session_keeps_its_provider_model_and_effort() {
         let mut agent = Agent::new("Scout");
         (agent.connection, agent.model, agent.effort) = ("claude".into(), "opus".into(), "max".into());
         let mut session = Session::new(&agent.id);
         let mut seen = agent.clone();
-        session.apply_choice(&mut seen, false);
+        session.apply_choice(&mut seen, true);
         assert_eq!(seen.model, "opus", "a session that chose nothing thinks as its agent does");
         session.keep_choice(&agent);
         let json = serde_json::to_string(&session).unwrap();
         let back: Session = serde_json::from_str(&json).unwrap();
         assert_eq!((back.provider.as_str(), back.model.as_str(), back.effort.as_str()), ("claude", "opus", "max"));
-        // The agent moves on; the session keeps what it was set to.
-        (agent.model, agent.effort) = ("haiku".into(), String::new());
-        let mut seen = agent.clone();
-        back.apply_choice(&mut seen, false);
-        assert_eq!((seen.model.as_str(), seen.effort.as_str()), ("opus", "max"));
-        // On another provider those models mean nothing.
-        agent.connection = "openai".into();
-        let mut seen = agent.clone();
-        back.apply_choice(&mut seen, false);
-        assert_eq!(seen.model, "haiku");
-        // On another account of the same kind they mean the same.
-        agent.connection = "work".into();
+        // The sidebar knows it without the messages.
+        let summary = back.summary();
+        assert_eq!(
+            (summary.provider.as_str(), summary.model.as_str(), summary.effort.as_str()),
+            ("claude", "opus", "max")
+        );
+        // The agent goes on to another provider and model; the session keeps what it was left with.
+        (agent.connection, agent.model, agent.effort) = ("openai".into(), "gpt".into(), String::new());
         let mut seen = agent.clone();
         back.apply_choice(&mut seen, true);
-        assert_eq!((seen.model.as_str(), seen.effort.as_str()), ("opus", "max"));
+        assert_eq!((seen.connection.as_str(), seen.model.as_str(), seen.effort.as_str()), ("claude", "opus", "max"));
+        // Its provider was deleted: it thinks as its agent does.
+        let mut seen = agent.clone();
+        back.apply_choice(&mut seen, false);
+        assert_eq!((seen.connection.as_str(), seen.model.as_str(), seen.effort.as_str()), ("openai", "gpt", ""));
+    }
+
+    #[test]
+    fn an_index_of_another_format_is_made_again() {
+        let mut store = store("index-format");
+        let mut kept = Session::new("scout");
+        (kept.provider, kept.model) = ("claude".into(), "opus".into());
+        store.save(&kept).unwrap();
+        // As a version before this one wrote it: no provider in the summaries.
+        let old = format!(r#"{{"version":1,"sessions":[{{"id":"{}","agent":"scout","title":"Old"}}]}}"#, kept.id);
+        fs::write(store.dir().join(INDEX_FILE), old).unwrap();
+        let (listed, errors) = SessionStore::at(store.dir().to_path_buf()).list().unwrap();
+        assert!(errors.is_empty());
+        assert_eq!((listed.len(), listed[0].provider.as_str(), listed[0].model.as_str()), (1, "claude", "opus"));
+        let written: Index = serde_json::from_slice(&fs::read(store.dir().join(INDEX_FILE)).unwrap()).unwrap();
+        assert_eq!(written.version, INDEX_VERSION);
     }
 
     fn session(agent: &str, prompt: &str, answer: &str) -> Session {

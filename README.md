@@ -102,7 +102,8 @@ cargo clippy --workspace --all-targets -- -D warnings
   All of that runs when the app starts, when you come back to its window (at most once a minute), and
   from *Clean up now*; nothing touches a worktree while a turn or an agent's process works in it. The
   settings page lists every worktree on disk with what it holds and how much room it takes.
-- **Providers**, chosen per agent and swapped from the chip in a session's top bar:
+- **Providers**, one per session, swapped from the chip in its top bar (the agent's editor says where its
+  next sessions start):
   - **Claude accounts**: the Claude Code you installed, driven with the Claude Agent SDK's protocol, with
     its own tools, permissions, subagents, skills and MCP servers. Several accounts (work, personal) are
     kept apart; see *Claude accounts and Anthropic's terms*.
@@ -153,16 +154,20 @@ cargo clippy --workspace --all-targets -- -D warnings
   Swapping provider mid-session works: a Claude or Codex account that never saw the conversation is
   handed what was said so far. Swapping to another account of the same kind (one Claude account for
   another) keeps the model and effort, and takes away the notice of the account that was left.
+  The provider is the session's: each session keeps the one it was left on, so swapping it in one leaves
+  the agent's other sessions where they are, and going back to a session goes back to its account and the
+  conversation that account holds. A new session starts on the provider picked last.
 - **When an account runs out** (Settings, Providers): when a Claude or Codex account's usage limit stops a
   turn, the session can *Wait for limit refill* (the default: it goes on by itself a minute after the limit
-  lifts, so you can walk away; when the provider did not say when, it tries again every 15 minutes), *Continue using different account* (the agent moves at once to another
+  lifts, so you can walk away; when the provider did not say when, it tries again every 15 minutes), *Continue using different account* (the session moves at once to another
   signed-in account of the same kind that has usage left, the least used first, keeping its model and
-  effort, and that account is handed the conversation; with none left it waits for the first to lift), or
+  effort, and that account is handed the conversation; the agent's next sessions start there too, and its
+  other sessions stay where they are; with none left it waits for the first to lift), or
   *Stop*. While it waits, a row above the message box says when it goes on, with *Continue now* and a
   button to cancel; what you sent while the agent worked waits there too and goes with it. A line in the
   conversation says why it went on and on which account, and the agent is told it was cut short and to
   carry on; nothing is written in your name. Whatever you do first wins: sending a message, switching the
-  agent's provider, clearing or deleting the session cancels the wait. A session the limit stops five turns
+  session's provider, clearing or deleting the session cancels the wait. A session the limit stops five turns
   in a row stops trying. The app wakes for it while it is in the tray; a wait does not outlive the app.
 - **Models from the provider.** The model menu at the right under the message box lists what the provider itself
   offers: a Claude account's list comes from Claude Code (so it is always current; of a family listed in
@@ -172,7 +177,8 @@ cargo clippy --workspace --all-targets -- -D warnings
   typed. The same menu sets the effort, which is always one of the model's own levels: Opus, Haiku and
   Fable start at medium, Sonnet at high, and picking another model starts at that model's level. A model
   that takes no effort shows none. Picking an effort closes the menu. The model and effort are the
-  session's: each session keeps its own, so switching sessions switches them too, and a new session starts
+  session's, like its provider: each session keeps its own, so switching sessions switches them too (a
+  session shows its own as it opens, before its messages are read), and a new session starts
   with the last ones picked. A session moved to another provider takes that provider's choice; moved to
   another account of the same kind, it keeps its own. A message
   typed and not sent stays with its session (until the app quits), files attached included.
@@ -225,7 +231,8 @@ cargo clippy --workspace --all-targets -- -D warnings
   turn ran on it, and when each starts over); the account is the one the top bar names, so picking
   another there shows its numbers at once, and its address is not put on screen here. They are what
   Claude Code reports for that account with each turn, the same numbers its own `/usage` prints (an
-  account that has not replied yet says so); a window that is used up says *Limit reached* and when it
+  account that has not replied yet says so, and numbers that have stood ten minutes or more say since
+  when: only the account's replies in this app bring news of them); a window that is used up says *Limit reached* and when it
   starts over, and reaching a limit is said in a notice that names the account, counts down to when it
   lifts and goes away by itself then. A Codex account's limits are shown the same way, as Codex reports
   them (when the app starts and with each turn). A message after the
@@ -271,6 +278,15 @@ cargo clippy --workspace --all-targets -- -D warnings
   account's address shows anywhere in the app (the settings, the top bar's provider menu, the agent editor,
   the statistics); an account shows its plan only, "Signed in · Claude Max". Signing in still happens in
   Claude Code's or Codex's own terminal, which shows the address.
+- **Installing and updating.** Windows has an installer, `AtroxaBot-Setup-x86_64.exe` on the
+  [releases page](https://github.com/Atroxabot/atroxabot/releases/latest): it installs for you alone,
+  without an administrator, with an entry in the Start menu and one among the installed apps to remove it
+  by. Removing it leaves your agents and sessions (`~/.atroxabot`) where they are. macOS and Linux have an
+  archive (see *Releases*). Updating is a button: Settings, General, *Check for updates* looks at the newest
+  release on GitHub, *Update* downloads it, and *Restart to update* puts it in place and starts it. Every
+  step is your click: the app never looks for a release by itself, at start or in the background, and a
+  downloaded version waits until you restart into it. A release is only taken when it is signed with
+  AtroxaBot's release key, newer than what runs, and byte for byte the file that was signed.
 - **Looks.** The app draws its own title bar, the sidebar sits on the window and the session floats beside
   it on a rounded canvas, with the side panel on one of its own; the agent editor, the settings, the
   statistics, the spotlight, a file's diff and a picture open over them as modals. Three themes: Black
@@ -356,6 +372,55 @@ out** (the handshake, models, threads, resuming, a turn that fails for want of a
 interrupting, compaction); replies, tool calls, approvals, questions, plans, usage, limits and sub-agents
 are written from Codex's own protocol types and were not run against a signed-in account.
 
+## Releases
+
+The version lives in one place: `version` under `[workspace.package]` in `Cargo.toml`. The settings show
+it, the Windows executable carries it (its file properties and the Task Manager say "AtroxaBot" and the
+version), the installer writes it into Windows' list of installed apps, and a release's tag is `v` and it.
+
+```sh
+sh packaging/release.sh 1.2.3     # sets the version, commits that, tags the commit v1.2.3
+git push origin HEAD v1.2.3       # publishes
+```
+
+Pushing the tag starts the release pipeline (`.github/workflows/ci.yml`). It refuses a tag that is not the
+version in `Cargo.toml`, builds every platform, signs the release, checks it with the app's own code, and
+publishes it on GitHub all at once:
+
+| File | For |
+|---|---|
+| `AtroxaBot-Setup-x86_64.exe` | Windows: the installer (Inno Setup, `packaging/windows/atroxabot.iss`). |
+| `atroxabot-windows-x86_64.zip` | Windows, without installing: the executable and the licenses. |
+| `atroxabot-windows-x86_64.exe` | What the app on Windows updates itself from. |
+| `atroxabot-macos-arm64.tar.gz` | macOS on Apple silicon: `AtroxaBot.app`. Also what the app there updates itself from. |
+| `atroxabot-linux-x86_64.tar.gz` | Linux: the binary and `install.sh`. Also what the app there updates itself from. |
+| `update.manifest` | What the release is, signed: the version, and the size and SHA-256 of the three files the app updates itself from. |
+
+How the app takes an update (`crates/core/src/update.rs`, whose module comment is the rule book):
+
+- It asks GitHub for the newest release's `update.manifest`, and only when you click *Check for updates*.
+- The manifest must be signed with the release key (Ed25519). The key's public half is
+  `packaging/update-key.pub`, compiled into the app. Its private half is the repository's Actions secret
+  `UPDATE_SIGNING_KEY` and is never in the repository. Keep a copy of it somewhere safe: without it no
+  installed copy can be updated any more (each would have to be installed again by hand, with a new key),
+  and whoever has it and can publish a release here can update every installed copy.
+- The version in the manifest must be newer than the one that runs.
+- The download must have the size and the SHA-256 the manifest gives it, before it is unpacked or put in
+  place.
+- Putting it in place moves what the app runs from aside (the executable on Windows and Linux, the whole
+  `AtroxaBot.app` on macOS) and the new version in; if that fails the old one is moved back. The new
+  version starts, waits for the old one to close, and clears away what was left beside it
+  (`atroxabot.exe.old`). On Windows it also writes its version into the installer's entry among the
+  installed apps.
+
+So the app must be able to write to the folder it runs from. The installer's folder
+(`%LOCALAPPDATA%\Programs\AtroxaBot`) is one; where it cannot, the settings say so and offer the download
+page.
+
+To build the installer on your own computer: install [Inno Setup 6](https://jrsoftware.org/isinfo.php),
+`cargo build --release -p atroxabot`, copy the license texts into `licenses/` as the pipeline does, and
+`iscc /DVersion=1.2.3 packaging\windows\atroxabot.iss`.
+
 ## Layout
 
 | Crate | Purpose |
@@ -363,7 +428,7 @@ are written from Codex's own protocol types and were not run against a signed-in
 | `crates/claude-agent` (`atroxabot-claude-agent`) | Rust port of the Claude Agent SDK's transport and control protocol. Only dependency: `serde_json`. |
 | `crates/codex` (`atroxabot-codex`) | Drives the installed Codex CLI through `codex app-server`: the handshake, threads and turns as a state machine without I/O (`machine.rs`), its messages (`parse.rs`), the process (`session.rs`), finding the binary (`cli.rs`). Only dependency: `serde_json`. |
 | `crates/mcp` (`atroxabot-mcp`) | A small MCP client (stdio and Streamable HTTP): lists a server's tools and calls them. |
-| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Anthropic's Messages in `messages.rs`, OpenAI's Responses in `openai.rs`, Chat Completions in `completions.rs`); the agent loop and its tools (`engine.rs`, `tools.rs`, and `pattern.rs`, the regular expressions `search` reads); the Claude Agent and Codex engines (`claude.rs`, `codex.rs`); usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the sessions' worktrees and their cleaning up (`worktree.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
+| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Anthropic's Messages in `messages.rs`, OpenAI's Responses in `openai.rs`, Chat Completions in `completions.rs`); the agent loop and its tools (`engine.rs`, `tools.rs`, and `pattern.rs`, the regular expressions `search` reads); the Claude Agent and Codex engines (`claude.rs`, `codex.rs`); usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the sessions' worktrees and their cleaning up (`worktree.rs`); updating the app from a signed release (`update.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
 | `crates/voice` (`atroxabot-voice`) | Fish Audio and ElevenLabs speech-to-text and text-to-speech, voice-activity detection, the call loop, and audio devices (`cpal`). |
 | `crates/desktop` | The app (`atroxabot`): winit window, wgpu renderer, text engine, immediate-mode UI. |
 
@@ -377,8 +442,12 @@ those into the saved transcript, so the app shows a Claude session, a Codex sess
 `shell/` (the screen: `sidebar.rs`, `thread.rs`, `composer.rs`, `queue.rs`, `limits.rs` (what a session
 does when its account runs out), `question.rs`,
 `menu.rs`, `panel.rs`, `picture.rs`, `spotlight.rs`, `stats.rs`, `agent_form.rs`, `settings.rs`, `skills.rs`,
-`worktrees.rs`,
+`worktrees.rs`, `update.rs` (the app's version and its update button),
 `call.rs`, `widgets.rs`), `app.rs` (events, threads, engines).
+
+`packaging/`: what a release is made with: the Windows installer's script and icon (`windows/`), the
+macOS bundle's `Info.plist`, the Linux launcher entry and `install.sh`, the release key's public half
+(`update-key.pub`), `release.sh` (makes a version) and `manifest.sh` (signs a release).
 
 The app redraws only when something changes. Model requests, tools, the Claude Agent's process, calls and
 file reads run on other threads and post results to the event loop; every file write goes through one
@@ -396,7 +465,8 @@ Everything lives in `~/.atroxabot/`:
   whether the side panel is open, the order you dragged the
   sessions into, when unused worktrees are cleaned up, the repositories worktrees were made in, and what a
   session does when its account runs out.
-- `usage.jsonl`: what every reply used (when, which agent, session, provider and model, its tokens, cost
+- `usage.jsonl`: what every reply used (when, which agent, session, the provider its turn ran on and the
+  model, its tokens, cost
   and tool calls), a line each. The statistics are counted from it; it is started once from the saved
   sessions and only added to after that. `limits.json`: each Claude account's plan limits as last
   reported.
@@ -411,7 +481,7 @@ Everything lives in `~/.atroxabot/`:
   makes and removes them; agents' file tools may work in them as in any folder.
 - `codex/<id>/`: the Codex home of each extra Codex account. Codex owns what is in it. Removing an account
   in Settings leaves the folder, and so its sign-in, where it is.
-- `sessions/<id>.json`: one file per session, with its folder (and its worktree, if it has one) and the model and effort chosen in it, and for an API session the system prompt it began with, its replies as they arrived and the pictures its tools showed; `.index.json` next to them holds titles.
+- `sessions/<id>.json`: one file per session, with its folder (and its worktree, if it has one) and the provider, model and effort it keeps, and for an API session the system prompt it began with, its replies as they arrived and the pictures its tools showed; `.index.json` next to them holds what the sidebar and an opening session need: titles, and each session's provider, model and effort.
 - `claude/<id>/`: the Claude Code configuration folder of each extra Claude account. Claude Code owns what
   is in it. Removing an account in Settings leaves the folder, and so its sign-in, where it is.
 - `desktop.log`, `desktop-crash.log`, `desktop.lock`.
@@ -473,7 +543,10 @@ saved for.
 - An agent's picture is used from where it is on disk; move the file and the drawn face comes back.
 - While the window is in the tray (or hidden on macOS) nothing says that an agent finished or waits for an
   approval: there are no system notifications yet. Linux has no tray icon (that needs a D-Bus client).
-- Release builds are unsigned and there are no installers.
+- Release builds are not code-signed: Windows warns when the installer is first run (*More info*, *Run
+  anyway*), and macOS when the app is first opened. Only Windows has an installer.
+- The app's own update is tested on Windows up to the swap (the checks, the download, putting it in
+  place); on macOS and Linux it is written and unit-tested, and has not been run against a real release.
 
 ## License
 

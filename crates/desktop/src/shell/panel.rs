@@ -14,7 +14,7 @@ use winit::window::CursorIcon;
 use super::menu::Menu;
 use super::thread::{Thread, agent_mark};
 use super::widgets::{Scroll, dropdown, field_label, modal};
-use super::{Modal, Shell, compact, money, until};
+use super::{Modal, Shell, ago, compact, money, until};
 use crate::app::Action;
 use crate::paint::{Color, Painter, Rect, fade, mix};
 use crate::text::Style;
@@ -33,6 +33,8 @@ const TAB: &str = "    ";
 const TASKS_SHOWN: usize = 8;
 /// Most subagents of a turn listed at once.
 const AGENTS_SHOWN: usize = 8;
+/// How old an account's plan limits may be, in seconds, before the panel says so.
+const FRESH: u64 = 10 * 60;
 /// The diff's text.
 const MONO: Style = Style::mono(12.5);
 
@@ -76,6 +78,16 @@ fn window_name(name: &str) -> String {
             None => other.replace('_', " "),
         },
     }
+}
+
+/// How old plan limits last reported at `at` are at `now`, once they are
+/// no longer fresh: news of an account only comes with its replies in this
+/// app, so numbers that have stood a while say since when.
+fn limits_age(at: u64, now: u64) -> Option<String> {
+    if at == 0 {
+        return Some("Kept from an earlier run".to_owned());
+    }
+    (now.saturating_sub(at) >= FRESH).then(|| format!("Reported {} ago", ago(now, at)))
 }
 
 /// A plan's limits as bars, one per window, each with how much is used
@@ -452,17 +464,19 @@ impl Shell {
         y + 6.0
     }
 
-    /// The Claude account whose plan limits the panel shows: the one the top
-    /// bar names, which the next message goes to (whatever account the open
-    /// session ran on before). `None` when that is an API provider.
+    /// The account whose plan limits the panel shows: the one the top bar
+    /// names, which the open session thinks through and its next message
+    /// goes to (whatever account it ran on before). `None` when that is an
+    /// API provider.
     pub(super) fn limits_account(&self) -> Option<String> {
-        let connection = self.selected_agent().and_then(|agent| self.connection(agent))?;
+        let connection = self.agent_in_use().and_then(|agent| self.connection(&agent))?;
         connection.kind.is_account().then_some(connection.id)
     }
 
     /// Where the plan limits of the Claude account the top bar names stand,
     /// as Claude Code last reported them: a bar per window and when it
-    /// starts over, or a line saying they come with its next reply. Who is
+    /// starts over (and since when they stand, once that is a while), or a
+    /// line saying they come with its next reply. Who is
     /// signed in to it is not put on screen here. Returns where they end
     /// (`y` itself for an API provider).
     fn draw_limits(&self, p: &mut Painter, (x, mut y, w): (f32, f32, f32)) -> f32 {
@@ -473,7 +487,12 @@ impl Shell {
         field_label(p, icon::ACTIVITY, "PLAN USAGE", x, y);
         y += 28.0;
         if let Some(limits) = self.limits.get(&account).filter(|limits| !limits.windows.is_empty()) {
-            return limit_bars(p, limits, (x, y, w));
+            y = limit_bars(p, limits, (x, y, w));
+            if let Some(age) = limits_age(limits.at, atroxabot_core::unix_now()) {
+                p.label(&age, theme::TINY, x, y, t.text_faint);
+                y += 26.0;
+            }
+            return y;
         }
         let note = p.layout("Known after this account's next reply.", theme::SMALL, Some(w));
         p.text(&note, x, y, t.text_faint);
@@ -675,6 +694,17 @@ In the parser"
         let names =
             ["five_hour", "seven_day", "seven_day_overage_included", "seven_day_opus", "monthly_cap"].map(window_name);
         assert_eq!(names, ["5-hour limit", "Weekly limit", "Weekly, Fable", "Weekly, Opus", "monthly cap"]);
+    }
+
+    #[test]
+    fn limits_that_stood_a_while_say_since_when() {
+        let now = 1_000_000;
+        assert_eq!(limits_age(now, now), None, "just reported");
+        assert_eq!(limits_age(now - FRESH + 1, now), None, "still fresh");
+        assert_eq!(limits_age(now - FRESH, now).as_deref(), Some("Reported 10m ago"));
+        assert_eq!(limits_age(now - 15 * 3600, now).as_deref(), Some("Reported 15h ago"));
+        assert_eq!(limits_age(now + 60, now), None, "a clock that went back");
+        assert_eq!(limits_age(0, now).as_deref(), Some("Kept from an earlier run"));
     }
 
     #[test]

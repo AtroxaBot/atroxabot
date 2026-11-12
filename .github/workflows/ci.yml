@@ -1,5 +1,6 @@
-# Lint, test and build on every OS we ship. Pushing a `v*` tag also
-# publishes release binaries to a GitHub release of that name.
+# Lint, test and build on every OS we ship. Pushing a `v*` tag also builds
+# the release of that version, signs it and publishes it on GitHub, where
+# the app's "Check for updates" finds it (`packaging/release.sh` makes the tag).
 name: CI
 
 on:
@@ -38,12 +39,10 @@ jobs:
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - run: cargo test --workspace --locked
 
-  release:
-    name: Release (${{ matrix.os }})
+  build:
+    name: Build (${{ matrix.os }})
     if: startsWith(github.ref, 'refs/tags/v')
     needs: check
-    permissions:
-      contents: write
     strategy:
       matrix:
         include:
@@ -56,25 +55,38 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v5
+      # The version lives in Cargo.toml: the app compares itself with a
+      # release by it, so a tag that says something else is not released.
+      - name: The tag is the version in Cargo.toml
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)".*/\1/p' Cargo.toml | head -n 1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::The tag is $GITHUB_REF_NAME, but Cargo.toml says version $version. Use packaging/release.sh."
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       # cpal records and plays through ALSA, whose headers Linux builds need.
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev
       - run: cargo build --release --locked -p atroxabot
-      # Windows: the exe carries its icon (build.rs). macOS: an AtroxaBot.app
-      # bundle, whose icon the Dock shows. Linux: the binary with a launcher
-      # entry, icon and install.sh, so desktops show its name and icon.
+      # Windows: the exe carries its icon and version (build.rs); it goes out
+      # in an installer, in a zip, and bare (what the app updates itself
+      # from). macOS: an AtroxaBot.app bundle, whose icon the Dock shows.
+      # Linux: the binary with a launcher entry, icon and install.sh, so
+      # desktops show its name and icon.
       - name: Package
         shell: bash
         run: |
           icons=crates/desktop/assets/icon
           # Every archive carries AtroxaBot's licenses and the bundled fonts'.
-          mkdir licenses
+          mkdir licenses dist
           cp LICENSE-MIT LICENSE-APACHE crates/desktop/assets/*-LICENSE.txt licenses/
           case "$RUNNER_OS" in
             Windows)
-              7z a "${{ matrix.archive }}" ./target/release/atroxabot.exe ./licenses
+              7z a "dist/${{ matrix.archive }}" ./target/release/atroxabot.exe ./licenses
+              cp target/release/atroxabot.exe dist/atroxabot-windows-x86_64.exe
               ;;
             macOS)
               app=AtroxaBot.app
@@ -88,7 +100,7 @@ jobs:
               iconutil -c icns AppIcon.iconset -o "$app/Contents/Resources/AppIcon.icns"
               # Ad-hoc sign the bundle as a whole; Apple silicon refuses unsigned code.
               codesign --force --deep --sign - "$app"
-              tar czf "${{ matrix.archive }}" "$app" licenses
+              tar czf "dist/${{ matrix.archive }}" "$app" licenses
               ;;
             Linux)
               dir=atroxabot-linux-x86_64
@@ -97,9 +109,71 @@ jobs:
               cp "$icons/256.png" "$dir/atroxabot.png"
               cp -r licenses "$dir/"
               chmod +x "$dir/atroxabot" "$dir/install.sh"
-              tar czf "${{ matrix.archive }}" "$dir"
+              tar czf "dist/${{ matrix.archive }}" "$dir"
               ;;
           esac
+      # The installer (packaging/windows/atroxabot.iss), made with Inno Setup.
+      - name: Installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup --no-progress -y
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          $version = $env:GITHUB_REF_NAME.Substring(1)
+          & $iscc /Qp "/DVersion=$version" "/DOutput=$PWD\dist" packaging\windows\atroxabot.iss
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  # Every platform is built: sign what the app updates itself from, check
+  # the release is one the app takes, and only then put it out, all at once.
+  publish:
+    name: Publish
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+      - name: Sign
+        env:
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+        run: sh packaging/manifest.sh dist "${GITHUB_REF_NAME#v}"
+      # With the app's own code: its key, its reading of the manifest, its version.
+      - name: The app takes this release
+        shell: bash
+        env:
+          ATROXABOT_RELEASE: ${{ github.workspace }}/dist
+        run: |
+          cargo test -p atroxabot-core --locked --lib -- --ignored --exact \
+            update::tests::a_built_release_is_one_the_app_takes | tee checked.txt
+          # A check that was renamed away would pass by running nothing.
+          grep -q "1 passed" checked.txt
+      # A draft until every file is up: the app never sees half a release.
       - uses: softprops/action-gh-release@v2
         with:
-          files: ${{ matrix.archive }}
+          draft: true
+          generate_release_notes: true
+          files: dist/*
+          body: |
+            **Windows:** download `AtroxaBot-Setup-x86_64.exe` and run it. It installs for you alone, without an administrator. Windows may say the publisher is unknown, as the installer is not code-signed yet: choose *More info*, then *Run anyway*.
+            **macOS (Apple silicon):** `atroxabot-macos-arm64.tar.gz` holds `AtroxaBot.app`. **Linux:** `atroxabot-linux-x86_64.tar.gz`, then `./install.sh`.
+
+            Already installed? Open Settings, General, and click **Check for updates**. The other files (`atroxabot-windows-x86_64.exe`, `update.manifest`) are what the app updates itself from.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release edit "$GITHUB_REF_NAME" --draft=false --latest

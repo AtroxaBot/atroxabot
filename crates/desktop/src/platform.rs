@@ -70,6 +70,23 @@ pub fn open_folder(path: &Path) -> io::Result<()> {
     launch(command)
 }
 
+/// Says that the app runs, where the installer looks (`AppMutex` in
+/// `packaging/windows/atroxabot.iss`): a mutex of this name, held until the
+/// process ends. Setup and the uninstaller then ask to quit the app first
+/// instead of failing on a file that is in use.
+#[cfg(target_os = "windows")]
+pub fn mark_running() {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateMutexW(attributes: *const std::ffi::c_void, owned: i32, name: *const u16) -> *mut std::ffi::c_void;
+    }
+    let name = wide("AtroxaBot.Running");
+    // SAFETY: the name is NUL-terminated UTF-16 that outlives the call, and
+    // null attributes are allowed. The handle is kept open on purpose: the
+    // mutex is to exist for as long as the process does.
+    let _held = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+}
+
 /// Shows a native error dialog with `title` and `message` and waits until
 /// the user closes it. For failures the window cannot show (it failed to
 /// start, or the app is crashing); safe from any thread. Does nothing where

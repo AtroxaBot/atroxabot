@@ -78,9 +78,8 @@ impl Shell {
         }
         // Claude Code keeps what it is handed and answers it after the stop. Codex would drop it with the turn
         // it was put into: there it goes as the next message instead, once the turn has stopped.
-        let owner = self.agents.iter().find(|agent| agent.id == thread.session.agent);
-        let kept = owner.and_then(|agent| self.config.connection(&agent.connection)).map(|connection| connection.kind)
-            != Some(ConnectionKind::Codex);
+        let kept =
+            self.config.connection(&thread.sent_on).map(|connection| connection.kind) != Some(ConnectionKind::Codex);
         for waiting in thread.follow_ups.iter_mut().filter(|w| kept && !w.sent && !is_command(&w.message.text)) {
             waiting.sent = true;
             actions.push(Action::FollowUp { session: session.to_owned(), message: Box::new(waiting.message.clone()) });

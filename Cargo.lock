@@ -188,6 +188,7 @@ dependencies = [
  "atroxabot-codex",
  "atroxabot-mcp",
  "flate2",
+ "ring",
  "serde",
  "serde_json",
  "ureq",

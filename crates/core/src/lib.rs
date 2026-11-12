@@ -11,6 +11,7 @@
 //!
 //! * [`skills`]: the skills every agent has, and the repositories they come from.
 //! * [`worktree`]: a git worktree of its own for a session, and the cleaning up after it.
+//! * [`update`]: the newest release, looked for and installed when the user asks.
 //!
 //! All network calls and tools are blocking; run them off the UI thread.
 
@@ -34,6 +35,7 @@ pub mod skills;
 mod sse;
 pub mod stats;
 pub mod tools;
+pub mod update;
 pub mod worktree;
 
 pub use agent::{Agent, AgentVoice, Autonomy, CALL_ENDED, CALL_STARTED, FOLLOW_UP, INTERRUPTING, Records};

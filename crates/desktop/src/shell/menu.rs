@@ -509,7 +509,6 @@ impl Shell {
     /// The choices of `menu`, narrowed by `query`.
     fn menu_items(&self, menu: Menu, query: &str) -> Vec<Item> {
         let form = self.form();
-        let agent = self.selected_agent();
         match menu {
             Menu::Model => self
                 .agent_in_use()
@@ -517,7 +516,8 @@ impl Shell {
                 .map(|(connection, agent)| self.model_items(&connection, &agent.model, query))
                 .unwrap_or_default(),
             Menu::Provider => {
-                let mut items = self.provider_items(agent.map_or("", |agent| agent.connection.as_str()));
+                let in_use = self.agent_in_use().map(|agent| agent.connection).unwrap_or_default();
+                let mut items = self.provider_items(&in_use);
                 items.push(Item {
                     value: "manage".to_owned(),
                     glyph: Some(icon::SETTINGS),
@@ -657,8 +657,8 @@ impl Shell {
                 let default = self.default_model(&agent.connection);
                 let model = if default.as_deref() == Some(value) { String::new() } else { value.to_owned() };
                 if model != agent.model {
-                    // Another model thinks at its own usual effort.
-                    agent.effort.clear();
+                    // The effort chosen stays: a model that does not take it thinks at its
+                    // usual one (`effort_in_use`), and it comes back with a model that does.
                     agent.model = model;
                     self.choose_thinking(agent, actions);
                 }
@@ -666,14 +666,7 @@ impl Shell {
             Menu::Provider if value == "manage" => {
                 self.modal = Some(Modal::Settings(Box::new(Settings::new(Tab::Providers))));
             }
-            Menu::Provider => {
-                let Some(agent) = self.selected_agent().cloned() else { return };
-                if agent.connection != value {
-                    // The user chose where its sessions go on: none waits for a limit to lift any more.
-                    self.cancel_resumes_of(&agent.id);
-                    self.move_agent(agent, value, actions);
-                }
-            }
+            Menu::Provider => self.swap_provider(value, actions),
             Menu::Folder if value == "choose" => actions.push(Action::PickFolder),
             Menu::Folder => self.set_folder(value, actions),
             Menu::FormProvider => {
@@ -1043,12 +1036,14 @@ mod tests {
         shell.choose(Menu::Model, "default", &mut actions);
         assert_eq!(shell.selected_agent().unwrap().model, "", "the default is not pinned");
 
-        // An effort chosen for one model does not follow to the next.
+        // An effort chosen for one model follows to the next.
         let mut agent = shell.selected_agent().unwrap().clone();
         agent.effort = "high".into();
         shell.update_agent(agent, &mut actions);
         shell.choose(Menu::Model, "fable", &mut actions);
-        assert_eq!(shell.selected_agent().unwrap().effort, "");
+        assert_eq!(shell.selected_agent().unwrap().effort, "high");
+        shell.choose(Menu::Model, "default", &mut actions);
+        assert_eq!(shell.selected_agent().unwrap().effort, "high");
     }
 
     #[test]
