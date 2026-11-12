@@ -272,6 +272,11 @@ pub struct Config {
     /// streaming or sharing it): an account shows its plan only.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub hide_emails: bool,
+    /// Whether Claude accounts stop guessing, after a reply, what the user
+    /// writes next (shown in the message box, taken with Tab). They guess
+    /// unless this is set.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub hide_suggestions: bool,
     /// The sessions in the order the user dragged them into, by id. One
     /// not named here (started since) comes before them.
     #[serde(skip_serializing_if = "Vec::is_empty")]

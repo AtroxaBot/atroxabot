@@ -246,9 +246,13 @@ pub(super) struct Thread {
     doing: String,
     /// A picture of the conversation that was just clicked, for the shell to open whole.
     pub clicked_picture: Option<String>,
-    /// The model and effort the last message went with: a Claude account's
-    /// process keeps the ones it started with, so other ones need a new process.
-    pub sent_with: Option<(String, String)>,
+    /// The model and effort the last message went with, and whether its
+    /// Claude process guesses the next message: a process keeps what it
+    /// started with, so other ones need a new process.
+    pub sent_with: Option<(String, String, bool)>,
+    /// What Claude Code guesses the user writes next, since the last turn
+    /// ended: shown in the empty message box, taken with Tab (`composer.rs`).
+    pub suggestion: Option<String>,
     /// The provider the last message went to, which its turn runs on; empty before the first.
     pub sent_on: String,
     /// The account's usage limit stopped the running turn, as its agent said.
@@ -293,6 +297,7 @@ impl Thread {
             doing: String::new(),
             clicked_picture: None,
             sent_with: None,
+            suggestion: None,
             sent_on: String::new(),
             limited: false,
             refused: false,
@@ -328,6 +333,8 @@ impl Thread {
     /// A turn starts: the view follows it.
     pub fn begin_turn(&mut self) {
         self.busy = true;
+        // A guess at what comes after the last turn is no use once another runs.
+        self.suggestion = None;
         self.stopping = false;
         (self.limited, self.refused) = (false, false);
         // Whatever started it, the session is not waiting to go on any more.

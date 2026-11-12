@@ -1201,7 +1201,7 @@ impl App {
                         .map_err(|e| e.to_string())
                 } else {
                     let mcp = atroxabot_core::claude_mcp_config(servers);
-                    ClaudeAgent::connect(agent, connection, &session, mcp, self.emitter(&id))
+                    ClaudeAgent::connect(agent, connection, &session, mcp, self.shell.suggesting(), self.emitter(&id))
                         .map(Live::Claude)
                         .map_err(|e| e.to_string())
                 };

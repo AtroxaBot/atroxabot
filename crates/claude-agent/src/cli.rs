@@ -184,6 +184,9 @@ pub(crate) fn build_args(options: &Options) -> Result<Vec<OsString>, Error> {
     if options.strict_mcp_config {
         add(&mut args, &["--strict-mcp-config"]);
     }
+    if options.prompt_suggestions {
+        add(&mut args, &["--prompt-suggestions"]);
+    }
     if options.fork_session {
         add(&mut args, &["--fork-session"]);
     }
@@ -242,6 +245,7 @@ mod tests {
             strict_mcp_config: true,
             setting_sources: Some(vec!["user".into(), "project".into()]),
             include_partial_messages: true,
+            prompt_suggestions: true,
             ask_permissions: true,
             env: Vec::new(),
             extra_args: vec![
@@ -277,6 +281,7 @@ mod tests {
             "{\"mcpServers\":{}}",
             "--include-partial-messages",
             "--strict-mcp-config",
+            "--prompt-suggestions",
             "--fork-session",
             "--setting-sources=user,project",
             "--debug",

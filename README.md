@@ -275,6 +275,15 @@ cargo clippy --workspace --all-targets -- -D warnings
   opens it again, and its menu opens it or quits; starting AtroxaBot again also brings the window back. On
   macOS the app hides as with Cmd+H, and its Dock icon brings it back. Linux has no tray here, so there the
   window is minimised. The other choices are to minimise or to quit. Ctrl+Q quits (Cmd+Q on macOS).
+- **Suggested next message** (Claude accounts): after a reply, Claude Code guesses what you will write
+  next, and the empty message box shows it a shade lighter than text, with a *Tab* key beside it. Tab (or a
+  click on the key) writes it in, to send as it is or change first; Esc puts it away; typing anything else
+  hides it. It goes when the next turn starts, and is not kept with the session. Each guess is a small extra
+  request on the account, mostly read from the prompt cache; Claude Code skips it early in a session, when
+  the cache has gone cold, when the account is near its limit or on extra usage, and more often when its
+  guesses go unused. Settings, General, *Suggest what to say next* turns it off (a session's Claude Code
+  then starts again without it at its next message). Not for API providers, where every guess would be a
+  request the app pays for itself, and not for Codex, whose app server does not offer it yet.
 - **Hiding email addresses** (Settings, General, *Privacy*): for streaming or sharing your screen, no
   account's address shows anywhere in the app (the settings, the top bar's provider menu, the agent editor,
   the statistics); an account shows its plan only, "Signed in · Claude Max". Signing in still happens in
@@ -316,6 +325,8 @@ is written to keep them there:
   usage limits are what Claude Code itself reports.
 - **The skill library** reaches Claude Code through its documented `--plugin-dir` flag, which loads a
   plugin for that session only: nothing is installed into, or read from, an account's folder.
+- **The suggested next message** is Claude Code's own `--prompt-suggestions` flag (the Agent SDK's
+  `promptSuggestions` option): Claude Code makes the guess and sends it after the turn; AtroxaBot only shows it.
 - Besides `CLAUDE_CONFIG_DIR`, AtroxaBot sets what the official Agent SDK sets so that Claude Code reports
   when it runs a turn (`CLAUDE_CODE_SDK_READS_SESSION_STATE`). It does not set the variables that would say
   it is Anthropic's SDK (`CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`).
@@ -462,7 +473,7 @@ To look at the design without opening the app, draw every screen offscreen in ev
 Everything lives in `~/.atroxabot/`:
 
 - `config.json`: providers (with their API keys), voice providers (with theirs), MCP servers, recent
-  folders, the theme, window and zoom, what closing the window does, whether email addresses are hidden,
+  folders, the theme, window and zoom, what closing the window does, whether email addresses are hidden, whether Claude accounts suggest the next message,
   whether the side panel is open, the order you dragged the
   sessions into, when unused worktrees are cleaned up, the repositories worktrees were made in, and what a
   session does when its account runs out.

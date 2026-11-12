@@ -175,6 +175,10 @@ pub enum AgentEvent {
     /// answered, in turns of their own that follow at once. Comes just
     /// before [`AgentEvent::TurnEnded`], and only when there are some.
     Queued(u64),
+    /// What the user may write next, as Claude Code guesses it. Comes a
+    /// moment after [`AgentEvent::TurnEnded`], and not after every turn;
+    /// nothing of it is kept in the session.
+    Suggestion(String),
     /// The turn is over; `problem` says why if it did not end well.
     TurnEnded {
         /// What went wrong, if anything.
@@ -364,6 +368,7 @@ impl Session {
                 self.entries.push(Entry::User { text: text.clone(), note: note.clone(), files: files.clone() });
             }
             AgentEvent::Queued(_)
+            | AgentEvent::Suggestion(_)
             | AgentEvent::Working
             | AgentEvent::Permission(_)
             | AgentEvent::PermissionGone(_)

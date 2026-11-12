@@ -146,7 +146,79 @@ impl Composer {
     }
 }
 
+/// Draws what the agent guesses the user writes next, in the empty message
+/// box at `(x, y)`, `width` wide: the words where the user's would be, a
+/// shade lighter than text, then the key that takes them. It fades in as it
+/// arrives. Returns whether the key was clicked.
+fn draw_suggestion(p: &mut Painter, ui: &mut Ui, guess: &str, (x, y, width): (f32, f32, f32), line_h: f32) -> bool {
+    let t = p.theme;
+    let key = p.layout("Tab", theme::TINY, None);
+    let key_w = key.width() + 14.0;
+    // One line: what does not fit ends in an ellipsis, the key stays in view.
+    let mut words = p.layout(guess, theme::BODY, None);
+    words.truncate(p.fonts, width - key_w - 12.0);
+    let shown = ui.appear(id(("suggestion", guess)));
+    p.text(&words, x, y, fade(mix(t.text_faint, t.text_muted, 0.55), shown));
+    let cap = Rect::new(x + words.width() + 10.0, y + ((line_h - 20.0) * 0.5).round(), key_w, 20.0);
+    let hovered = ui.hovered(cap);
+    let hover = ui.anim(id("suggestion-key"), f32::from(u8::from(hovered)));
+    p.bordered(cap, fade(mix(t.surface, t.hover, 0.5 + 0.5 * hover), shown), 5.0, 1.0, fade(t.border_strong, shown));
+    p.text(&key, cap.x + 7.0, cap.y + ((cap.h - key.height()) * 0.5).round(), fade(t.text_muted, shown));
+    if hovered {
+        ui.cursor = CursorIcon::Pointer;
+    }
+    ui.clicked(cap)
+}
+
 impl Shell {
+    /// Whether Claude accounts guess the user's next message after a turn.
+    pub fn suggesting(&self) -> bool {
+        !self.config.hide_suggestions
+    }
+
+    /// Turns the guessing on or off. Off, what was guessed goes at once; a
+    /// running process goes on guessing until the session's next message,
+    /// which starts one without it (`sent_with`), and is not shown meanwhile.
+    pub(super) fn set_suggesting(&mut self, on: bool) {
+        self.config.hide_suggestions = !on;
+        if !on {
+            for thread in self.threads.values_mut() {
+                thread.suggestion = None;
+            }
+        }
+    }
+
+    /// What the agent guesses the user writes next, while the message box
+    /// would show it: the open session is between turns on a Claude account,
+    /// nothing is written or attached, and nothing else waits for an answer.
+    pub(super) fn suggestion_shown(&self) -> Option<&str> {
+        let thread = self.thread().filter(|thread| thread.loaded && !thread.busy && thread.asks.is_empty())?;
+        let guess = thread.suggestion.as_deref().filter(|_| self.suggesting())?;
+        let composer = &self.composer;
+        let empty = composer.editor.text().is_empty() && composer.files.is_empty() && composer.preedit.is_none();
+        let claude = self.agent_in_use().is_some_and(|agent| {
+            self.config.connection(&agent.connection).is_some_and(|c| c.kind == ConnectionKind::ClaudeAgent)
+        });
+        (empty && claude && self.renaming.is_none() && self.call.is_none()).then_some(guess)
+    }
+
+    /// Writes the guess into the message box, to send or change; it is
+    /// taken, so it does not come back once the box is emptied.
+    pub(super) fn take_suggestion(&mut self) {
+        let Some(guess) = self.suggestion_shown().map(str::to_owned) else { return };
+        if let Some(thread) = self.thread_mut() {
+            thread.suggestion = None;
+        }
+        self.composer.editor.insert(&guess);
+    }
+
+    /// Puts the guess away.
+    pub(super) fn drop_suggestion(&mut self) {
+        if let Some(thread) = self.thread_mut() {
+            thread.suggestion = None;
+        }
+    }
+
     /// Draws the composer at the foot of `canvas`, with a pending approval
     /// above it. Returns the top edge of what it drew.
     pub(super) fn draw_composer(
@@ -164,6 +236,8 @@ impl Shell {
         let text_w = width - 2.0 * pad;
         let elsewhere = self.renaming.is_some() || self.answering();
         let typing = ui.focused && self.menu.is_none() && self.modal.is_none() && !elsewhere;
+        let guess = self.suggestion_shown().map(str::to_owned);
+        let mut take_guess = false;
         let composer = &mut self.composer;
 
         // With an input method composing, show its text at the caret.
@@ -232,7 +306,9 @@ impl Shell {
                 p.rect(Rect::new(origin.0 + x0, origin.1 + y, x1 - x0, line_h), t.selection, 2.0);
             }
         }
-        if shown.is_empty() {
+        if let Some(guess) = guess.as_deref().filter(|_| shown.is_empty()) {
+            take_guess = draw_suggestion(p, ui, guess, (origin.0, origin.1, text_w), line_h);
+        } else if shown.is_empty() {
             p.label(&format!("Message {}", agent.name), theme::BODY, origin.0, origin.1, t.text_faint);
         } else {
             p.text(&layout, origin.0, origin.1, t.text);
@@ -252,6 +328,9 @@ impl Shell {
         }
         p.set_clip(clip);
         self.composer.layout = if preedit.is_none() { Some((layout, origin)) } else { None };
+        if take_guess {
+            self.take_suggestion();
+        }
 
         // Under the text: files to send along at the left, what the agent thinks with at the right.
         let item_y = card.bottom() - 9.0 - 30.0;

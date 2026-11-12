@@ -134,6 +134,11 @@ pub(crate) fn parse_line(line: &str) -> Parsed {
         }
         "control_cancel_request" => Event::PermissionCancelled { request_id: text(&data, "request_id") },
         "rate_limit_event" => Event::RateLimit(rate_limit(field(&data, "rate_limit_info"))),
+        // An empty guess is no guess.
+        "prompt_suggestion" => match opt_text(&data, "suggestion").filter(|text| !text.trim().is_empty()) {
+            Some(text) => Event::PromptSuggestion(text),
+            None => return Parsed::Nothing,
+        },
         _ => Event::Other { subtype: text(&data, "subtype"), kind, raw: data },
     })
 }
@@ -449,6 +454,15 @@ mod tests {
         let windows: Vec<(&str, f64)> = limits.windows.iter().map(|w| (w.name.as_str(), w.utilization)).collect();
         assert_eq!(windows, [("five_hour", 0.1), ("seven_day", 0.58)], "what is no window is left out");
         assert_eq!(event(r#"{"type":"rate_limit_event"}"#), Event::RateLimit(RateLimit::default()));
+        // As Claude Code 2.1.322 sends it, a moment after the turn's result.
+        let guess =
+            r#"{"type":"prompt_suggestion","suggestion":"Show me a full example program","uuid":"u","session_id":"s"}"#;
+        assert_eq!(event(guess), Event::PromptSuggestion("Show me a full example program".into()));
+        for nothing in
+            [r#"{"type":"prompt_suggestion","suggestion":"  "}"#, r#"{"type":"prompt_suggestion","suggestion":7}"#]
+        {
+            assert!(matches!(parse_line(nothing), Parsed::Nothing), "{nothing}");
+        }
         // A window without a number: full when it refused, left out (what was known stands) otherwise.
         let refused = r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected","resetsAt":9,
             "rateLimitType":"five_hour","unifiedWindows":{"five_hour":{"status":"rejected","resetsAt":9},

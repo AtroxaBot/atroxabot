@@ -118,8 +118,9 @@ impl ClaudeAgent {
     /// Starts the binary for `agent` on the Claude account `connection`, in
     /// the folder of `session`, resuming the session's context when this
     /// account has it. `mcp` is the `--mcp-config` JSON of the app's own MCP
-    /// servers, if any. `emit` is called on a reader thread with everything
-    /// that happens.
+    /// servers, if any; with `suggest`, Claude Code guesses after a turn what
+    /// the user writes next ([`AgentEvent::Suggestion`]). `emit` is called on
+    /// a reader thread with everything that happens.
     ///
     /// # Errors
     /// The binary is not installed or could not be started.
@@ -128,6 +129,7 @@ impl ClaudeAgent {
         connection: &Connection,
         session: &Session,
         mcp: Option<String>,
+        suggest: bool,
         mut emit: impl FnMut(AgentEvent) + Send + 'static,
     ) -> Result<Self, sdk::Error> {
         let suggestions: Arc<Mutex<HashMap<String, Vec<Value>>>> = Arc::default();
@@ -137,6 +139,7 @@ impl ClaudeAgent {
         let follow_ups = Arc::clone(&mapper.follow_ups);
         let mut options = options(agent, connection, session);
         options.mcp_config = mcp;
+        options.prompt_suggestions = suggest;
         let session = sdk::Session::connect(&options, move |event| {
             if let sdk::Event::Permission(request) = &event
                 && let Ok(mut pending) = pending.lock()
@@ -568,6 +571,7 @@ impl Mapper {
                 }));
             }
             sdk::Event::PermissionCancelled { request_id } => out.push(AgentEvent::PermissionGone(request_id)),
+            sdk::Event::PromptSuggestion(text) => out.push(AgentEvent::Suggestion(text)),
             sdk::Event::Result(result) => {
                 self.begin(&mut out);
                 let said = result.result.filter(|text| !text.trim().is_empty());
@@ -765,6 +769,11 @@ mod tests {
         assert_eq!(
             mapper.map(task(sdk::TaskState::Completed, "")),
             [AgentEvent::Note("A background task finished: Wait for the build".into())]
+        );
+        // Its guess at what the user writes next comes after the turn, and is only passed on.
+        assert_eq!(
+            mapper.map(sdk::Event::PromptSuggestion("Run the tests".into())),
+            [AgentEvent::Suggestion("Run the tests".into())]
         );
         // Claude Code says it runs again before the model answers (an older one does not: the answer starts it).
         assert_eq!(mapper.map(sdk::Event::SessionState("running".into())), [AgentEvent::Working]);
@@ -1096,7 +1105,8 @@ mod live {
         let own = Connection::claude_agent();
         let info = claude_info(&own).unwrap();
         assert!(!info.models.is_empty() && !info.version.is_empty(), "the binary says what it offers");
-        let live = ClaudeAgent::connect(&agent, &own, &session, None, move |event| drop(events.send(event))).unwrap();
+        let live =
+            ClaudeAgent::connect(&agent, &own, &session, None, false, move |event| drop(events.send(event))).unwrap();
         live.send("ping", &[]).unwrap();
         let (mut said, mut remote, mut ended) = (String::new(), String::new(), None);
         while ended.is_none() {
@@ -1127,7 +1137,8 @@ mod live {
         let (events, inbox) = mpsc::channel();
         let mut session = Session { workdir: dir.display().to_string(), ..Session::new(&agent.id) };
         let own = Connection::claude_agent();
-        let live = ClaudeAgent::connect(&agent, &own, &session, None, move |event| drop(events.send(event))).unwrap();
+        let live =
+            ClaudeAgent::connect(&agent, &own, &session, None, false, move |event| drop(events.send(event))).unwrap();
         let ask = "With your task tools, make two tasks, 'Read the file' and 'Fix the bug', and mark the first \
             one completed. Do nothing else, then say done.";
         live.send(ask, &[]).unwrap();

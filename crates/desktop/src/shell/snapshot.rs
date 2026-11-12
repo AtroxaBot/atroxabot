@@ -186,6 +186,19 @@ fn snapshots() {
         }
         let mut slash = shell();
         slash.composer.editor.insert("/co");
+        // Between turns, Claude Code's guess at the next message waits in the empty message box; a long one is cut.
+        let guessing = |guess: &str| {
+            let mut guessing = shell();
+            if let Some(thread) = guessing.thread_mut() {
+                thread.busy = false;
+                thread.suggestion = Some(guess.to_owned());
+            }
+            guessing
+        };
+        let suggested = guessing("Add a test for an escaped quote at the very end");
+        let suggested_long = guessing(
+            "Now run the whole test suite, and if anything else fails because of the change, fix that too before you              commit the escape handling",
+        );
         // An `@` word: the folder's files that match it.
         let mut mention = shell();
         mention.composer.editor.insert("Why does @tok");
@@ -517,6 +530,8 @@ fn snapshots() {
             ("menu-autonomy", autonomy),
             ("settings-general", settings(Tab::General)),
             ("menu-close", closing),
+            ("suggestion", suggested),
+            ("suggestion-long", suggested_long),
             ("update-available", updating(Updater::Available(Release::unnamed(newer())))),
             ("update-downloading", updating(downloading)),
             ("update-ready", updating(Updater::Ready(Staged::nowhere(newer())))),

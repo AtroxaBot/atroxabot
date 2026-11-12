@@ -482,6 +482,18 @@ impl Settings {
         }
         y += 58.0 + 34.0;
 
+        // Claude Code's guess at the next message, in the message box: Claude accounts only.
+        p.label("Message box", theme::LABEL, x, y, t.text);
+        y += 30.0;
+        let rect = Rect::new(x, y, w, 58.0);
+        let about = "After a reply, Claude accounts guess your next message: Tab takes it. Uses a little usage.";
+        row(p, rect, (icon::SPARKLES, None), "Suggest what to say next", about, 70.0);
+        if toggle(p, ui, (rect.right() - 52.0, rect.y + 18.0), shell.suggesting(), "suggestions") {
+            shell.set_suggesting(!shell.suggesting());
+            actions.push(Action::SaveConfig);
+        }
+        y += 58.0 + 34.0;
+
         p.label("On this computer", theme::LABEL, x, y, t.text);
         y += 30.0;
         y = super::update::draw(p, ui, (x, y, w), shell, actions) + 8.0;

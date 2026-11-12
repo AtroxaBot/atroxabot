@@ -951,7 +951,8 @@ impl Shell {
         }
         thread.sent_on.clone_from(&connection.id);
         // An account's process thinks with what it was started with: other choices need a new one.
-        let with = (agent.model.clone(), agent.effort.clone());
+        let guesses = connection.kind == ConnectionKind::ClaudeAgent && !self.config.hide_suggestions;
+        let with = (agent.model.clone(), agent.effort.clone(), guesses);
         if connection.kind.is_account() && thread.sent_with.as_ref().is_some_and(|sent| *sent != with) {
             actions.push(Action::CloseLive(session.to_owned()));
         }
@@ -1083,6 +1084,7 @@ impl Shell {
     pub fn agent_event(&mut self, session: &str, event: AgentEvent, actions: &mut Vec<Action>) {
         let on_call = self.call.as_ref().is_some_and(|call| call.session == session);
         let speaking = on_call && self.call.as_ref().is_some_and(|call| !call.hold);
+        let suggesting = self.suggesting();
         let Some(thread) = self.threads.get_mut(session) else { return };
         thread.session.apply(&event);
         // What a subagent's response used is logged too, apart: it is no reply of the session's.
@@ -1163,6 +1165,8 @@ impl Shell {
             // Taken in: it is in the conversation now.
             AgentEvent::FollowUp { id, .. } => thread.follow_ups.retain(|waiting| waiting.message.id != id),
             AgentEvent::Queued(count) => thread.more = count,
+            // Only between turns: one that started since makes it stale.
+            AgentEvent::Suggestion(text) if suggesting && !thread.busy => thread.suggestion = Some(text),
             AgentEvent::TurnEnded { problem } => {
                 let (hurried, stopped) = (std::mem::take(&mut thread.hurry), thread.stopping);
                 // The account's usage limit stopped it: its agent said so, or it was refused and the turn failed.
@@ -1774,7 +1778,11 @@ impl Shell {
         if self.slash_key(event) || self.mention_key(event) {
             return;
         }
+        let guessed = self.suggestion_shown().is_some();
         match &event.logical_key {
+            // The message box shows what the agent guesses comes next: Tab writes it in, Esc puts it away.
+            Key::Named(NamedKey::Tab) if guessed && !mods.shift_key() => self.take_suggestion(),
+            Key::Named(NamedKey::Escape) if guessed && !asking => self.drop_suggestion(),
             // A paste with no text on the clipboard brings what else is there: files, or a picture.
             Key::Character(c) if primary && c.eq_ignore_ascii_case("v") => {
                 if clipboard.is_none() {
@@ -2397,6 +2405,47 @@ mod tests {
     }
 
     /// A shell whose agent (on a Claude account) is answering "Fix the bug": the session's id.
+    #[test]
+    fn claude_guesses_the_next_message_and_tab_takes_it() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        shell.start(&mut actions);
+        let session = working(&mut shell, &mut actions);
+        let guess = |text: &str| AgentEvent::Suggestion(text.into());
+        // During a turn a guess is stale before it could be read.
+        shell.agent_event(&session, guess("Too early"), &mut actions);
+        assert_eq!(shell.suggestion_shown(), None);
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        shell.agent_event(&session, guess("Run the tests"), &mut actions);
+        assert_eq!(shell.suggestion_shown(), Some("Run the tests"));
+        // Only while the box is empty.
+        shell.composer.editor.insert("Also");
+        assert_eq!(shell.suggestion_shown(), None);
+        shell.composer.editor.take();
+        assert_eq!(shell.suggestion_shown(), Some("Run the tests"));
+        // Tab writes it in, to send or to change; it does not come back once the box is emptied.
+        shell.take_suggestion();
+        assert_eq!(shell.composer.editor.text(), "Run the tests");
+        shell.composer.editor.take();
+        assert_eq!(shell.suggestion_shown(), None);
+        // A new turn makes the last guess stale.
+        shell.agent_event(&session, guess("Commit it"), &mut actions);
+        actions.clear();
+        shell.send("Run them", false, Vec::new(), &mut actions);
+        assert_eq!(shell.suggestion_shown(), None);
+        assert!(!actions.iter().any(|a| matches!(a, Action::CloseLive(_))), "the same process goes on");
+        // Turned off, what was guessed goes, and the next message starts a process that does not guess.
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        shell.agent_event(&session, guess("Commit it"), &mut actions);
+        shell.set_suggesting(false);
+        assert_eq!(shell.suggestion_shown(), None);
+        shell.agent_event(&session, guess("Push it"), &mut actions);
+        assert_eq!(shell.suggestion_shown(), None, "the old process may still guess: it is not shown");
+        actions.clear();
+        shell.send("Commit it", false, Vec::new(), &mut actions);
+        assert!(actions.iter().any(|a| matches!(a, Action::CloseLive(closed) if *closed == session)));
+    }
+
     fn working(shell: &mut Shell, actions: &mut Vec<Action>) -> String {
         signed_in(shell);
         shell.send("Fix the bug", false, Vec::new(), actions);

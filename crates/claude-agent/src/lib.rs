@@ -58,6 +58,11 @@ pub struct Options {
     pub setting_sources: Option<Vec<String>>,
     /// Stream the reply as [`Event::TextDelta`] / [`Event::ThinkingDelta`] (`--include-partial-messages`).
     pub include_partial_messages: bool,
+    /// After each turn, have the binary guess what the user will write next (`--prompt-suggestions`): it
+    /// arrives as an [`Event::PromptSuggestion`]. Each guess is a small request of its own on the account,
+    /// mostly read from the prompt cache; the binary skips it when it would cost more (early in a session,
+    /// a cold cache, an account near its limit or on extra usage) and when its guesses go unused.
+    pub prompt_suggestions: bool,
     /// Route permission prompts to this process (`--permission-prompt-tool stdio`): each arrives as an
     /// [`Event::Permission`] and waits for [`Session::respond`].
     pub ask_permissions: bool,
@@ -337,6 +342,9 @@ pub enum Event {
     },
     /// `rate_limit_event`: where the account's plan limits stand. Sent when they change.
     RateLimit(RateLimit),
+    /// `prompt_suggestion`: what the user may write next (needs [`Options::prompt_suggestions`]). Arrives a
+    /// moment after a turn's [`Event::Result`], and not after every turn.
+    PromptSuggestion(String),
     /// A subagent started, moved on or ended.
     Task(Task),
     /// `system`/`status`: what the binary is busy with besides the model (`compacting`), `None` once it is done.
