@@ -335,7 +335,7 @@ impl Shell {
                 if effort.is_empty() { model.label } else { format!("{} · {}", model.label, effort_label(&effort)) };
             let width = 58.0 + p.layout(&label, theme::SMALL, None).width().min(220.0);
             // The model wears its provider's mark.
-            let model = self.toolbar_button(p, ui, (send.x - 6.0 - width, item_y), (None, &label), Menu::Model);
+            let model = self.toolbar_button(p, ui, (send.x - 6.0 - width, item_y), (None, &label, 220.0), Menu::Model);
             self.provider_mark(p, &connection, (model.x + 17.0, model.y + 15.0), 15.0, t.text_muted);
             room = model.x - 8.0;
         }
@@ -704,12 +704,12 @@ impl Shell {
         p: &mut Painter,
         ui: &mut Ui,
         (x, y): (f32, f32),
-        (glyph, label): (Option<char>, &str),
+        (glyph, label, widest): (Option<char>, &str, f32),
         menu: Menu,
     ) -> Rect {
         let t = p.theme;
         let mut text = p.layout(label, theme::SMALL, None);
-        text.truncate(p.fonts, 220.0);
+        text.truncate(p.fonts, widest);
         let rect = Rect::new(x, y, 32.0 + text.width() + 26.0, 30.0);
         let open = self.menu_open(menu);
         let hovered = ui.hovered(rect);

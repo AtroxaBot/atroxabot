@@ -123,6 +123,17 @@ pub enum AgentEvent {
         /// One line on it.
         text: String,
     },
+    /// A task the agent's process runs in the background that is no
+    /// subagent (a command, a monitor) started or ended. It lives only as
+    /// long as that process: nothing of it is kept in the session.
+    Background {
+        /// The id of the tool call that started it.
+        id: String,
+        /// What it was started for; empty when not said, and on its end.
+        what: String,
+        /// Whether it ended.
+        ended: bool,
+    },
     /// The response is complete.
     ReplyEnded {
         /// The reply as its wire sent it, to replay; empty for the account engines.
@@ -372,6 +383,7 @@ impl Session {
                 self.entries.push(Entry::User { text: text.clone(), note: note.clone(), files: files.clone() });
             }
             AgentEvent::Queued(_)
+            | AgentEvent::Background { .. }
             | AgentEvent::Suggestion(_)
             | AgentEvent::Working
             | AgentEvent::Permission(_)

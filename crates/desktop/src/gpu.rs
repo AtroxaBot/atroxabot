@@ -109,6 +109,14 @@ pub struct Renderer {
     /// Raised when the device is lost (driver reset or update, GPU
     /// switched): the renderer must be created again.
     lost: Arc<AtomicBool>,
+    /// The window changed size since the surface was set up: it is set up
+    /// again once, before the next frame, however many sizes passed by.
+    resized: bool,
+    /// The window is minimised (zero-sized): nothing is drawn.
+    hidden: bool,
+    /// The last frame asked to be drawn again at once: the next one does
+    /// not, so a surface that keeps refusing cannot spin the loop.
+    retried: bool,
 }
 
 /// The pipeline, its atlases and buffers: what draws a frame, whatever
@@ -189,7 +197,7 @@ impl Renderer {
         };
         surface.configure(&device, &config);
         let draw = Draw::new(&device, format);
-        Ok(Self { surface, device, queue, config, draw, lost })
+        Ok(Self { surface, device, queue, config, draw, lost, resized: false, hidden: false, retried: false })
     }
 
     /// The device was lost: drawing does nothing until the renderer is
@@ -199,14 +207,15 @@ impl Renderer {
         self.lost.load(Ordering::Relaxed)
     }
 
-    /// Resizes the swapchain. Zero-sized (minimised) windows are ignored.
+    /// The window has a new size. The swapchain follows before the next
+    /// frame: setting it up waits for the GPU, so it is not done for every
+    /// step of a resize. A zero-sized (minimised) window draws nothing.
     pub fn resize(&mut self, width: u32, height: u32) {
-        if width == 0 || height == 0 {
-            return;
+        self.hidden = width == 0 || height == 0;
+        if !self.hidden && (width, height) != (self.config.width, self.config.height) {
+            (self.config.width, self.config.height) = (width, height);
+            self.resized = true;
         }
-        self.config.width = width;
-        self.config.height = height;
-        self.surface.configure(&self.device, &self.config);
     }
 
     /// Uploads pending glyphs and thumbnails and draws `instances` over `clear`.
@@ -218,8 +227,11 @@ impl Renderer {
         scale: f32,
         clear: [f32; 4],
     ) -> Frame {
-        if self.is_lost() {
+        if self.is_lost() || self.hidden {
             return Frame::Skipped;
+        }
+        if std::mem::take(&mut self.resized) {
+            self.surface.configure(&self.device, &self.config);
         }
         self.draw.upload(&self.queue, glyphs, images);
         let frame = match self.surface.get_current_texture() {
@@ -231,7 +243,8 @@ impl Renderer {
             }
             wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
-                return Frame::Retry;
+                // Once at once; a second time in a row it waits like a skipped frame.
+                return if std::mem::replace(&mut self.retried, true) { Frame::Skipped } else { Frame::Retry };
             }
             wgpu::CurrentSurfaceTexture::Timeout
             | wgpu::CurrentSurfaceTexture::Occluded
@@ -244,6 +257,7 @@ impl Renderer {
         let commands = self.draw.encode(&self.device, &self.queue, (&view, size), instances, scale, clear);
         self.queue.submit([commands]);
         self.queue.present(frame);
+        self.retried = false;
         Frame::Drawn
     }
 }

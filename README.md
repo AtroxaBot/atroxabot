@@ -390,7 +390,8 @@ server-side compaction on its own API, by a request of the app's elsewhere.
 
 ### Side panel, spotlight and statistics
 
-- **The side panel** (the last icon of the top bar):
+- **The side panel** (the last icon of the top bar). Where the window is too narrow to set it beside the
+  session, it floats over the session under the top bar; Esc or a click outside it puts it away.
   - What the session used and how full its context is. Rest the mouse on the context to see what it
     holds: the system prompt, the tools (the app's or Claude Code's, and those of MCP servers), the
     skills, memory files, the messages and the free space. A Claude account reports this after each turn
@@ -398,6 +399,11 @@ server-side compaction on its own API, by a request of the app's elsewhere.
     each part of its request and gives the conversation the rest of the tokens the provider counted. The
     session keeps the latest breakdown.
   - The tasks and subagents (see above), and the plan's limits (see *Plan limits*).
+  - What Claude Code runs in the background (a command, a monitor), while it runs. The session's
+    Claude Code process stays up for it when you open another session (the sidebar shows a still dot by
+    the session), so it can finish and the agent can answer it. Should the process end anyway (it
+    stopped, or the session's next message goes with another account, model or effort), a line in the
+    conversation says which task was stopped with it. Nothing of it outlives the app.
   - The git repository of the session's folder: the branch (a click switches it), how far it is from what
     it tracks, and the changed files with their added and removed lines (a click opens the diff).
     Committing and pushing are the agent's: the panel only shows. It uses your installed `git` and reads
@@ -426,7 +432,10 @@ back. M mutes, Esc hangs up. Use headphones: there is no echo cancellation.
 - **Looks.** The app draws its own title bar. The sidebar sits on the window, the session floats beside it
   on a rounded canvas, and the side panel on one of its own; the agent editor, the settings, the
   statistics, the spotlight, a file's diff and a picture open over them. Three themes: Black (the
-  default), White and Amber. Zoom with Ctrl/Cmd + and -. Scrolling eases and never overshoots.
+  default), White and Amber. Zoom with Ctrl/Cmd + and -; the smallest the window goes grows with the zoom
+  (up to most of the screen), so the layout fits as it does unzoomed. Scrolling eases and never
+  overshoots. Resizing lays out again what is in view at once and the rest of a long conversation over
+  the next frames, so it stays smooth.
 - **Closing the window** keeps the app running by default, so agents and calls go on (Settings, General,
   *When you close the window*; the other choices are to minimise or to quit). On Windows the window goes
   to the tray: a click on the icon by the clock opens it again, and its menu opens it or quits; starting
@@ -496,7 +505,10 @@ is written to keep them there:
   shows it.
 - Besides `CLAUDE_CONFIG_DIR`, AtroxaBot sets what the official Agent SDK sets so that Claude Code reports
   when it runs a turn (`CLAUDE_CODE_SDK_READS_SESSION_STATE`). It does not set the variables that would say
-  it is Anthropic's SDK (`CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`).
+  it is Anthropic's SDK (`CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`): Claude Code labels its own
+  process (`sdk-cli`). Started from inside a Claude Code session (as a developer does), the app passes
+  nothing of that session on: not its label, its session id, its way back in or its account folder, so
+  the app's sessions are never taken for part of it.
 - An agent on a Claude account runs with **the agent's own system prompt**, not Claude Code's: who it is,
   your instructions, and a short section on how to work (act rather than describe, read before changing,
   check its work, be careful with what cannot be undone, ask with questions, delegate to subagents, use

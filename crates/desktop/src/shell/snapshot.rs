@@ -150,6 +150,7 @@ fn snapshots() {
                 ),
                 AgentEvent::Activity { id: "a1".into(), text: "Reading src/tokenizer.rs · 2 tool calls".into() },
                 AgentEvent::Activity { id: "a2".into(), text: "Done · 3 tool calls · 28.8k tokens · 12s".into() },
+                AgentEvent::Background { id: "b1".into(), what: "Watch the release build".into(), ended: false },
                 AgentEvent::ToolResult {
                     id: "a2".into(),
                     output: "14 tests in tests/tokenizer.rs".into(),
@@ -626,6 +627,12 @@ fn snapshots() {
             });
             write_png(&dir.join(format!("{name}-{}.png", scheme.key())), SIZE, &pixels);
         }
+        // The smallest window: no room beside the session, so the side panel floats over it.
+        let mut narrow = panel();
+        let pixels = frame(&mut gpu, &fonts, scheme, (-1.0, -1.0), &mut |p, ui, view| {
+            narrow.draw(p, ui, Rect::new(view.x, view.y, 820.0, 560.0), scheme, &mut Vec::new());
+        });
+        write_png(&dir.join(format!("panel-narrow-{}.png", scheme.key())), SIZE, &pixels);
     }
 }
 

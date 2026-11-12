@@ -159,8 +159,11 @@ impl Shell {
                 };
                 p.rect(row, fill, theme::RADIUS_SM);
                 let confirming = self.confirm_delete.as_deref() == Some(session.id.as_str());
-                let working = self.threads.get(&session.id).is_some_and(|thread| thread.busy);
-                // Right: a delete button while hovered, a pulse while it works.
+                let thread = self.threads.get(&session.id);
+                let working = thread.is_some_and(|thread| thread.busy);
+                // Something runs in the background between its turns: a still dot, as that may take an hour.
+                let waiting = thread.is_some_and(|thread| !thread.background.is_empty());
+                // Right: a delete button while hovered, a pulse while it works, a dot while it waits.
                 let mut on_control = false;
                 let right = if (hovered && !carried) || confirming {
                     let bin = Rect::new(row.right() - 26.0, row.y + 3.0, 22.0, 22.0);
@@ -181,6 +184,9 @@ impl Shell {
                     let pulse = 0.5 + 0.5 * (ui.time * 4.0).sin();
                     let dot = Rect::new(row.right() - 15.0, row.y + 11.0, 6.0, 6.0);
                     p.rect(dot, fade(t.accent, 0.4 + 0.6 * pulse), 3.0);
+                    22.0
+                } else if waiting {
+                    p.rect(Rect::new(row.right() - 15.0, row.y + 11.0, 6.0, 6.0), fade(t.accent, 0.4), 3.0);
                     22.0
                 } else {
                     10.0
