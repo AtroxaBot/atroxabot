@@ -15,6 +15,7 @@ mod limits;
 mod menu;
 mod panel;
 mod picture;
+mod plan;
 mod question;
 mod queue;
 mod settings;
@@ -36,7 +37,8 @@ use arboard::Clipboard;
 use atroxabot_core::stats::Ledger;
 use atroxabot_core::{
     Agent, AgentEvent, CALL_ENDED, CALL_STARTED, ClaudeError, ClaudeInfo, ClaudeMcpServer, CodexError, CodexInfo,
-    Config, Connection, ConnectionKind, Error, Limits, Model, SearchHit, Session, SessionSummary, Verdict, unix_now,
+    Config, Connection, ConnectionKind, Error, LimitWindow, Limits, Model, SearchHit, Session, SessionSummary, Verdict,
+    unix_now,
 };
 use atroxabot_voice::CallEvent;
 use winit::event::KeyEvent;
@@ -208,6 +210,8 @@ pub struct Shell {
     icons: HashMap<String, String>,
     /// Where each Claude account's plan limits stand, as last reported, by connection id.
     limits: HashMap<String, Limits>,
+    /// How asking each account where its plan limits stand goes, by connection id (`plan.rs`).
+    checks: HashMap<String, plan::Check>,
     /// The answers being given to the question the agent asks.
     question: Option<QuestionForm>,
     /// A session whose delete button was clicked once: again deletes it.
@@ -274,6 +278,7 @@ impl Shell {
             renaming: None,
             icons: HashMap::new(),
             limits: HashMap::new(),
+            checks: HashMap::new(),
             question: None,
             confirm_delete: None,
             was_on_call: false,
@@ -342,6 +347,7 @@ impl Shell {
     /// Codex answered (or could not) about the Codex account `connection`.
     /// Where its plan's limits stand comes with the answer.
     pub fn codex_info(&mut self, connection: &str, result: Result<CodexInfo, CodexError>, actions: &mut Vec<Action>) {
+        self.codex_checked(connection, matches!(&result, Ok(info) if info.limits.is_some()));
         let account = match result {
             Ok(info) => {
                 if let Some(limits) = &info.limits {
@@ -404,6 +410,8 @@ impl Shell {
         // The files may have changed while the user was elsewhere, and a session's work been merged.
         self.refresh_git(actions);
         self.sweep_worktrees_again(actions);
+        // And the plan's limits: a limit may have been reset on claude.ai.
+        self.check_shown_limits(actions);
         // Only while the settings are open: that is where signing in starts.
         if !matches!(self.modal, Some(Modal::Settings(_))) {
             return;
@@ -692,10 +700,12 @@ impl Shell {
         }
     }
 
-    /// Opens the statistics and has every session read for them.
+    /// Opens the statistics and has every session read for them, and every
+    /// account asked where its plan's limits stand.
     fn open_stats(&mut self, actions: &mut Vec<Action>) {
         self.modal = Some(Modal::Stats(Box::default()));
         actions.push(Action::LoadStats);
+        self.check_every_account(actions);
     }
 
     /// Every session's usage was read, for the statistics.
@@ -1927,14 +1937,25 @@ fn ran_on(thread: &Thread, agents: &[Agent]) -> String {
 /// not named this time keeps what it last said.
 fn merge_limits(known: &mut Limits, new: Limits) {
     (known.at, known.status, known.resets) = (new.at, new.status, new.resets);
-    for window in new.windows {
+    for mut window in new.windows {
         match known.windows.iter_mut().find(|old| old.name == window.name) {
-            Some(old) => *old = window,
+            Some(old) => {
+                // A reply does not say which model a week of its own is for; a check did.
+                if window.label.is_empty() {
+                    window.label = std::mem::take(&mut old.label);
+                }
+                *old = window;
+            }
             None => known.windows.push(window),
         }
     }
-    // The short window first, then the week, then the week's per-model ones.
-    known.windows.sort_by_key(|window| (window.name != "five_hour", window.name != "seven_day", window.name.clone()));
+    order_windows(&mut known.windows);
+}
+
+/// Puts a plan's windows in the order they are shown: the short window
+/// first, then the week, then the week's per-model ones.
+fn order_windows(windows: &mut [LimitWindow]) {
+    windows.sort_by_key(|window| (window.name != "five_hour", window.name != "seven_day", window.name.clone()));
 }
 
 /// When `then` is, seen from `now`: "now", "in 12m", "in 3h 12m", "in 2d 4h".
@@ -2000,7 +2021,12 @@ mod tests {
         assert_eq!((compact(840), compact(12_400), compact(3_100_000)), ("840".into(), "12.4k".into(), "3.1M".into()));
         assert_eq!((money(0.4249), money(128.4)), ("$0.42".into(), "$128".into()));
         // A turn on another model adds its window; the others keep what they last said.
-        let window = |name: &str, used: f64| atroxabot_core::LimitWindow { name: name.into(), used, resets: 9 };
+        let window = |name: &str, used: f64| atroxabot_core::LimitWindow {
+            name: name.into(),
+            used,
+            resets: 9,
+            label: String::new(),
+        };
         let mut known = Limits::default();
         let fable =
             vec![window("seven_day_overage_included", 0.42), window("seven_day", 0.61), window("five_hour", 0.28)];
@@ -2512,6 +2538,40 @@ mod tests {
         shell.thread_mut().expect("open").open_agent(Some("old-agent".into()));
         shell.send("and the tests", false, Vec::new(), &mut actions);
         assert_eq!(shell.thread().expect("open").sub, None, "a follow-up");
+    }
+
+    /// A subagent opened after it finished shows its end, as the conversation does.
+    #[test]
+    fn an_opened_subagent_shows_its_end() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        shell.start(&mut actions);
+        let session = working(&mut shell, &mut actions);
+        let input =
+            serde_json::json!({ "description": "Look around", "prompt": "Read it all", "subagent_type": "Explore" });
+        let call = atroxabot_core::ToolUse {
+            id: "a1".into(),
+            name: "Agent".into(),
+            input: input.to_string(),
+            ..atroxabot_core::ToolUse::default()
+        };
+        shell.agent_event(&session, AgentEvent::ToolCall(call), &mut actions);
+        for n in 0..80 {
+            let said = AgentEvent::Text(format!(
+                "Finding {n}: the parser reads this part well enough.
+
+"
+            ));
+            shell.agent_event(&session, AgentEvent::Sub { parent: "a1".into(), event: Box::new(said) }, &mut actions);
+        }
+        let done = AgentEvent::ToolResult { id: "a1".into(), output: "Done".into(), is_error: false };
+        shell.agent_event(&session, done, &mut actions);
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        shell.thread_mut().expect("open").open_agent(Some("a1".into()));
+        let mut ui = Ui::default();
+        paint(&mut shell, &mut ui);
+        paint(&mut shell, &mut ui);
+        assert_eq!(shell.thread().expect("open").sub_progress(), Some(1.0), "at its end, not its start");
     }
 
     fn working(shell: &mut Shell, actions: &mut Vec<Action>) -> String {

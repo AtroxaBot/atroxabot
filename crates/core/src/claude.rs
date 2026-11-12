@@ -61,6 +61,97 @@ pub fn claude_connectors(connection: &Connection) -> Result<Vec<sdk::McpServerSt
     sdk::mcp_servers(&sdk::Options { env: account_env(connection), ..sdk::Options::default() }, CONNECTORS_TIMEOUT)
 }
 
+/// How long Claude Code gets to say where an account's plan limits stand.
+const USAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The plan's windows that limit Claude Code's turns, as its replies name
+/// them (`rateLimitType`); `seven_day_oauth_apps`, which no reply names, is
+/// not one of them.
+const TURN_WINDOWS: [&str; 4] = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"];
+
+/// What asking Claude Code where an account's plan limits stand came to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanCheck {
+    /// Where they stand now.
+    Limits {
+        /// The windows, named as the replies name them; no status is said.
+        limits: Limits,
+        /// Whether every window is in them. Otherwise Claude Code answered
+        /// from what it kept, which says nothing of the models' own weeks.
+        complete: bool,
+    },
+    /// Plan limits do not apply to how Claude Code signs in to the account:
+    /// an API key or a cloud provider.
+    NoPlan,
+    /// Claude Code could not get them just now: Anthropic's usage page did
+    /// not answer, or asked it to wait.
+    Unavailable,
+}
+
+/// Where the plan limits of the Claude account `connection` stand, as
+/// Claude Code's own `/usage` shows them: Claude Code asks Anthropic with its
+/// own sign-in, and no message is sent, so nothing is used. It is started in
+/// a folder of no project and without MCP servers, and stopped once it has
+/// answered (about two seconds); checks made meanwhile wait their turn.
+/// Call it off the UI thread.
+///
+/// # Errors
+/// [`sdk::Error::Unsupported`] when this Claude Code refuses the request
+/// (Anthropic calls it experimental) or answers it in a shape not known
+/// here; otherwise it is not installed, could not be started, or did not
+/// answer in time.
+pub fn claude_usage(connection: &Connection) -> Result<PlanCheck, sdk::Error> {
+    /// Held while Claude Code is asked: checks of several accounts (the
+    /// statistics ask every one) start one Claude Code after another, not all at once.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let options = sdk::Options {
+        env: account_env(connection),
+        cwd: Some(std::env::temp_dir()),
+        mcp_config: Some(r#"{"mcpServers":{}}"#.to_owned()),
+        strict_mcp_config: true,
+        ..sdk::Options::default()
+    };
+    plan_check(sdk::plan_usage(&options, USAGE_TIMEOUT)?, crate::session::unix_now())
+}
+
+/// What Claude Code's answer to `/usage` says, at `now`.
+fn plan_check(usage: sdk::PlanUsage, now: u64) -> Result<PlanCheck, sdk::Error> {
+    let Some(plan) = usage.limits else {
+        return Ok(if usage.available { PlanCheck::Unavailable } else { PlanCheck::NoPlan });
+    };
+    let window = |w: &sdk::RateWindow, name: String, label: String| LimitWindow {
+        name,
+        used: w.utilization,
+        resets: w.resets_at,
+        label,
+    };
+    let mut windows: Vec<LimitWindow> = (plan.windows.iter())
+        .filter(|w| TURN_WINDOWS.contains(&w.name.as_str()))
+        .map(|w| window(w, w.name.clone(), String::new()))
+        .collect();
+    if windows.is_empty() {
+        // Limits that name no window of the plan are no answer this app knows.
+        return Err(sdk::Error::Unsupported("its plan limits name neither the 5-hour nor the weekly window".into()));
+    }
+    let complete = plan.models.is_some();
+    let models = plan.models.unwrap_or_default();
+    // A model's own week is the window the replies call `seven_day_overage_included`: Claude Code makes its
+    // row for the model from that one. Several, which no reply tells apart, are named after their models.
+    let single = models.len() == 1;
+    for model in models {
+        let slug = model.name.to_lowercase().split_whitespace().collect::<Vec<_>>().join("_");
+        let own = format!("seven_day_{slug}");
+        // A week the plan has for that model anyway (`seven_day_opus`) is not shown twice.
+        if windows.iter().any(|known| known.name == own) {
+            continue;
+        }
+        let name = if single { "seven_day_overage_included".to_owned() } else { own };
+        windows.push(window(&model, name, model.name.clone()));
+    }
+    Ok(PlanCheck::Limits { limits: Limits { at: now, status: String::new(), resets: 0, windows }, complete })
+}
+
 /// A command to run in a terminal the user sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalCommand {
@@ -529,13 +620,22 @@ impl Mapper {
                 ));
             }
             sdk::Event::RateLimit(limit) => {
-                let window =
-                    |w: sdk::RateWindow| LimitWindow { name: w.name, used: w.utilization, resets: w.resets_at };
+                let window = |w: sdk::RateWindow| LimitWindow {
+                    name: w.name,
+                    used: w.utilization,
+                    resets: w.resets_at,
+                    label: String::new(),
+                };
                 let mut windows: Vec<LimitWindow> = limit.windows.into_iter().map(window).collect();
                 // Refused: the window that decided is full until it starts over, whatever else was said of it
                 // (Claude Code names the window and when it lifts, and not always how full it is).
                 if limit.status == "rejected" && !limit.kind.is_empty() {
-                    let full = LimitWindow { name: limit.kind.clone(), used: 1.0, resets: limit.resets_at };
+                    let full = LimitWindow {
+                        name: limit.kind.clone(),
+                        used: 1.0,
+                        resets: limit.resets_at,
+                        label: String::new(),
+                    };
                     match windows.iter_mut().find(|window| window.name == limit.kind) {
                         Some(window) => {
                             window.used = 1.0;
@@ -773,6 +873,68 @@ mod tests {
         assert_eq!(news(mapper.map(task("r1", "", sdk::TaskState::Completed))), ["r1"]);
     }
 
+    #[test]
+    fn plan_checks() {
+        let w = |name: &str, used: f64| sdk::RateWindow {
+            name: name.into(),
+            utilization: used,
+            resets_at: 9,
+            ..sdk::RateWindow::default()
+        };
+        let answer = |windows: Vec<sdk::RateWindow>, models: Option<Vec<sdk::RateWindow>>| sdk::PlanUsage {
+            available: true,
+            limits: Some(sdk::PlanLimits { windows, models }),
+            ..sdk::PlanUsage::default()
+        };
+        let seen = |check: PlanCheck| match check {
+            PlanCheck::Limits { limits, complete } => {
+                assert_eq!((limits.at, limits.status.as_str(), limits.resets), (5, "", 0));
+                let names = limits.windows.into_iter().map(|w| (w.name, w.used, w.label)).collect::<Vec<_>>();
+                (names, complete)
+            }
+            other => panic!("no limits: {other:?}"),
+        };
+        let plan = || vec![w("five_hour", 0.05), w("seven_day", 0.11), w("seven_day_oauth_apps", 0.5)];
+        // As Claude Code 2.1.322 answers: Fable's week is the one the replies call `seven_day_overage_included`.
+        let (names, complete) = seen(plan_check(answer(plan(), Some(vec![w("Fable", 0.22)])), 5).unwrap());
+        let fable = ("seven_day_overage_included".to_owned(), 0.22, "Fable".to_owned());
+        assert_eq!(
+            names,
+            [("five_hour".to_owned(), 0.05, String::new()), ("seven_day".to_owned(), 0.11, String::new()), fable],
+            "the week of other apps is no limit of Claude Code's turns"
+        );
+        assert!(complete);
+        // From what it kept: nothing of the models' weeks.
+        let (names, complete) = seen(plan_check(answer(plan(), None), 5).unwrap());
+        assert_eq!((names.len(), complete), (2, false));
+        // Several models' weeks are named after them; one the plan has anyway is not shown twice.
+        let models = vec![w("Opus", 0.3), w("Fable 2", 0.4)];
+        let with_opus = vec![w("five_hour", 0.05), w("seven_day_opus", 0.3)];
+        let (names, _) = seen(plan_check(answer(with_opus, Some(models)), 5).unwrap());
+        let names: Vec<&str> = names.iter().map(|(name, ..)| name.as_str()).collect();
+        assert_eq!(names, ["five_hour", "seven_day_opus", "seven_day_fable_2"]);
+
+        let none = sdk::PlanUsage { available: false, ..sdk::PlanUsage::default() };
+        assert_eq!(plan_check(none, 5).unwrap(), PlanCheck::NoPlan);
+        let unavailable = sdk::PlanUsage { available: true, ..sdk::PlanUsage::default() };
+        assert_eq!(plan_check(unavailable, 5).unwrap(), PlanCheck::Unavailable);
+        let nameless = answer(vec![w("seven_day_oauth_apps", 0.5)], Some(Vec::new()));
+        assert!(matches!(plan_check(nameless, 5), Err(sdk::Error::Unsupported(_))), "a shape not known here");
+    }
+
+    /// Asks the installed Claude Code where its own account's plan limits stand: nothing is used.
+    #[test]
+    #[ignore = "starts the installed Claude Code"]
+    fn checks_an_accounts_plan_limits() {
+        let PlanCheck::Limits { limits, complete } = claude_usage(&Connection::claude_agent()).unwrap() else {
+            panic!("no plan limits")
+        };
+        for window in &limits.windows {
+            println!("{} {:.0}% {} {}", window.name, window.used * 100.0, window.resets, window.label);
+        }
+        assert!(complete && limits.windows.iter().any(|window| window.name == "five_hour"));
+    }
+
     /// Asks the installed Claude Code about its own account's MCP servers: it is only started, so nothing is used.
     #[test]
     #[ignore = "starts the installed Claude Code"]
@@ -904,7 +1066,10 @@ mod tests {
             sdk::RateLimit { status: "rejected".into(), kind: "five_hour".into(), resets_at: 99, windows: vec![] };
         let hit = mapper.map(sdk::Event::RateLimit(hit));
         let [AgentEvent::Limits(hit)] = &hit[..] else { panic!("limits") };
-        assert_eq!(hit.windows, [LimitWindow { name: "five_hour".into(), used: 1.0, resets: 99 }]);
+        assert_eq!(
+            hit.windows,
+            [LimitWindow { name: "five_hour".into(), used: 1.0, resets: 99, label: String::new() }]
+        );
         // Named with a stale number, it is full all the same.
         let stale =
             sdk::RateWindow { name: "seven_day".into(), utilization: 0.97, resets_at: 7, status: String::new() };
@@ -912,7 +1077,7 @@ mod tests {
             sdk::RateLimit { status: "rejected".into(), kind: "seven_day".into(), resets_at: 99, windows: vec![stale] };
         let hit = mapper.map(sdk::Event::RateLimit(hit));
         let [AgentEvent::Limits(hit)] = &hit[..] else { panic!("limits") };
-        assert_eq!(hit.windows, [LimitWindow { name: "seven_day".into(), used: 1.0, resets: 7 }]);
+        assert_eq!(hit.windows, [LimitWindow { name: "seven_day".into(), used: 1.0, resets: 7, label: String::new() }]);
 
         assert_eq!(mapper.map(sdk::Event::Status(Some("compacting".into()))).len(), 1);
         let compacted = mapper.map(sdk::Event::Compacted { manual: true, pre_tokens: 39_577, post_tokens: 11_092 });

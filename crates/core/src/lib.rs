@@ -47,8 +47,8 @@ pub use atroxabot_codex::{
     Account as CodexAccount, Error as CodexError, Info as CodexInfo, Model as CodexModel, RateLimits as CodexLimits,
 };
 pub use claude::{
-    CLAUDE_INSTALL, ClaudeAgent, TerminalCommand, claude_connectors, claude_info, claude_install, claude_login,
-    find_claude,
+    CLAUDE_INSTALL, ClaudeAgent, PlanCheck, TerminalCommand, claude_connectors, claude_info, claude_install,
+    claude_login, claude_usage, find_claude,
 };
 pub use client::{Client, Model};
 pub use codex::{

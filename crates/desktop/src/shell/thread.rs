@@ -223,6 +223,8 @@ pub(super) struct Thread {
     /// That subagent's view, and whether it stays at its newest words.
     sub_scroll: Scroll,
     sub_follow: bool,
+    /// The opened subagent is not drawn yet: its first frame only measures, so it opens at its end.
+    sub_fresh: bool,
     scroll: Scroll,
     /// Not drawn yet: its first frame only measures, so it opens at its end.
     fresh: bool,
@@ -284,6 +286,7 @@ impl Thread {
             sub: None,
             sub_scroll: Scroll::default(),
             sub_follow: true,
+            sub_fresh: false,
             scroll: Scroll::default(),
             fresh: true,
             follow: true,
@@ -503,9 +506,16 @@ impl Thread {
 
     /// Shows the subagent started by the call `id` in the conversation's place; `None` goes back to it.
     pub fn open_agent(&mut self, id: Option<String>) {
+        self.sub_fresh = id.is_some();
         self.sub = id;
         self.sub_scroll.reset();
         (self.sub_follow, self.selection) = (true, None);
+    }
+
+    /// How far down the open subagent's view is (`0..=1`), when it scrolls.
+    #[cfg(test)]
+    pub fn sub_progress(&self) -> Option<f32> {
+        self.sub_scroll.progress()
     }
 
     /// The subagents of the turn (the open one's, or the latest), in the
@@ -585,6 +595,8 @@ impl Thread {
             self.selecting = false;
         }
         let top = area.y + 24.0 - offset;
+        // The first frame only measures: like the conversation, it opens at its end, not its start.
+        let hidden = self.sub_fresh.then(|| p.push_clip(Rect::new(area.x, area.y, 0.0, 0.0)));
         let base = SUB_KEYS | (id(&call.id) as usize >> 8);
         let (_, _, brief) = agent_brief(call);
         let mut y = top;
@@ -601,6 +613,9 @@ impl Thread {
             p.label(&call.activity, theme::TINY, x, y + 4.0, ink);
             y += 28.0;
         }
+        if let Some(clip) = hidden {
+            p.set_clip(clip);
+        }
         let content = y - top + 24.0 + 24.0;
         self.sub_scroll.finish(ui, content, area.h);
         if hovered && ui.scroll > 0.0 && self.sub_scroll.at_end() {
@@ -610,7 +625,10 @@ impl Thread {
             // Dragged to the end, it follows the newest words again; anywhere else, it stays.
             self.sub_follow = self.sub_scroll.at_end();
         }
-        if live && self.sub_follow && !self.sub_scroll.at_end() {
+        if std::mem::take(&mut self.sub_fresh) {
+            self.sub_scroll.jump_to_end();
+            ui.animating = true;
+        } else if live && self.sub_follow && !self.sub_scroll.at_end() {
             self.sub_scroll.follow_end();
             ui.animating = true;
         }

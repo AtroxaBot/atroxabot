@@ -101,6 +101,7 @@ pub fn codex_limits(limits: &sdk::RateLimits) -> Limits {
         name: name(window, fallback),
         used: (window.used_percent / 100.0).clamp(0.0, 1.0),
         resets: window.resets_at.unwrap_or(0),
+        label: String::new(),
     };
     let windows: Vec<LimitWindow> =
         [(limits.primary.as_ref(), "short_window"), (limits.secondary.as_ref(), "long_window")]

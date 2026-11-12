@@ -221,9 +221,9 @@ page lists every worktree on disk, with what it holds and how much room it takes
   agent described) to see it whole. Claude Code gives an app's session those tools only when they are
   named as allowed (`--allowedTools`), so AtroxaBot names them.
 - **Suggested next message** (Claude accounts). After a reply, Claude Code guesses what you will write
-  next, and the empty message box shows it a shade lighter, with a *Tab* key beside it. Tab (or a click on
-  the key) writes it in, to send or change; Esc puts it away; typing hides it. It goes when the next turn
-  starts and is not saved. Each guess is a small extra request on the account, mostly read from the
+  next, and the empty message box shows it a shade lighter, with a *Tab* key beside it. Tab writes it in,
+  to send or change (the key beside it is only a hint: a click in the box never takes it); Esc puts it
+  away; typing hides it. It goes when the next turn starts and is not saved. Each guess is a small extra request on the account, mostly read from the
   prompt cache; Claude Code skips it early in a session, when the cache has gone cold, when the account is
   near its limit or on extra usage, and more often when its guesses go unused. Turn it off in Settings,
   General, *Suggest what to say next* (a session's Claude Code then restarts without it at its next
@@ -279,14 +279,22 @@ Each session has its own provider, model and effort.
   in your name. Whatever you do first wins: sending a message, switching the session's provider, or
   clearing or deleting the session cancels the wait. A session the limit stops five turns in a row stops
   trying. The app wakes for it while it is in the tray; a wait does not outlive the app.
-- **Plan limits.** For a Claude account the side panel shows where the plan's limits stand: the 5-hour and
-  weekly windows, the week's limit for Fable once a turn ran on it, and when each starts over. They are
-  what Claude Code reports with each turn, the numbers its own `/usage` prints, for the account the top bar
-  names. An account that has not replied yet says so, and numbers ten minutes old or more say since when
-  (only the account's replies in this app bring news of them). A used-up window says *Limit reached* and
-  when it starts over. Reaching a limit is said in a notice that names the account, counts down to when it
-  lifts, and goes away by itself then; it shows only on the sessions that use that account. A Codex
-  account's limits show the same way, as Codex reports them (when the app starts and with each turn).
+- **Plan limits.** For a Claude account the side panel shows where the plan's limits stand, for the account
+  the top bar names: the 5-hour and weekly windows, the week of a model that has one of its own (Fable),
+  and when each starts over. Each reply brings the windows its turn counted against; besides, the app asks
+  Claude Code for the whole picture (its own `/usage`, which uses nothing), so a model's week stays right
+  while you use another, and a limit reset on claude.ai shows. It asks only about limits on screen, and
+  seldom: when the panel shows them while the window is in front and they were last asked about ten
+  minutes ago or more, when you come back to the window, when the statistics open, and when you click the
+  refresh icon by them. Nothing is asked on a timer. A limit that turns out to have lifted lets the
+  sessions waiting for it go on. Numbers ten minutes old or more say since when. Anthropic calls that
+  request experimental: should Claude Code stop answering it as the app expects, the panel says *Not
+  checked: Claude Code's /usage has changed* (its answer on the line's tooltip, and in the log), the
+  numbers come with replies only, and the app needs an update; the app does not ask again by itself until
+  it starts again. A used-up window says *Limit reached* and when it starts over. Reaching a limit is said
+  in a notice that names the account, counts down to when it lifts, and goes away by itself then; it shows
+  only on the sessions that use that account. A Codex account's limits show the same way, as Codex reports
+  them (when the app starts, with each turn, and when they are asked about as above).
 - **Provider marks.** A provider wears its platform's logo (Claude, Anthropic, OpenAI, OpenRouter, Meta,
   Gemini, Mistral, Ollama), in the platform's colour where it has one; others get an icon. The marks are
   their owners' trademarks, shown only to say which platform a provider is. To use a picture of your own,
@@ -402,8 +410,8 @@ server-side compaction on its own API, by a request of the app's elsewhere.
   active days, streaks and the busiest day, over the last 7, 30 or 90 days, a year or all time; a year of
   days as a grid that is brighter the more was used (by tokens, cost or tool calls); the period day by
   day; where the tokens went (output, new input, written to and read from the cache); what each provider,
-  model, agent and tool used; and where each Claude account's plan limits stood when Claude Code last
-  reported them (kept between runs; nothing is asked of Anthropic to show them). They are counted from a
+  model, agent and tool used; and where each account's plan limits stand (kept between runs; opening the
+  statistics asks each signed-in account, as the side panel does). They are counted from a
   usage log of their own, so deleting a session does not lose what it used.
 
 ### Voice calls
@@ -474,6 +482,13 @@ is written to keep them there:
   Code's.
 - The account's email and plan shown in Settings, the model list, the commands and skills, and the plan's
   usage limits are what Claude Code itself reports.
+- **The plan's limits** are asked of Claude Code with the request the official Agent SDK sends for its
+  `/usage` (`get_usage`, the SDK's `usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET`): Claude
+  Code fetches them from Anthropic with its own sign-in, no model is called, and AtroxaBot never sees a
+  token. The scan of local transcripts that `/usage` also shows is skipped. A check starts Claude Code for
+  that account in a folder of no project and without MCP servers, and stops it once it has answered
+  (about two seconds; checks of several accounts take turns, and Claude Code answers from what it fetched
+  in the last minute). AtroxaBot never calls Anthropic's usage address itself.
 - **The skill library** reaches Claude Code through its documented `--plugin-dir` flag, which loads a
   plugin for that session only: nothing is installed into, or read from, an account's folder.
 - **The suggested next message** is Claude Code's own `--prompt-suggestions` flag (the Agent SDK's
@@ -503,7 +518,9 @@ message is sent as typed by a person (`origin`), and `--replay-user-messages` ha
 message sent during a turn is taken in (under the `uuid` it was sent with). How such a message is read
 (after the running tool calls, or as a turn of its own right after; `queued_turn_count` in the result says
 so), how an interrupt keeps or drops it (`cancel_queued`) and how `/clear` resets the context were checked
-against Claude Code 2.1.322.
+against Claude Code 2.1.322, as was the shape of its answer to `get_usage` (rerun
+`cargo test -p atroxabot-claude-agent live_plan_usage -- --ignored` after Claude Code changes: it uses
+nothing).
 
 ## Codex accounts
 
@@ -579,7 +596,8 @@ same way.
   `assets/logos/`.
 - `tray.rs`: what closing the window does, and the Windows tray icon, through Win32 directly.
 - `shell/`: the screen. `sidebar.rs`, `thread.rs`, `composer.rs`, `queue.rs`, `limits.rs` (what a session
-  does when its account runs out), `question.rs`, `menu.rs`, `panel.rs`, `picture.rs`, `spotlight.rs`,
+  does when its account runs out), `plan.rs` (when an account is asked where its limits stand),
+  `question.rs`, `menu.rs`, `panel.rs`, `picture.rs`, `spotlight.rs`,
   `stats.rs`, `agent_form.rs`, `settings.rs`, `skills.rs`, `worktrees.rs`, `update.rs` (the app's version
   and its update button), `call.rs`, `widgets.rs`.
 - `app.rs`: events, threads, engines.
@@ -604,7 +622,7 @@ Everything lives in `~/.atroxabot/`:
 | `sessions/<id>.json` | One file per session: its folder (and worktree, if any), the provider, model and effort it keeps, and for an API session the system prompt it began with, its replies as they arrived and the pictures its tools showed. |
 | `sessions/.index.json` | What the sidebar and an opening session need: titles, and each session's provider, model and effort. |
 | `usage.jsonl` | What every reply used (when, which agent and session, the provider its turn ran on, the model, its tokens, cost and tool calls), a line each. The statistics are counted from it; it is started once from the saved sessions and only added to after that. |
-| `limits.json` | Each Claude account's plan limits as last reported. |
+| `limits.json` | Each account's plan limits as last reported or checked, with the model a week of its own counts. |
 | `icons/` | Your own pictures of providers (see *Provider marks*). The app only reads it. |
 | `attachments/` | Pictures you pasted into a message, one PNG each. |
 | `library/` | The installed skills (`skills/<name>/`), laid out as a Claude Code plugin (`.claude-plugin/plugin.json`), and `library.json`: the repositories you look in and where each skill came from. A skill folder you put in `skills/` yourself works too. |

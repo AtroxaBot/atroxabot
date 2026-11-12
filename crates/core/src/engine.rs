@@ -235,6 +235,10 @@ pub struct LimitWindow {
     pub used: f64,
     /// When it starts over, in Unix seconds; 0 when not said.
     pub resets: u64,
+    /// What the provider calls what it counts, where its name does not
+    /// say: the model of a week of its own ("Fable"). Empty otherwise.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub label: String,
 }
 
 /// A tool call waiting for the user's approval.

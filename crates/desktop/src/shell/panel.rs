@@ -8,10 +8,11 @@
 
 use atroxabot_core::git::{Change, GitFile, GitStatus, Job, Report};
 use atroxabot_core::stats::Ledger;
-use atroxabot_core::{ContextPart, Limits, Todo, TodoState};
+use atroxabot_core::{ContextPart, LimitWindow, Limits, Todo, TodoState};
 use winit::window::CursorIcon;
 
 use super::menu::Menu;
+use super::plan;
 use super::thread::{Thread, agent_mark};
 use super::widgets::{Scroll, dropdown, field_label, modal};
 use super::{Modal, Shell, ago, compact, money, until};
@@ -60,9 +61,15 @@ pub(super) struct DiffView {
     across: Scroll,
 }
 
-/// What a window of a plan's limits is called. Claude Code's own `/usage`
-/// calls `seven_day_overage_included` the week's limit for Fable.
-fn window_name(name: &str) -> String {
+/// What a window of a plan's limits is called: by the model it counts, when
+/// the provider named it (a week of a model's own), else by its own name.
+/// Claude Code's own `/usage` calls `seven_day_overage_included` the week's
+/// limit for Fable.
+fn window_name(window: &LimitWindow) -> String {
+    let name = window.name.as_str();
+    if !window.label.is_empty() {
+        return if name.starts_with("seven_day") { format!("Weekly, {}", window.label) } else { window.label.clone() };
+    }
     match name {
         "five_hour" => "5-hour limit".to_owned(),
         "seven_day" => "Weekly limit".to_owned(),
@@ -99,7 +106,7 @@ pub(super) fn limit_bars(p: &mut Painter, limits: &Limits, (x, mut y, w): (f32, 
     for window in &limits.windows {
         let over = window.resets > 0 && window.resets <= now;
         let full = if over { 0.0 } else { window.used.clamp(0.0, 1.0) as f32 };
-        p.label(&window_name(&window.name), theme::SMALL, x, y, t.text_muted);
+        p.label(&window_name(window), theme::SMALL, x, y, t.text_muted);
         let used = p.layout(&format!("{:.0}%", full * 100.0), theme::SMALL, None);
         p.text(&used, x + w - used.width(), y, t.text);
         y += 24.0;
@@ -473,28 +480,56 @@ impl Shell {
         connection.kind.is_account().then_some(connection.id)
     }
 
-    /// Where the plan limits of the Claude account the top bar names stand,
-    /// as Claude Code last reported them: a bar per window and when it
-    /// starts over (and since when they stand, once that is a while), or a
-    /// line saying they come with its next reply. Who is
-    /// signed in to it is not put on screen here. Returns where they end
-    /// (`y` itself for an API provider).
-    fn draw_limits(&self, p: &mut Painter, (x, mut y, w): (f32, f32, f32)) -> f32 {
+    /// Where the plan limits of the account the top bar names stand: a bar
+    /// per window and when it starts over (and since when they stand, once
+    /// that is a while), or a line saying when they are known. They are
+    /// asked about by themselves now and then while the window has the
+    /// user's attention, and at once with the refresh icon by them
+    /// (`plan.rs`); a line under them says when Claude Code's answer is no
+    /// longer understood. Who is signed in to the account is not put on
+    /// screen here. Returns where they end (`y` itself for an API provider).
+    fn draw_limits(
+        &mut self,
+        p: &mut Painter,
+        ui: &mut Ui,
+        (x, mut y, w): (f32, f32, f32),
+        actions: &mut Vec<Action>,
+    ) -> f32 {
         let t = p.theme;
         let Some(account) = self.limits_account() else { return y };
+        if ui.focused {
+            self.check_limits(&account, plan::RECHECK, false, actions);
+        }
         p.rect(Rect::new(x - 16.0, y, w + 32.0, 1.0), t.border, 0.0);
         y += 18.0;
         field_label(p, icon::ACTIVITY, "PLAN USAGE", x, y);
+        let checking = self.checking(&account);
+        if self.config.connection(&account).is_some_and(|connection| self.can_check(&connection))
+            && icon_button(p, ui, Rect::new(x + w - 26.0, y - 6.0, 26.0, 26.0), icon::REFRESH, !checking)
+        {
+            self.check_limits(&account, 0, true, actions);
+        }
         y += 28.0;
-        if let Some(limits) = self.limits.get(&account).filter(|limits| !limits.windows.is_empty()) {
+        let known = self.limits.get(&account).filter(|limits| !limits.windows.is_empty());
+        if let Some(limits) = known {
             y = limit_bars(p, limits, (x, y, w));
+        }
+        // Claude Code no longer answers as the app expects: said, with what it answered on the line's tooltip.
+        if let Some(why) = self.check_changed(&account) {
+            let line = p.layout(plan::CHANGED, theme::TINY, Some(w));
+            p.text(&line, x, y, t.text_faint);
+            ui.tip(id(("limits-changed", &account)), Rect::new(x, y, w, line.height()), || Tip::text(why));
+            y += line.height() + 8.0;
+        }
+        if let Some(limits) = known {
             if let Some(age) = limits_age(limits.at, atroxabot_core::unix_now()) {
                 p.label(&age, theme::TINY, x, y, t.text_faint);
                 y += 26.0;
             }
             return y;
         }
-        let note = p.layout("Known after this account's next reply.", theme::SMALL, Some(w));
+        let note = if checking { "Checking…" } else { "Known after this account's next reply." };
+        let note = p.layout(note, theme::SMALL, Some(w));
         p.text(&note, x, y, t.text_faint);
         y + note.height() + 16.0
     }
@@ -514,7 +549,7 @@ impl Shell {
         let mut y = self.draw_usage(p, ui, (x, rect.y + 48.0, w)) + 8.0;
         y = self.draw_todos(p, ui, (x, y, w));
         y = self.draw_subagents(p, ui, (x, y, w));
-        y = self.draw_limits(p, (x, y, w));
+        y = self.draw_limits(p, ui, (x, y, w), actions);
         p.rect(Rect::new(rect.x, y, rect.w, 1.0), t.border, 0.0);
         y += 18.0;
         field_label(p, icon::BRANCH, "GIT", x, y);
@@ -691,9 +726,15 @@ In the parser"
 
     #[test]
     fn limit_windows_are_named_as_claude_code_names_them() {
-        let names =
-            ["five_hour", "seven_day", "seven_day_overage_included", "seven_day_opus", "monthly_cap"].map(window_name);
-        assert_eq!(names, ["5-hour limit", "Weekly limit", "Weekly, Fable", "Weekly, Opus", "monthly cap"]);
+        let shown = |name: &str, label: &str| {
+            window_name(&LimitWindow { name: name.into(), label: label.into(), ..LimitWindow::default() })
+        };
+        let plain = ["five_hour", "seven_day", "seven_day_overage_included", "seven_day_opus", "monthly_cap"]
+            .map(|name| shown(name, ""));
+        assert_eq!(plain, ["5-hour limit", "Weekly limit", "Weekly, Fable", "Weekly, Opus", "monthly cap"]);
+        // A check names the model of a week of its own: it may be another one day.
+        assert_eq!(shown("seven_day_overage_included", "Fable 2"), "Weekly, Fable 2");
+        assert_eq!(shown("monthly_cap", "Credits"), "Credits");
     }
 
     #[test]

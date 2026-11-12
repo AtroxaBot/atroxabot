@@ -149,8 +149,9 @@ impl Composer {
 /// Draws what the agent guesses the user writes next, in the empty message
 /// box at `(x, y)`, `width` wide: the words where the user's would be, a
 /// shade lighter than text, then the key that takes them. It fades in as it
-/// arrives. Returns whether the key was clicked.
-fn draw_suggestion(p: &mut Painter, ui: &mut Ui, guess: &str, (x, y, width): (f32, f32, f32), line_h: f32) -> bool {
+/// arrives. Only the key takes them: the cap is no button, so a click that
+/// only means to put the caret in the box never takes the guess.
+fn draw_suggestion(p: &mut Painter, ui: &mut Ui, guess: &str, (x, y, width): (f32, f32, f32), line_h: f32) {
     let t = p.theme;
     let key = p.layout("Tab", theme::TINY, None);
     let key_w = key.width() + 14.0;
@@ -160,14 +161,8 @@ fn draw_suggestion(p: &mut Painter, ui: &mut Ui, guess: &str, (x, y, width): (f3
     let shown = ui.appear(id(("suggestion", guess)));
     p.text(&words, x, y, fade(mix(t.text_faint, t.text_muted, 0.55), shown));
     let cap = Rect::new(x + words.width() + 10.0, y + ((line_h - 20.0) * 0.5).round(), key_w, 20.0);
-    let hovered = ui.hovered(cap);
-    let hover = ui.anim(id("suggestion-key"), f32::from(u8::from(hovered)));
-    p.bordered(cap, fade(mix(t.surface, t.hover, 0.5 + 0.5 * hover), shown), 5.0, 1.0, fade(t.border_strong, shown));
+    p.bordered(cap, fade(mix(t.surface, t.hover, 0.5), shown), 5.0, 1.0, fade(t.border_strong, shown));
     p.text(&key, cap.x + 7.0, cap.y + ((cap.h - key.height()) * 0.5).round(), fade(t.text_muted, shown));
-    if hovered {
-        ui.cursor = CursorIcon::Pointer;
-    }
-    ui.clicked(cap)
 }
 
 impl Shell {
@@ -237,7 +232,6 @@ impl Shell {
         let elsewhere = self.renaming.is_some() || self.answering();
         let typing = ui.focused && self.menu.is_none() && self.modal.is_none() && !elsewhere;
         let guess = self.suggestion_shown().map(str::to_owned);
-        let mut take_guess = false;
         let composer = &mut self.composer;
 
         // With an input method composing, show its text at the caret.
@@ -307,7 +301,7 @@ impl Shell {
             }
         }
         if let Some(guess) = guess.as_deref().filter(|_| shown.is_empty()) {
-            take_guess = draw_suggestion(p, ui, guess, (origin.0, origin.1, text_w), line_h);
+            draw_suggestion(p, ui, guess, (origin.0, origin.1, text_w), line_h);
         } else if shown.is_empty() {
             p.label(&format!("Message {}", agent.name), theme::BODY, origin.0, origin.1, t.text_faint);
         } else {
@@ -328,9 +322,6 @@ impl Shell {
         }
         p.set_clip(clip);
         self.composer.layout = if preedit.is_none() { Some((layout, origin)) } else { None };
-        if take_guess {
-            self.take_suggestion();
-        }
 
         // Under the text: files to send along at the left, what the agent thinks with at the right.
         let item_y = card.bottom() - 9.0 - 30.0;

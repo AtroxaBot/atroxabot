@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 pub use cli::{cli_version, find_cli};
 pub use serde_json::Value;
-pub use session::{Decision, Session, info, mcp_servers};
+pub use session::{Decision, Session, info, mcp_servers, plan_usage};
 
 /// How to launch the Claude Code binary. `Options::default()` is a plain session in the current directory.
 #[derive(Debug, Clone, Default)]
@@ -179,8 +179,37 @@ pub struct RateWindow {
     pub utilization: f64,
     /// When it resets, in Unix seconds; 0 when not said.
     pub resets_at: u64,
-    /// `allowed`, `allowed_warning` or `rejected`.
+    /// `allowed`, `allowed_warning` or `rejected`; empty when not said (a [`PlanUsage`] never says).
     pub status: String,
+}
+
+/// The account's plan usage as Claude Code's `/usage` shows it, from [`Session::plan_usage`] or [`plan_usage`].
+/// Claude Code fetches it from Anthropic itself, with its own sign-in. Anthropic calls the request experimental
+/// and says its shape may change: whatever is missing or mistyped is left out.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlanUsage {
+    /// The claude.ai plan (`pro`, `max`, `team`, `enterprise`); empty for an API key or a cloud provider.
+    pub subscription: String,
+    /// Whether plan limits apply to how the binary signs in: not for an API key, Bedrock or Vertex.
+    pub available: bool,
+    /// Where the plan's limits stand; `None` when they do not apply, or Claude Code could not get them (its
+    /// usage endpoint did not answer and it kept nothing recent).
+    pub limits: Option<PlanLimits>,
+    /// The whole answer.
+    pub raw: Value,
+}
+
+/// Where a plan's limits stand, from a [`PlanUsage`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PlanLimits {
+    /// The windows of the whole plan, by Claude Code's names for them: `five_hour`, `seven_day`, and where the
+    /// plan has them `seven_day_opus`, `seven_day_sonnet` and `seven_day_oauth_apps`. A window without a
+    /// number is left out.
+    pub windows: Vec<RateWindow>,
+    /// The weekly windows of single models (`model_scoped`), each named as Anthropic labels its model
+    /// (`Fable`). `None` when nothing is known of them: Claude Code answered from what it kept rather than
+    /// asking. Empty when the account has none.
+    pub models: Option<Vec<RateWindow>>,
 }
 
 /// How a subagent is doing.
@@ -294,6 +323,8 @@ pub enum Event {
     McpStatus(Vec<McpServerStatus>),
     /// The answer to [`Session::context_usage`]: what the context window holds.
     ContextUsage(ContextUsage),
+    /// The answer to [`Session::plan_usage`]: where the account's plan limits stand.
+    PlanUsage(PlanUsage),
     /// A complete piece of an assistant message. The binary sends one of these per content block, each repeating
     /// the message's `usage`, so add up [`TurnResult::usage`] rather than these.
     Assistant {
@@ -363,8 +394,9 @@ pub enum Event {
         post_tokens: u64,
     },
     /// Any other message: other `system` subtypes (hook events, ...), stream events that are not text or thinking
-    /// deltas (`kind` is `stream_event`, `subtype` the event's type), and top-level types this crate does not
-    /// model.
+    /// deltas (`kind` is `stream_event`, `subtype` the event's type), answers to control requests this crate
+    /// does not model (`kind` is `control_response`, `subtype` `success`; a bare acknowledgement is not
+    /// reported), and top-level types this crate does not model.
     Other {
         /// The message's `type`.
         kind: String,
@@ -570,6 +602,9 @@ pub enum Error {
     Version(String),
     /// The binary did not say what it offers; the text says what happened.
     NoInfo(String),
+    /// The binary refused a request of this crate's, or answered it in a shape this crate does not know: a
+    /// version that dropped or changed it. The text says which.
+    Unsupported(String),
 }
 
 impl fmt::Display for Error {
@@ -590,6 +625,7 @@ impl fmt::Display for Error {
             Self::UnknownRequest(id) => write!(f, "no pending permission request {id}"),
             Self::Version(why) => write!(f, "could not read the Claude Code version: {why}"),
             Self::NoInfo(why) => write!(f, "Claude Code did not report its models and account: {why}"),
+            Self::Unsupported(why) => write!(f, "Claude Code does not answer the request as expected: {why}"),
         }
     }
 }

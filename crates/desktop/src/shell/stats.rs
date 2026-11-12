@@ -277,10 +277,10 @@ fn cards(p: &mut Painter, data: &Data, range: Range, (x, y, w): (f32, f32, f32))
     y + 2.0 * (height + gap) + 16.0
 }
 
-/// Where each Claude account's plan limits stood when Claude Code last
-/// reported them, an account a column. Nothing is asked of anyone: these
-/// are the numbers kept from the turns that ran. Returns where the next
-/// section starts (`y` itself when none are known).
+/// Where each account's plan limits stood when it last reported them (with
+/// a turn, or when the statistics opened and asked it: `plan.rs`), an
+/// account a column. Returns where the next section starts (`y` itself
+/// when none are known).
 fn limits(p: &mut Painter, shell: &Shell, (x, y, w): (f32, f32, f32)) -> f32 {
     let t = p.theme;
     let accounts: Vec<_> = shell

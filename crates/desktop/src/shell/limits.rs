@@ -207,7 +207,7 @@ impl Shell {
     }
 
     /// Whether the account `connection` is known to be signed in.
-    fn signed_in(&self, connection: &Connection) -> bool {
+    pub(super) fn signed_in(&self, connection: &Connection) -> bool {
         match connection.kind {
             ConnectionKind::ClaudeAgent => {
                 matches!(self.claude.get(&connection.id), Some(Account::Ready(info)) if !info.account.email.is_empty())
@@ -501,7 +501,7 @@ mod tests {
 
     /// The account the turn runs on is refused until `resets`, and Claude Code ends the turn on it.
     fn run_out(shell: &mut Shell, session: &str, resets: u64, actions: &mut Vec<Action>) {
-        let window = LimitWindow { name: "five_hour".into(), used: 1.0, resets };
+        let window = LimitWindow { name: "five_hour".into(), used: 1.0, resets, label: String::new() };
         let limits = Limits { at: unix_now(), status: "rejected".into(), resets, windows: vec![window] };
         shell.agent_event(session, AgentEvent::Limits(limits), actions);
         shell.agent_event(session, AgentEvent::ReplyStarted, actions);
@@ -655,7 +655,7 @@ mod tests {
     fn with_every_account_out_it_waits_for_the_first_to_lift() {
         let (mut shell, session, mut actions) = two_accounts(OutOfLimits::Switch);
         let soon = unix_now() + 900;
-        let window = LimitWindow { name: "five_hour".into(), used: 1.0, resets: soon };
+        let window = LimitWindow { name: "five_hour".into(), used: 1.0, resets: soon, label: String::new() };
         let work = Limits { at: unix_now(), status: "rejected".into(), resets: soon, windows: vec![window] };
         shell.limits.insert("work".into(), work);
         run_out(&mut shell, &session, unix_now() + 7_200, &mut actions);

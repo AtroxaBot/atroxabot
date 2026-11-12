@@ -12,7 +12,7 @@ use atroxabot_core::worktree;
 use atroxabot_core::{
     Agent, AgentEvent, Ask, Autonomy, ClaudeError, ClaudeInfo, ClaudeMcpServer, ClaudeModel, CodexAccount, CodexError,
     CodexInfo, CodexModel, Config, Connection, ConnectionKind, ContextPart, LimitWindow, Limits, McpServer, Model,
-    Session, ToolUse, Usage, VoiceSettings, Worktree, unix_now,
+    PlanCheck, Session, ToolUse, Usage, VoiceSettings, Worktree, unix_now,
 };
 use atroxabot_voice::CallState;
 
@@ -77,8 +77,18 @@ fn snapshots() {
             status: "allowed".into(),
             resets: 0,
             windows: vec![
-                LimitWindow { name: "five_hour".into(), used: used[0], resets: unix_now() + 7_300 },
-                LimitWindow { name: "seven_day".into(), used: used[1], resets: unix_now() + 250_000 },
+                LimitWindow {
+                    name: "five_hour".into(),
+                    used: used[0],
+                    resets: unix_now() + 7_300,
+                    label: String::new(),
+                },
+                LimitWindow {
+                    name: "seven_day".into(),
+                    used: used[1],
+                    resets: unix_now() + 250_000,
+                    label: String::new(),
+                },
             ],
         };
         stats.set_limits(
@@ -153,8 +163,18 @@ fn snapshots() {
                 status: "allowed".into(),
                 resets: 0,
                 windows: vec![
-                    LimitWindow { name: "five_hour".into(), used: 0.34, resets: unix_now() + 11_520 },
-                    LimitWindow { name: "seven_day".into(), used: 0.82, resets: unix_now() + 187_200 },
+                    LimitWindow {
+                        name: "five_hour".into(),
+                        used: 0.34,
+                        resets: unix_now() + 11_520,
+                        label: String::new(),
+                    },
+                    LimitWindow {
+                        name: "seven_day".into(),
+                        used: 0.82,
+                        resets: unix_now() + 187_200,
+                        label: String::new(),
+                    },
                 ],
             };
             delegating.agent_event(&turn, AgentEvent::Limits(limits), &mut Vec::new());
@@ -165,6 +185,24 @@ fn snapshots() {
             delegating
         };
         let (delegating, inside) = (delegate(None), delegate(Some("a1")));
+        // Claude Code was asked where the plan stands (Fable's week came along), then answered in a new way.
+        let mut changed = delegate(None);
+        let week = |name: &str, used: f64, label: &str| LimitWindow {
+            name: name.into(),
+            used,
+            resets: unix_now() + 187_200,
+            label: label.into(),
+        };
+        let windows = vec![
+            LimitWindow { resets: unix_now() + 11_520, ..week("five_hour", 0.34, "") },
+            week("seven_day", 0.82, ""),
+            week("seven_day_overage_included", 0.24, "Fable"),
+        ];
+        let checked = Limits { at: unix_now() - 900, windows, ..Limits::default() };
+        let account = Connection::CLAUDE_AGENT;
+        changed.limits_checked(account, Ok(PlanCheck::Limits { limits: checked, complete: true }), &mut Vec::new());
+        let refused = "control request req_2 failed: Unsupported control request subtype: get_usage";
+        changed.limits_checked(account, Err(ClaudeError::Unsupported(refused.into())), &mut Vec::new());
         // The agent asks: one question of two, the first answered.
         let mut asked = shell();
         if let Some(thread) = asked.thread_mut() {
@@ -280,7 +318,7 @@ fn snapshots() {
         let turn = spent.current.clone().unwrap_or_default();
         spent.send("Then make the other escape tests pass too", false, Vec::new(), &mut Vec::new());
         let lifts = unix_now() + 3_150;
-        let window = LimitWindow { name: "five_hour".into(), used: 1.0, resets: lifts };
+        let window = LimitWindow { name: "five_hour".into(), used: 1.0, resets: lifts, label: String::new() };
         let refused = Limits { at: unix_now(), status: "rejected".into(), resets: lifts, windows: vec![window] };
         for event in [
             AgentEvent::Limits(refused),
@@ -535,6 +573,7 @@ fn snapshots() {
             ("panel", panel()),
             ("panel-no-git", plain),
             ("subagents", delegating),
+            ("plan-changed", changed),
             ("subagent-open", inside),
             ("question", asked),
             ("slash", slash),

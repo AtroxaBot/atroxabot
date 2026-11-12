@@ -23,7 +23,7 @@ use atroxabot_core::worktree;
 use atroxabot_core::{
     Agent, AgentEvent, ApiEngine, ClaudeAgent, ClaudeError, ClaudeInfo, ClaudeMcpServer, Client, CodexAgent,
     CodexError, CodexInfo, Config, Connection, ConnectionKind, Control, Error, FollowUp, Limits, McpHub, McpServer,
-    Model, Records, SearchHit, Session, SessionStore, SessionSummary, Verdict,
+    Model, PlanCheck, Records, SearchHit, Session, SessionStore, SessionSummary, Verdict,
 };
 use atroxabot_voice::{Call, CallEvent, CallOptions, VoiceConfig};
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -103,6 +103,13 @@ pub enum WorkerEvent {
         connection: String,
         /// Its models and who is signed in, or why it could not be asked.
         result: Result<CodexInfo, CodexError>,
+    },
+    /// Claude Code said (or could not say) where a Claude account's plan limits stand.
+    LimitsChecked {
+        /// The account's connection id.
+        connection: String,
+        /// Its plan's windows, or why it could not say.
+        result: Result<PlanCheck, ClaudeError>,
     },
     /// Claude Code said (or could not say) which MCP servers a Claude account's sessions get.
     Connectors {
@@ -239,6 +246,8 @@ pub enum Action {
     ProbeClaude(Box<Connection>),
     /// Ask Claude Code which MCP servers (claude.ai connectors among them) a Claude account's sessions get.
     ProbeConnectors(Box<Connection>),
+    /// Ask Claude Code where a Claude account's plan limits stand (its own `/usage`).
+    CheckLimits(Box<Connection>),
     /// Open Claude Code's own sign-in for a Claude account, in a terminal.
     ClaudeLogin(Box<Connection>),
     /// Ask Codex what a Codex account offers.
@@ -815,6 +824,16 @@ impl App {
                 }
                 self.shell.codex_info(&connection, result, &mut actions);
             }
+            WorkerEvent::LimitsChecked { connection, result } => {
+                match &result {
+                    Err(e) => log::error(format!("Claude Code could not say where a plan's limits stand: {e}")),
+                    Ok(PlanCheck::Unavailable) => {
+                        log::error("Claude Code could not get a plan's limits from Anthropic");
+                    }
+                    Ok(_) => {}
+                }
+                self.shell.limits_checked(&connection, result, &mut actions);
+            }
             WorkerEvent::Connectors { connection, result } => {
                 if let Err(e) = &result {
                     log::error(format!("Claude Code could not say which MCP servers an account has: {e}"));
@@ -955,6 +974,10 @@ impl App {
             }),
             Action::ProbeConnectors(connection) => self.spawn(move || WorkerEvent::Connectors {
                 result: atroxabot_core::claude_connectors(&connection),
+                connection: connection.id.clone(),
+            }),
+            Action::CheckLimits(connection) => self.spawn(move || WorkerEvent::LimitsChecked {
+                result: atroxabot_core::claude_usage(&connection),
                 connection: connection.id.clone(),
             }),
             Action::ClaudeLogin(connection) => {

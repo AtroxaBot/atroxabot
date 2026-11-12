@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 use crate::cli::{build_args, command};
-use crate::parse::{Parsed, parse_line};
-use crate::{Error, Event, Info, McpServerStatus, Options, PermissionMode, find_cli};
+use crate::parse::{Parsed, is_refusal, parse_line};
+use crate::{Error, Event, Info, McpServerStatus, Options, PermissionMode, PlanUsage, find_cli};
 
 /// Longest line accepted from the binary; a longer one is dropped and reported.
 const MAX_LINE: usize = 8 * 1024 * 1024;
@@ -216,6 +216,18 @@ impl Session {
         self.request(&json!({"subtype": "get_context_usage", "detail": "summary"}))
     }
 
+    /// Asks where the account's plan limits stand, as Claude Code's `/usage` shows them; the answer arrives as
+    /// an [`Event::PlanUsage`]. Claude Code fetches them from Anthropic with its own sign-in (or answers from
+    /// what it fetched in the last minute), without the model, so nothing is used. The scan of local
+    /// transcripts `/usage` also shows is skipped. Anthropic calls the request experimental: a version that
+    /// drops it refuses it, which arrives as an [`Event::Error`].
+    ///
+    /// # Errors
+    /// [`Error::Closed`] after the session closed, [`Error::Io`] when the write fails.
+    pub fn plan_usage(&self) -> Result<(), Error> {
+        self.request(&json!({"subtype": "get_usage", "skip_behaviors": true}))
+    }
+
     /// Changes the model for the following turns; `None` returns to the default model.
     ///
     /// # Errors
@@ -351,6 +363,63 @@ pub fn mcp_servers(options: &Options, timeout: Duration) -> Result<Vec<McpServer
         (Ok(()), None) => Err(Error::NoInfo("it did not answer in time".to_owned())),
         (Err(why), _) => Err(Error::NoInfo(why)),
     }
+}
+
+/// Asks the binary where the account's plan limits stand (see [`Session::plan_usage`]) without sending it a
+/// message, so nothing is used: starts it, asks once it is ready, waits up to `timeout` for the answer, and
+/// stops it.
+///
+/// # Errors
+/// [`Error::Unsupported`] when the binary refuses the request or answers it in a shape this crate does not
+/// know (a version that dropped or changed it); otherwise the binary could not be started, ended first, or did
+/// not answer in time.
+pub fn plan_usage(options: &Options, timeout: Duration) -> Result<PlanUsage, Error> {
+    /// What the reader thread heard.
+    enum Heard {
+        Ready,
+        Usage(PlanUsage),
+        Refused(String),
+        Unknown,
+        Closed(String),
+    }
+    let (answers, inbox) = mpsc::channel();
+    let session = Session::connect(options, move |event| {
+        let heard = match event {
+            Event::Ready(_) => Heard::Ready,
+            Event::PlanUsage(usage) => Heard::Usage(usage),
+            Event::Error(why) if is_refusal(&why) => Heard::Refused(why),
+            Event::Other { kind, .. } if kind == "control_response" => Heard::Unknown,
+            Event::Closed { error, .. } => {
+                Heard::Closed(error.unwrap_or_else(|| "it stopped before answering".to_owned()))
+            }
+            _ => return,
+        };
+        // The receiver is gone once an answer was taken.
+        let _ = answers.send(heard);
+    })?;
+    let deadline = Instant::now() + timeout;
+    let mut asked = false;
+    let outcome = loop {
+        match inbox.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+            Ok(Heard::Ready) if !asked => {
+                asked = true;
+                if let Err(e) = session.plan_usage() {
+                    break Err(e);
+                }
+            }
+            Ok(Heard::Usage(usage)) => break Ok(usage),
+            Ok(Heard::Refused(why)) if asked => break Err(Error::Unsupported(why)),
+            Ok(Heard::Unknown) if asked => {
+                break Err(Error::Unsupported("its answer has a shape not known here".into()));
+            }
+            // Before it was asked, only `initialize` can have failed.
+            Ok(Heard::Refused(why) | Heard::Closed(why)) => break Err(Error::NoInfo(why)),
+            Ok(Heard::Ready | Heard::Unknown) => {}
+            Err(_) => break Err(Error::NoInfo("it did not answer in time".to_owned())),
+        }
+    };
+    session.close();
+    outcome
 }
 
 impl Drop for Session {
@@ -622,6 +691,28 @@ mod tests {
         };
         assert_eq!(deny(false), json!({"behavior": "deny", "message": "not now"}));
         assert_eq!(deny(true), json!({"behavior": "deny", "message": "not now", "interrupt": true}));
+    }
+
+    /// Uses no model and none of the owner's usage, but Claude Code asks Anthropic: run by hand after Claude
+    /// Code changes, to confirm that `get_usage` (which Anthropic calls experimental) is still answered in the
+    /// shape this crate reads. Prints no email address.
+    #[test]
+    #[ignore = "talks to the real Claude Code binary"]
+    fn live_plan_usage() {
+        let options = Options { cwd: Some(std::env::temp_dir()), ..Options::default() };
+        let path = find_cli().expect("no Claude Code binary installed");
+        println!("cli: {} version {}", path.display(), crate::cli_version(&path).unwrap());
+        let usage = plan_usage(&options, Duration::from_secs(60)).expect("get_usage was not answered");
+        println!("subscription {:?}, plan limits apply: {}", usage.subscription, usage.available);
+        let limits = usage.limits.expect("no limits: an API key, or Anthropic's usage page did not answer");
+        for window in limits.windows.iter().chain(limits.models.iter().flatten()) {
+            println!("{}: {:.0}% until {}", window.name, window.utilization * 100.0, window.resets_at);
+        }
+        let names: Vec<&str> = limits.windows.iter().map(|window| window.name.as_str()).collect();
+        assert!(names.contains(&"five_hour") && names.contains(&"seven_day"), "plan windows: {names:?}");
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert!(limits.windows.iter().all(|window| window.resets_at > now), "every window says when it resets");
+        assert!(limits.models.is_some(), "a fresh answer says which models have a week of their own");
     }
 
     /// Uses the owner's Claude usage: run by hand, once, to confirm the wire format against the real binary.

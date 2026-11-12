@@ -8,8 +8,16 @@ use serde_json::Value;
 use crate::cli::preview;
 use crate::{
     Account, Block, ContextCategory, ContextUsage, Event, Info, Init, McpServerStatus, ModelInfo, PermissionRequest,
-    RateLimit, RateWindow, SlashCommand, Task, TaskState, TurnResult, Usage,
+    PlanLimits, PlanUsage, RateLimit, RateWindow, SlashCommand, Task, TaskState, TurnResult, Usage,
 };
+
+/// How a control request of ours that failed is reported: [`Event::Error`] with this before its id.
+const REFUSED: &str = "control request ";
+
+/// Whether an [`Event::Error`] says a control request of ours failed.
+pub(crate) fn is_refusal(error: &str) -> bool {
+    error.starts_with(REFUSED)
+}
 
 /// What a line of output amounts to.
 #[derive(Debug, PartialEq)]
@@ -109,25 +117,10 @@ pub(crate) fn parse_line(line: &str) -> Parsed {
         "control_response" => {
             let response = field(&data, "response");
             if field(response, "subtype").as_str() != Some("error") {
-                // Only the answer to `initialize` lists models, only that to `mcp_status` servers, only
-                // that to `get_context_usage` categories.
-                let answer = field(response, "response");
-                return if answer.get("models").is_some() {
-                    Parsed::Event(Event::Ready(info(answer)))
-                } else if let Some(servers) = answer.get("mcpServers").and_then(Value::as_array) {
-                    Parsed::Event(Event::McpStatus(servers.iter().filter_map(mcp_server).collect()))
-                } else if let Some(categories) = answer.get("categories").and_then(Value::as_array) {
-                    Parsed::Event(Event::ContextUsage(ContextUsage {
-                        categories: categories.iter().take(64).filter_map(context_category).collect(),
-                        total: number(answer, "totalTokens"),
-                        max: number(answer, "maxTokens"),
-                    }))
-                } else {
-                    Parsed::Nothing
-                };
+                return control_answer(data);
             }
             Event::Error(format!(
-                "control request {} failed: {}",
+                "{REFUSED}{} failed: {}",
                 text(response, "request_id"),
                 opt_text(response, "error").unwrap_or_else(|| "unknown error".into())
             ))
@@ -141,6 +134,130 @@ pub(crate) fn parse_line(line: &str) -> Parsed {
         },
         _ => Event::Other { subtype: text(&data, "subtype"), kind, raw: data },
     })
+}
+
+/// A successful `control_response`: an answer this crate models becomes its event, any other answer that says
+/// something passes through as [`Event::Other`], and a bare acknowledgement is nothing.
+fn control_answer(data: Value) -> Parsed {
+    let answer = field(field(&data, "response"), "response");
+    // Only the answer to `initialize` lists models, only that to `mcp_status` servers, only that to
+    // `get_context_usage` categories, only that to `get_usage` the plan's limits.
+    let event = if answer.get("models").is_some() {
+        Event::Ready(info(answer))
+    } else if let Some(servers) = answer.get("mcpServers").and_then(Value::as_array) {
+        Event::McpStatus(servers.iter().filter_map(mcp_server).collect())
+    } else if let Some(categories) = answer.get("categories").and_then(Value::as_array) {
+        Event::ContextUsage(ContextUsage {
+            categories: categories.iter().take(64).filter_map(context_category).collect(),
+            total: number(answer, "totalTokens"),
+            max: number(answer, "maxTokens"),
+        })
+    } else if answer.get("rate_limits_available").is_some() || answer.get("rate_limits").is_some() {
+        Event::PlanUsage(plan_usage(answer))
+    } else if answer.as_object().is_some_and(|fields| !fields.is_empty()) {
+        Event::Other { kind: "control_response".into(), subtype: "success".into(), raw: data }
+    } else {
+        return Parsed::Nothing;
+    };
+    Parsed::Event(event)
+}
+
+/// The windows of the whole plan an answer to `get_usage` can name, as the Agent SDK's types list them.
+const PLAN_WINDOWS: [&str; 5] =
+    ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "seven_day_oauth_apps"];
+
+/// The answer to `get_usage`.
+fn plan_usage(answer: &Value) -> PlanUsage {
+    let limits = field(answer, "rate_limits");
+    PlanUsage {
+        subscription: text(answer, "subscription_type"),
+        available: field(answer, "rate_limits_available").as_bool().unwrap_or(limits.is_object()),
+        limits: limits.is_object().then(|| PlanLimits {
+            windows: PLAN_WINDOWS.iter().filter_map(|name| usage_window(name, field(limits, name))).collect(),
+            models: field(limits, "model_scoped").as_array().map(|models| {
+                let named = |model: &Value| usage_window(&text(model, "display_name"), model);
+                models.iter().take(16).filter_map(named).collect()
+            }),
+        }),
+        raw: answer.clone(),
+    }
+}
+
+/// A window of the answer to `get_usage`, which says how much of it is used in percent and when it resets as
+/// an ISO 8601 time. `None` without a name or a number.
+fn usage_window(name: &str, window: &Value) -> Option<RateWindow> {
+    let name: String = name.trim().chars().take(40).collect();
+    let used = field(window, "utilization").as_f64().filter(|used| used.is_finite())?;
+    (!name.is_empty()).then(|| RateWindow {
+        name,
+        utilization: (used / 100.0).clamp(0.0, 1.0),
+        resets_at: field(window, "resets_at").as_str().and_then(unix_time).unwrap_or(0),
+        status: String::new(),
+    })
+}
+
+/// The Unix seconds of an ISO 8601 time such as `2026-11-12T19:09:59.569441+00:00` (a fraction of a second is
+/// dropped); `None` for anything else, a time without its offset, or one before 1970.
+fn unix_time(time: &str) -> Option<u64> {
+    let time = time.trim();
+    let at = |index: usize| time.as_bytes().get(index).copied();
+    let digits = |range: std::ops::Range<usize>| -> Option<i64> {
+        let part = time.get(range)?;
+        if part.bytes().all(|byte| byte.is_ascii_digit()) { part.parse().ok() } else { None }
+    };
+    let separated = at(4) == Some(b'-')
+        && at(7) == Some(b'-')
+        && matches!(at(10), Some(b'T' | b't' | b' '))
+        && at(13) == Some(b':')
+        && at(16) == Some(b':');
+    if !separated {
+        return None;
+    }
+    let (year, month, day) = (digits(0..4)?, digits(5..7)?, digits(8..10)?);
+    let (hour, minute, second) = (digits(11..13)?, digits(14..16)?, digits(17..19)?);
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let month_days = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    if !(1..=12).contains(&month) || !(1..=month_days).contains(&day) || hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+    let mut zone = time.get(19..)?;
+    if let Some(fraction) = zone.strip_prefix('.') {
+        let end = fraction.find(|c: char| !c.is_ascii_digit()).unwrap_or(fraction.len());
+        if end == 0 {
+            return None;
+        }
+        zone = &fraction[end..];
+    }
+    let offset = match zone.as_bytes().first() {
+        Some(b'Z' | b'z') if zone.len() == 1 => 0,
+        Some(&sign @ (b'+' | b'-')) => {
+            let hhmm = &zone[1..];
+            let (hours, minutes) = match hhmm.len() {
+                5 if hhmm.as_bytes()[2] == b':' => (hhmm.get(0..2)?, hhmm.get(3..5)?),
+                4 => (hhmm.get(0..2)?, hhmm.get(2..4)?),
+                2 => (hhmm, "00"),
+                _ => return None,
+            };
+            let number =
+                |part: &str| part.bytes().all(|byte| byte.is_ascii_digit()).then(|| part.parse::<i64>().ok())?;
+            let (hours, minutes) = (number(hours).filter(|h| *h <= 23)?, number(minutes).filter(|m| *m <= 59)?);
+            let seconds = hours * 3600 + minutes * 60;
+            if sign == b'-' { -seconds } else { seconds }
+        }
+        _ => return None,
+    };
+    // Days since 1970-01-01, by Howard Hinnant's `days_from_civil`.
+    let shifted = if month <= 2 { year - 1 } else { year };
+    let era = shifted.div_euclid(400);
+    let of_era = shifted - era * 400;
+    let of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
+    let days = era * 146_097 + of_era * 365 + of_era / 4 - of_era / 100 + of_year - 719_468;
+    u64::try_from(days * 86_400 + hour * 3600 + minute * 60 + second - offset).ok()
 }
 
 /// One kind of thing the context holds, of the answer to `get_context_usage`; `None` without a name.
@@ -773,6 +890,100 @@ mod tests {
             [("system_prompt", 3213, "used"), ("mcp_tools_deferred", 32_959, "deferred"), ("messages", 0, "used")]
         );
         assert_eq!(usage.categories[0].name, "System prompt");
+    }
+
+    #[test]
+    fn plan_usage_answers() {
+        // As Claude Code 2.1.322 answers `get_usage` with `skip_behaviors` (shortened: it also sends the
+        // session's totals, the server's own rows of limits, spend, and more fields under code names).
+        let line = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_2","response":{
+            "session":{"total_cost_usd":0,"model_usage":{}},"subscription_type":"team","rate_limits_available":true,
+            "rate_limits":{"five_hour":{"utilization":1,"resets_at":"2026-11-12T19:09:59.569441+00:00",
+            "limit_dollars":null},"seven_day":{"utilization":11,"resets_at":"2026-11-19T02:59:59.569461+00:00"},
+            "seven_day_oauth_apps":null,"seven_day_opus":null,"seven_day_sonnet":{"utilization":null},
+            "tangelo":null,"extra_usage":{"is_enabled":false,"utilization":null},
+            "limits":[{"kind":"weekly_scoped","percent":21,"scope":{"model":{"display_name":"Fable"}}}],
+            "model_scoped":[{"display_name":"Fable","utilization":21,"resets_at":"2026-11-19T02:59:59.569637+00:00"},
+            {"display_name":" ","utilization":5},{"display_name":"Odd","utilization":"lots"},7]},"behaviors":null}}}"#;
+        let Event::PlanUsage(usage) = event(&line.replace('\n', " ")) else { panic!("not a plan usage") };
+        assert_eq!((usage.subscription.as_str(), usage.available), ("team", true));
+        let limits = usage.limits.expect("limits");
+        let seen = |windows: &[RateWindow]| -> Vec<(String, f64, u64)> {
+            windows.iter().map(|w| (w.name.clone(), w.utilization, w.resets_at)).collect()
+        };
+        let plan = [("five_hour".to_owned(), 0.01, 1_794_510_599), ("seven_day".to_owned(), 0.11, 1_795_057_199)];
+        assert_eq!(seen(&limits.windows), plan, "null and numberless windows are left out");
+        let fable = [("Fable".to_owned(), 0.21, 1_795_057_199)];
+        assert_eq!(seen(limits.models.as_deref().expect("models")), fable, "nameless and mistyped ones too");
+
+        // An API key: no plan limits. Anthropic's usage page did not answer: none known.
+        let none = r#"{"type":"control_response","response":{"subtype":"success","response":{
+            "subscription_type":null,"rate_limits_available":false,"rate_limits":null,"behaviors":null}}}"#;
+        let Event::PlanUsage(usage) = event(&none.replace('\n', " ")) else { panic!("not a plan usage") };
+        assert_eq!((usage.subscription.as_str(), usage.available, usage.limits), ("", false, None));
+        let failed = r#"{"type":"control_response","response":{"response":{"rate_limits_available":true,
+            "rate_limits":null}}}"#;
+        let Event::PlanUsage(usage) = event(&failed.replace('\n', " ")) else { panic!("not a plan usage") };
+        assert_eq!((usage.available, usage.limits), (true, None));
+        // Answered from what Claude Code kept: nothing is known of the models' windows. Out of range is clamped.
+        let kept = r#"{"type":"control_response","response":{"response":{"rate_limits":{
+            "five_hour":{"utilization":250,"resets_at":7},"seven_day":{"utilization":-3}}}}}"#;
+        let Event::PlanUsage(usage) = event(&kept.replace('\n', " ")) else { panic!("not a plan usage") };
+        assert!(usage.available, "limits that came say they apply");
+        let limits = usage.limits.expect("limits");
+        assert_eq!(seen(&limits.windows), [("five_hour".to_owned(), 1.0, 0), ("seven_day".to_owned(), 0.0, 0)]);
+        assert_eq!(limits.models, None);
+        let no_models = r#"{"type":"control_response","response":{"response":{"rate_limits":{"model_scoped":[]}}}}"#;
+        let Event::PlanUsage(usage) = event(no_models) else { panic!("not a plan usage") };
+        assert_eq!(usage.limits.and_then(|limits| limits.models), Some(Vec::new()));
+        let odd = r#"{"type":"control_response","response":{"response":{"rate_limits":[1,2]}}}"#;
+        assert!(matches!(event(odd), Event::PlanUsage(PlanUsage { limits: None, .. })));
+    }
+
+    #[test]
+    fn answers_this_crate_does_not_know_pass_through() {
+        let unknown = r#"{"type":"control_response","response":{"subtype":"success","response":{"rows":[1]}}}"#;
+        let Event::Other { kind, subtype, raw } = event(unknown) else { panic!("not other") };
+        assert_eq!(
+            (kind.as_str(), subtype.as_str(), &raw["response"]["response"]["rows"][0]),
+            ("control_response", "success", &json!(1))
+        );
+        let done = r#"{"type":"control_response","response":{"subtype":"success","response":{}}}"#;
+        assert_eq!(parse_line(done), Parsed::Nothing, "an acknowledgement says nothing");
+        let failed = r#"{"type":"control_response","response":{"subtype":"error","request_id":"req_2","error":"x"}}"#;
+        assert!(matches!(event(failed), Event::Error(why) if is_refusal(&why)));
+        assert!(!is_refusal("unparseable line"));
+    }
+
+    #[test]
+    fn iso_times() {
+        assert_eq!(unix_time("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(unix_time("2026-11-12T19:09:59.569441+00:00"), Some(1_794_510_599));
+        assert_eq!(unix_time(" 2026-11-12t20:09:59+01:00 "), Some(1_794_510_599));
+        assert_eq!(unix_time("2026-11-12 14:09:59-0500"), Some(1_794_510_599));
+        assert_eq!(unix_time("2026-11-12T21:09:59.5+02"), Some(1_794_510_599));
+        assert_eq!(unix_time("2024-02-29T00:00:00Z"), Some(1_709_164_800));
+        assert_eq!(unix_time("2000-03-01T12:30:00.000Z"), Some(951_913_800));
+        for wrong in [
+            "",
+            "2026-11-12",
+            "2026-11-12T19:09:59",
+            "2026-13-01T00:00:00Z",
+            "2025-02-29T00:00:00Z",
+            "2026-11-12T24:00:00Z",
+            "1969-12-31T23:59:59Z",
+            "2026-11-12T19:09:59.Z",
+            "2026-11-12T19:09:59+1:00",
+            "2026-11-12T19:09:59+25:00",
+            "2026-11-12T19:09:59Zjunk",
+            "+2026-11-12T19:09:59Z",
+            "２０２６-11-12T19:09:59Z",
+            "2026-11-12T19:09:5\u{e9}Z",
+            "2026-11-12T19:09:59+0\u{e9}:00",
+            "2026-11-12T19:09:59+0\u{e9}0",
+        ] {
+            assert_eq!(unix_time(wrong), None, "{wrong:?}");
+        }
     }
 
     #[test]
