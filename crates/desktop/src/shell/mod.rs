@@ -29,7 +29,7 @@ mod update;
 mod widgets;
 mod worktrees;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use arboard::Clipboard;
@@ -108,6 +108,18 @@ pub(super) enum Connectors {
     Failed(String),
 }
 
+/// A command-line agent the app runs as installed: Claude Code or Codex.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Cli {
+    /// Claude Code, for Claude accounts.
+    Claude,
+    /// The Codex CLI, for Codex accounts.
+    Codex,
+}
+
+/// What a Claude or Codex account says while its tool's installer is open and the tool is not found yet.
+const INSTALLING: &str = "Installing: finish in the installer's window";
+
 /// What is known of a Claude account: what Claude Code said when asked.
 #[derive(Debug, Clone)]
 enum Account {
@@ -182,6 +194,8 @@ pub struct Shell {
     claude: HashMap<String, Account>,
     /// What Codex says of each Codex account, by connection id.
     codex: HashMap<String, CodexAccount>,
+    /// The tools whose installer was opened and that have not been found since.
+    installing: HashSet<Cli>,
     /// Problems to tell the user about, oldest first.
     notices: Vec<Notice>,
     call: Option<CallView>,
@@ -252,6 +266,7 @@ impl Shell {
             models: HashMap::new(),
             claude: HashMap::new(),
             codex: HashMap::new(),
+            installing: HashSet::new(),
             notices: Vec::new(),
             call: None,
             sidebar_scroll: Scroll::default(),
@@ -334,6 +349,7 @@ impl Shell {
                     merge_limits(self.limits.entry(connection.to_owned()).or_default(), limits);
                     actions.push(Action::SaveLimits(self.limits.clone()));
                 }
+                self.installing.remove(&Cli::Codex);
                 CodexAccount::Ready(Box::new(info))
             }
             Err(CodexError::NotFound) => CodexAccount::Missing,
@@ -350,11 +366,26 @@ impl Shell {
     /// Claude Code answered (or could not) about the Claude account `connection`.
     pub fn claude_info(&mut self, connection: &str, result: Result<ClaudeInfo, ClaudeError>) {
         let account = match result {
-            Ok(info) => Account::Ready(Box::new(info)),
+            Ok(info) => {
+                self.installing.remove(&Cli::Claude);
+                Account::Ready(Box::new(info))
+            }
             Err(ClaudeError::NotFound) => Account::Missing,
             Err(e) => Account::Failed(e.to_string()),
         };
         self.claude.insert(connection.to_owned(), account);
+    }
+
+    /// The installer of `cli` is open in a terminal: what waits for it says
+    /// so until it is found, which the app looks for again when the user
+    /// comes back to its window ([`Shell::focused`]).
+    pub fn installing(&mut self, cli: Cli) {
+        self.installing.insert(cli);
+    }
+
+    /// Whether the installer of `cli` was opened and `cli` is not found yet.
+    fn is_installing(&self, cli: Cli) -> bool {
+        self.installing.contains(&cli)
     }
 
     /// Claude Code said (or could not say) which MCP servers a Claude account's sessions get.
@@ -750,6 +781,10 @@ impl Shell {
         // What the user sends is what happens next, not going on by itself after a usage limit.
         self.cancel_resume(&session);
         let Some(thread) = self.threads.get_mut(&session) else { return };
+        // What the user sends is for the conversation: a subagent open in its place gives way to it.
+        if thread.sub.is_some() {
+            thread.open_agent(None);
+        }
         if !thread.loaded {
             // Its messages are still being read: it goes once they are in, never over them.
             thread.queued = Some((text.to_owned(), spoken, files));
@@ -783,9 +818,7 @@ impl Shell {
         if connection.kind == ConnectionKind::ClaudeAgent {
             match self.claude.get(&connection.id) {
                 Some(Account::Missing) => {
-                    self.notify(
-                        "Claude Code is not installed. Install it and sign in, or pick an API provider.".into(),
-                    );
+                    self.notify("Claude Code is not installed: install it in Settings, Providers.".into());
                     return None;
                 }
                 Some(Account::Ready(info)) if info.account.email.is_empty() => {
@@ -798,11 +831,7 @@ impl Shell {
         if connection.kind == ConnectionKind::Codex {
             match self.codex.get(&connection.id) {
                 Some(CodexAccount::Missing) => {
-                    self.notify(
-                        "Codex is not installed. Install it (npm install -g @openai/codex) and sign in, or pick \
-                         another provider."
-                            .into(),
-                    );
+                    self.notify("Codex is not installed: install it in Settings, Providers.".into());
                     return None;
                 }
                 Some(CodexAccount::Ready(info)) if info.account.is_none() && info.requires_auth => {
@@ -2444,6 +2473,45 @@ mod tests {
         actions.clear();
         shell.send("Commit it", false, Vec::new(), &mut actions);
         assert!(actions.iter().any(|a| matches!(a, Action::CloseLive(closed) if *closed == session)));
+    }
+
+    /// Claude Code is missing; its installer is opened; the account says so
+    /// until Claude Code is found, which the app looks for when the user
+    /// comes back to the settings.
+    #[test]
+    fn an_opened_installer_is_waited_for_until_its_tool_is_found() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let claude = shell.config.connection(Connection::CLAUDE_AGENT).expect("the first account");
+        shell.claude_info(&claude.id, Err(ClaudeError::NotFound));
+        assert_eq!(shell.provider_detail(&claude), "Claude Code is not installed");
+        shell.installing(Cli::Claude);
+        assert_eq!(shell.provider_detail(&claude), INSTALLING);
+        // Back in the settings, it is looked for again; found, the account just needs signing in.
+        shell.modal = Some(Modal::Settings(Box::new(settings::Settings::new(settings::Tab::Providers))));
+        let mut actions = Vec::new();
+        shell.focused(&mut actions);
+        assert!(actions.iter().any(|a| matches!(a, Action::ProbeClaude(asked) if asked.id == claude.id)));
+        shell.claude_info(&claude.id, Ok(ClaudeInfo::default()));
+        assert!(!shell.is_installing(Cli::Claude));
+        assert_eq!(shell.provider_detail(&claude), "Not signed in");
+    }
+
+    /// A subagent left open in the conversation's place gives way to it
+    /// when the user sends something: their message and the reply show.
+    #[test]
+    fn sending_goes_back_to_the_conversation() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        shell.start(&mut actions);
+        let session = working(&mut shell, &mut actions);
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: Some("Out of usage".into()) }, &mut actions);
+        shell.thread_mut().expect("open").open_agent(Some("old-agent".into()));
+        shell.send("continue", false, Vec::new(), &mut actions);
+        assert_eq!(shell.thread().expect("open").sub, None, "a new turn");
+        // Sent while the agent works, it waits in the tray, and the conversation shows too.
+        shell.thread_mut().expect("open").open_agent(Some("old-agent".into()));
+        shell.send("and the tests", false, Vec::new(), &mut actions);
+        assert_eq!(shell.thread().expect("open").sub, None, "a follow-up");
     }
 
     fn working(shell: &mut Shell, actions: &mut Vec<Action>) -> String {

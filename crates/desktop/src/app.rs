@@ -37,7 +37,7 @@ use crate::image::{self, ImageAtlas, ImageKey};
 use crate::log;
 use crate::paint::{Painter, Rect};
 use crate::platform;
-use crate::shell::Shell;
+use crate::shell::{Cli, Shell};
 use crate::text::{Fonts, GlyphAtlas};
 use crate::theme::{Palette, Scheme};
 use crate::titlebar::{self, Command, Grab};
@@ -245,6 +245,8 @@ pub enum Action {
     ProbeCodex(Box<Connection>),
     /// Open Codex's own sign-in for a Codex account, in a terminal.
     CodexLogin(Box<Connection>),
+    /// Open the maker's own installer of Claude Code or Codex, in a terminal.
+    Install(Cli),
     /// Search every session's messages.
     Search {
         /// The text to find.
@@ -959,9 +961,7 @@ impl App {
                 // Claude Code's own sign-in, in a terminal the user sees: the app only starts it.
                 let started = atroxabot_core::claude_login(&connection)
                     .ok_or_else(|| "Claude Code is not installed.".to_owned())
-                    .and_then(|login| {
-                        platform::run_in_terminal(&login.program, &login.args, &login.env).map_err(|e| e.to_string())
-                    });
+                    .and_then(|login| in_terminal("Sign in to Claude", &login));
                 if let Err(e) = started {
                     self.shell.notify(format!("The sign-in could not be opened: {e}"));
                 }
@@ -974,11 +974,20 @@ impl App {
                 // Codex's own sign-in, in a terminal the user sees: the app only starts it.
                 let started = atroxabot_core::codex_login(&connection)
                     .ok_or_else(|| "Codex is not installed.".to_owned())
-                    .and_then(|login| {
-                        platform::run_in_terminal(&login.program, &login.args, &login.env).map_err(|e| e.to_string())
-                    });
+                    .and_then(|login| in_terminal("Sign in to Codex", &login));
                 if let Err(e) = started {
                     self.shell.notify(format!("The sign-in could not be opened: {e}"));
+                }
+            }
+            Action::Install(cli) => {
+                // The maker's own installer, in a terminal the user sees and answers: the app only starts it.
+                let (title, installer) = match cli {
+                    Cli::Claude => ("Install Claude Code", atroxabot_core::claude_install()),
+                    Cli::Codex => ("Install Codex", atroxabot_core::codex_install()),
+                };
+                match in_terminal(title, &installer) {
+                    Ok(()) => self.shell.installing(cli),
+                    Err(e) => self.shell.notify(format!("The installer could not be opened: {e}")),
                 }
             }
             Action::Search { query, generation } => {
@@ -1584,6 +1593,11 @@ impl Live {
 /// Lets an agent's process go on another thread: closing it waits for
 /// the process, which the UI must not. The hold on the worktree it worked
 /// in, if any, ends once it has.
+/// Runs `command` in a terminal the user sees, its window named `title`.
+fn in_terminal(title: &str, command: &atroxabot_core::TerminalCommand) -> Result<(), String> {
+    platform::run_in_terminal(title, &command.program, &command.args, &command.env).map_err(|e| e.to_string())
+}
+
 fn retire(live: Live, lease: Option<worktree::Lease>) {
     let _ = std::thread::Builder::new().name("atroxabot-retire".into()).spawn(move || {
         live.close();

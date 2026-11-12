@@ -17,7 +17,7 @@ use winit::window::CursorIcon;
 use super::menu::Menu;
 use super::skills::SkillsPage;
 use super::widgets::{Scroll, chip, dropdown, line_field, logo_badge, modal, row, tile, toggle};
-use super::{Account, CodexAccount, Connectors, Shell};
+use super::{Account, Cli, CodexAccount, Connectors, Shell};
 use crate::app::Action;
 use crate::editor::Editor;
 use crate::form::Fields;
@@ -125,6 +125,9 @@ pub(super) struct Settings {
     armed: Option<String>,
     /// The worktrees page was shown: what is on disk was asked for.
     listed: bool,
+    /// The page is shown scrolled to its end: for a snapshot of what is at its foot.
+    #[cfg(test)]
+    pub(super) at_end: bool,
 }
 
 impl Settings {
@@ -143,6 +146,8 @@ impl Settings {
             skills: SkillsPage::new(),
             armed: None,
             listed: false,
+            #[cfg(test)]
+            at_end: false,
         }
     }
 
@@ -365,6 +370,10 @@ impl Settings {
         p.set_clip(clip);
         let content = end + offset - area.y + 24.0;
         self.scroll.finish(ui, content, area.h);
+        #[cfg(test)]
+        if self.at_end {
+            self.scroll.jump_to_end();
+        }
         self.scroll.bar(p, ui, area, content);
         leave
     }
@@ -501,17 +510,27 @@ impl Settings {
             Account::Ready(info) => Some(format!("Claude Code {}", info.version)),
             _ => None,
         });
-        let missing = shell.claude.values().any(|account| matches!(account, Account::Missing));
+        let missing = installed.is_none() && shell.claude.values().any(|account| matches!(account, Account::Missing));
         let (title, about) = match (installed, missing) {
             (Some(version), _) => (version, "Claude accounts run the Claude Code installed here, as it is."),
+            (None, true) if shell.is_installing(Cli::Claude) => (
+                "Installing Claude Code".to_owned(),
+                "Finish in the installer's window. This updates when you come back.",
+            ),
             (None, true) => (
                 "Claude Code is not installed".to_owned(),
                 "Install it to use Claude accounts. API providers work without it.",
             ),
             (None, false) => ("Looking for Claude Code…".to_owned(), ""),
         };
-        row(p, Rect::new(x, y, w, 58.0), (icon::SPARKLES, theme::provider_color("claude")), &title, about, 0.0);
+        let claude = Rect::new(x, y, w, 58.0);
+        let room = if missing { 130.0 } else { 0.0 };
+        row(p, claude, (icon::SPARKLES, theme::provider_color("claude")), &title, about, room);
         logo_badge(p, Rect::new(x + 12.0, y + 12.0, 34.0, 34.0), Logo::Claude, theme::provider_color("claude"));
+        let install = Rect::new(claude.right() - 122.0, claude.y + 13.0, 110.0, 32.0);
+        if missing && button(p, ui, install, "Install", ButtonStyle::Secondary, true) {
+            actions.push(Action::Install(Cli::Claude));
+        }
         y += 66.0;
         let data = Rect::new(x, y, w, 58.0);
         row(
@@ -559,6 +578,7 @@ impl Settings {
             let state = shell.codex.get(&account.id);
             let signed_in = matches!(state, Some(CodexAccount::Ready(info)) if info.account.is_some());
             let can_sign_in = matches!(state, Some(CodexAccount::Ready(_) | CodexAccount::Failed(_)));
+            let missing = matches!(state, Some(CodexAccount::Missing));
             let title = if self.is_renaming(&account.id) { "" } else { account.name.as_str() };
             row(
                 p,
@@ -589,6 +609,12 @@ impl Settings {
                 let sign_in = Rect::new(right - 92.0, rect.y + 13.0, 84.0, 32.0);
                 if button(p, ui, sign_in, "Sign in", ButtonStyle::Primary, true) {
                     actions.push(Action::CodexLogin(Box::new(account.clone())));
+                }
+            } else if missing {
+                // OpenAI's own installer; once Codex is found, the account signs in.
+                let install = Rect::new(right - 92.0, rect.y + 13.0, 84.0, 32.0);
+                if button(p, ui, install, "Install", ButtonStyle::Primary, true) {
+                    actions.push(Action::Install(Cli::Codex));
                 }
             }
             y += 66.0;
@@ -640,10 +666,11 @@ impl Settings {
             }
             y += 116.0;
         }
-        let note = "A Codex account is the Codex CLI you installed (npm install -g @openai/codex), run as it is, \
-                    with its own tools, sandbox and approvals, on your ChatGPT plan or API key. Each account you \
-                    add has a Codex home of its own, with its own sign-in, settings and conversations. Signing \
-                    in opens Codex in a terminal; AtroxaBot never sees your credentials.";
+        let note = "A Codex account is the Codex CLI installed here, run as it is, with its own tools, sandbox \
+                    and approvals, on your ChatGPT plan or API key. Without it, Install opens OpenAI's own \
+                    installer in a terminal. Each account you add has a Codex home of its own, with its own \
+                    sign-in, settings and conversations. Signing in opens Codex in a terminal; AtroxaBot never \
+                    sees your credentials.";
         Self::note(p, (x, y + 2.0, w), note) + 30.0
     }
 
@@ -683,6 +710,7 @@ impl Settings {
             let state = shell.claude.get(&account.id);
             let signed_in = matches!(state, Some(Account::Ready(info)) if !info.account.email.is_empty());
             let can_sign_in = matches!(state, Some(Account::Ready(_) | Account::Failed(_)));
+            let missing = matches!(state, Some(Account::Missing));
             let mark = (icon::SPARKLES, Shell::provider_tint(account));
             let title = if self.is_renaming(&account.id) { "" } else { account.name.as_str() };
             row(p, rect, mark, title, &shell.provider_detail(account), 190.0);
@@ -707,6 +735,12 @@ impl Settings {
                 let sign_in = Rect::new(right - 92.0, rect.y + 13.0, 84.0, 32.0);
                 if button(p, ui, sign_in, "Sign in", ButtonStyle::Primary, true) {
                     actions.push(Action::ClaudeLogin(Box::new(account.clone())));
+                }
+            } else if missing {
+                // Anthropic's own installer; once Claude Code is found, the account signs in.
+                let install = Rect::new(right - 92.0, rect.y + 13.0, 84.0, 32.0);
+                if button(p, ui, install, "Install", ButtonStyle::Primary, true) {
+                    actions.push(Action::Install(Cli::Claude));
                 }
             }
             y += 66.0;
@@ -780,8 +814,9 @@ impl Settings {
         let note = "\"Claude\" is Claude Code as you use it in your terminal: whoever `claude` is signed in as there, \
                     with the skills, plugins and settings you have there. Each account you add is a Claude Code \
                     profile of its own, with its own sign-in, settings and history, and starts without those. \
-                    Signing in opens Claude Code in a terminal; AtroxaBot never sees your credentials, and usage \
-                    is billed to the account you sign in to.";
+                    Without Claude Code, Install opens Anthropic's own installer in a terminal. Signing in opens \
+                    Claude Code in a terminal; AtroxaBot never sees your credentials, and usage is billed to the \
+                    account you sign in to.";
         y = Self::note(p, (x, y + 2.0, w), note) + 30.0;
 
         y = self.codex_accounts(p, ui, (x, y, w), shell, &mut changed, actions);

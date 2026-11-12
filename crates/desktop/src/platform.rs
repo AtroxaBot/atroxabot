@@ -502,24 +502,27 @@ pub fn pick_folder(title: &str) -> io::Result<Option<PathBuf>> {
 }
 
 /// Runs `program` with `args` in a terminal window the user sees and can
-/// type in, with `env` added to the app's environment.
+/// type in, with `env` added to the app's environment. `title` names the
+/// window where the system lets it be named (Windows).
 ///
 /// # Errors
 /// No terminal could be started.
-pub fn run_in_terminal(program: &Path, args: &[String], env: &[(String, String)]) -> io::Result<()> {
+pub fn run_in_terminal(title: &str, program: &Path, args: &[String], env: &[(String, String)]) -> io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
         // `start` opens a console of its own and `cmd /K` keeps it open afterwards. `start` takes its
         // first quoted argument as the window's title and its first unquoted one as the program, so the
-        // title goes in quoted, exactly as written here.
+        // title goes in quoted, with nothing in it that could end the quotes or be read by `cmd`.
+        let title: String = title.chars().filter(|c| c.is_alphanumeric() || " .-".contains(*c)).collect();
         let mut command = Command::new("cmd");
-        command.args(["/C", "start"]).raw_arg("\"Sign in to Claude\"").args(["cmd", "/K"]).arg(program).args(args);
+        command.args(["/C", "start"]).raw_arg(format!("\"{title}\"")).args(["cmd", "/K"]).arg(program).args(args);
         command.envs(env.iter().map(|(name, value)| (name.as_str(), value.as_str())));
         command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(|_| ())
     }
     #[cfg(not(windows))]
     {
+        let _ = title;
         run_in_unix_terminal(program, args, env)
     }
 }
@@ -585,7 +588,7 @@ mod tests {
         // The program is `cmd` itself, writing a variable it was given and closing its window again.
         let args = ["/C".to_owned(), format!("echo %ATROXABOT_TEST%>{} & exit", out.display())];
         let env = [("ATROXABOT_TEST".to_owned(), "it works".to_owned())];
-        run_in_terminal(Path::new("cmd.exe"), &args, &env).unwrap();
+        run_in_terminal("AtroxaBot test", Path::new("cmd.exe"), &args, &env).unwrap();
         let mut written = String::new();
         for _ in 0..50 {
             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -603,6 +606,34 @@ mod tests {
         let _ = Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output();
         let _ = std::fs::remove_file(&out);
         assert_eq!(written.trim(), "it works", "the program ran in the terminal, with the variable");
+    }
+
+    /// An installer's one-line command (a PowerShell pipe, as `irm … | iex` is) gets through the
+    /// terminal's `cmd` whole: `cargo test -p atroxabot installer_line -- --ignored`.
+    #[test]
+    #[ignore = "opens a console window"]
+    fn an_installer_line_runs_whole_in_a_terminal() {
+        let out = std::env::temp_dir().join(format!("atroxabot-installer-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&out);
+        let line = format!("'it works' | Out-File -Encoding ascii -FilePath '{}'", out.display());
+        let command = atroxabot_core::TerminalCommand::shell_line(&line, "");
+        run_in_terminal("Install test", &command.program, &command.args, &command.env).unwrap();
+        let mut written = String::new();
+        for _ in 0..100 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            written = std::fs::read_to_string(&out).unwrap_or_default();
+            if !written.is_empty() {
+                break;
+            }
+        }
+        // The console `cmd /K` keeps open is closed again, found by the file it was told to write.
+        let marker = out.file_stem().and_then(|stem| stem.to_str()).unwrap_or_default();
+        let script = format!(
+            "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object {{ $_.CommandLine -like '*{marker}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"
+        );
+        let _ = Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output();
+        let _ = std::fs::remove_file(&out);
+        assert_eq!(written.trim(), "it works", "the pipe ran in PowerShell, not in cmd");
     }
 
     /// A `BITMAPINFOHEADER` for `width` by `height` at `bits` a pixel, compressed as `compression` says.

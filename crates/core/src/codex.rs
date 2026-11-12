@@ -48,6 +48,20 @@ pub fn codex_info(connection: &Connection) -> Result<sdk::Info, sdk::Error> {
     sdk::info(&sdk::Options { env: account_env(connection), ..sdk::Options::default() }, INFO_TIMEOUT)
 }
 
+/// OpenAI's own commands that install the Codex CLI (on Windows, then
+/// elsewhere): they fetch the native binary from OpenAI, check it and put it
+/// where [`find_codex`] looks. No Node or npm needed.
+pub const CODEX_INSTALL: (&str, &str) =
+    ("irm https://chatgpt.com/codex/install.ps1 | iex", "curl -fsSL https://chatgpt.com/codex/install.sh | sh");
+
+/// The command that installs Codex: OpenAI's own installer, which the app
+/// only starts, in a terminal the user sees. No account's `CODEX_HOME` goes
+/// with it: Codex is installed once for all of them.
+#[must_use]
+pub fn codex_install() -> TerminalCommand {
+    TerminalCommand::shell_line(CODEX_INSTALL.0, CODEX_INSTALL.1)
+}
+
 /// The command that signs the user in to the Codex account `connection`:
 /// Codex's own `login`, which opens OpenAI's sign-in in the browser. The app
 /// only starts it, in a terminal the user sees. `None` when Codex is not

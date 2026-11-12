@@ -13,7 +13,7 @@ use super::agent_form::{VOICES, autonomy_hint};
 use super::limits::OutOfLimits;
 use super::settings::{Settings, Tab};
 use super::widgets::{Scroll, chip, logo_badge, toggle};
-use super::{Account, CodexAccount, Modal, Models, Shell};
+use super::{Account, Cli, CodexAccount, INSTALLING, Modal, Models, Shell};
 use crate::app::Action;
 use crate::editor::Editor;
 use crate::image::Lookup;
@@ -286,6 +286,7 @@ impl Shell {
                         self.signed_in_as(&account.email, &plan)
                     }
                 },
+                Some(CodexAccount::Missing) if self.is_installing(Cli::Codex) => INSTALLING.to_owned(),
                 Some(CodexAccount::Missing) => "Codex is not installed".to_owned(),
                 Some(CodexAccount::Failed(why)) => why.clone(),
                 Some(CodexAccount::Checking) | None => "Checking…".to_owned(),
@@ -297,6 +298,7 @@ impl Shell {
         match self.claude.get(&connection.id) {
             Some(Account::Ready(info)) if info.account.email.is_empty() => "Not signed in".to_owned(),
             Some(Account::Ready(info)) => self.signed_in_as(&info.account.email, &info.account.subscription),
+            Some(Account::Missing) if self.is_installing(Cli::Claude) => INSTALLING.to_owned(),
             Some(Account::Missing) => "Claude Code is not installed".to_owned(),
             Some(Account::Failed(why)) => why.clone(),
             Some(Account::Checking) | None => "Checking…".to_owned(),

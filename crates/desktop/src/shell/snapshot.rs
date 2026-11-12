@@ -10,9 +10,9 @@ use atroxabot_core::stats::{Ledger, Record, day_of};
 use atroxabot_core::update::{Release, Staged, Version};
 use atroxabot_core::worktree;
 use atroxabot_core::{
-    Agent, AgentEvent, Ask, Autonomy, ClaudeInfo, ClaudeMcpServer, ClaudeModel, CodexAccount, CodexInfo, CodexModel,
-    Config, Connection, ConnectionKind, ContextPart, LimitWindow, Limits, McpServer, Model, Session, ToolUse, Usage,
-    VoiceSettings, Worktree, unix_now,
+    Agent, AgentEvent, Ask, Autonomy, ClaudeError, ClaudeInfo, ClaudeMcpServer, ClaudeModel, CodexAccount, CodexError,
+    CodexInfo, CodexModel, Config, Connection, ConnectionKind, ContextPart, LimitWindow, Limits, McpServer, Model,
+    Session, ToolUse, Usage, VoiceSettings, Worktree, unix_now,
 };
 use atroxabot_voice::CallState;
 
@@ -26,7 +26,7 @@ use super::spotlight::Spotlight;
 use super::stats::StatsView;
 use super::thread::Thread;
 use super::update::Updater;
-use super::{Modal, Shell};
+use super::{Cli, Modal, Shell};
 use crate::gpu::Offscreen;
 use crate::image::ImageAtlas;
 use crate::paint::{Painter, Rect};
@@ -323,6 +323,25 @@ fn snapshots() {
         let downloading = Updater::Downloading { release: Release::unnamed(newer()), done: 43, size: 100 };
         let unwritable = "AtroxaBot cannot write to the folder it runs from (C:\\Program Files\\AtroxaBot): Access is \
             denied. Install the newest release instead.";
+        // Neither Claude Code nor Codex installed: each account offers its maker's installer; and the
+        // General page while Claude Code's installer is open in its terminal.
+        let uninstalled = |tab: Tab| {
+            let mut shell = settings(tab);
+            for account in [Connection::CLAUDE_AGENT, "work"] {
+                shell.claude_info(account, Err(ClaudeError::NotFound));
+            }
+            shell.codex_info("codex", Err(CodexError::NotFound), &mut Vec::new());
+            shell
+        };
+        // The General page at its foot, where Claude Code's row is.
+        let foot = |mut shell: Shell| {
+            if let Some(Modal::Settings(settings)) = &mut shell.modal {
+                settings.at_end = true;
+            }
+            shell
+        };
+        let mut installing = foot(uninstalled(Tab::General));
+        installing.installing(Cli::Claude);
         // The close button's choices, open under their dropdown.
         let mut closing = settings(Tab::General);
         closing.open_menu(Menu::Close, Rect::new(905.0, 432.0, 240.0, 40.0));
@@ -538,6 +557,9 @@ fn snapshots() {
             ("update-failed", updating(Updater::Failed(unwritable.into()))),
             ("settings-providers", settings(Tab::Providers)),
             ("settings-providers-private", private),
+            ("settings-providers-missing", uninstalled(Tab::Providers)),
+            ("settings-general-missing", foot(uninstalled(Tab::General))),
+            ("settings-general-installing", installing),
             ("menu-provider-private", private_menu),
             ("settings-voice", settings(Tab::Voice)),
             ("settings-integrations", connected),

@@ -57,6 +57,8 @@ fn usual_dirs() -> Vec<PathBuf> {
     let variable = |name: &str, relative: &str| under(env::var_os(name).map(PathBuf::from), relative);
     let dirs = if cfg!(windows) {
         vec![
+            // OpenAI's own installer (`install.ps1`): a link to the version in use.
+            variable("LOCALAPPDATA", "Programs/OpenAI/Codex/bin"),
             variable("APPDATA", "npm"),
             variable("LOCALAPPDATA", "Microsoft/WinGet/Links"),
             home(".local/bin"),

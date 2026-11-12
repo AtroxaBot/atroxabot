@@ -72,6 +72,35 @@ pub struct TerminalCommand {
     pub env: Vec<(String, String)>,
 }
 
+impl TerminalCommand {
+    /// The shell line `windows` in Windows PowerShell on Windows, `posix` in
+    /// `sh` elsewhere: an installer's own one-line command, run as its
+    /// maker publishes it.
+    #[must_use]
+    pub fn shell_line(windows: &str, posix: &str) -> Self {
+        let (program, args) = if cfg!(windows) {
+            ("powershell.exe", vec!["-NoProfile".to_owned(), "-Command".to_owned(), windows.to_owned()])
+        } else {
+            ("sh", vec!["-c".to_owned(), posix.to_owned()])
+        };
+        Self { program: PathBuf::from(program), args, env: Vec::new() }
+    }
+}
+
+/// Anthropic's own commands that install Claude Code (on Windows, then
+/// elsewhere), as its setup page gives them: they fetch the native binary
+/// from Anthropic, check it and put it where [`find_claude`] looks.
+pub const CLAUDE_INSTALL: (&str, &str) =
+    ("irm https://claude.ai/install.ps1 | iex", "curl -fsSL https://claude.ai/install.sh | bash");
+
+/// The command that installs Claude Code: Anthropic's own installer, which
+/// the app only starts, in a terminal the user sees. Nothing of an account
+/// goes with it: Claude Code is installed once for all of them.
+#[must_use]
+pub fn claude_install() -> TerminalCommand {
+    TerminalCommand::shell_line(CLAUDE_INSTALL.0, CLAUDE_INSTALL.1)
+}
+
 /// The command that signs the user in to the Claude account `connection`:
 /// Claude Code's own `auth login`, which opens Anthropic's sign-in in the
 /// browser. The app only starts it, in a terminal the user sees. `None`
@@ -687,6 +716,23 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    /// The installers run as their makers publish them, in the system's own shell, with no account's folder.
+    #[test]
+    fn an_installer_is_its_makers_one_line_command() {
+        let claude = claude_install();
+        let codex = crate::codex::codex_install();
+        assert!(claude.env.is_empty() && codex.env.is_empty(), "installed once for every account");
+        if cfg!(windows) {
+            assert_eq!(claude.program, PathBuf::from("powershell.exe"));
+            assert_eq!(claude.args, ["-NoProfile", "-Command", "irm https://claude.ai/install.ps1 | iex"]);
+            assert_eq!(codex.args[2], "irm https://chatgpt.com/codex/install.ps1 | iex");
+        } else {
+            assert_eq!(claude.program, PathBuf::from("sh"));
+            assert_eq!(claude.args, ["-c", "curl -fsSL https://claude.ai/install.sh | bash"]);
+            assert_eq!(codex.args[1], "curl -fsSL https://chatgpt.com/codex/install.sh | sh");
+        }
+    }
 
     #[test]
     fn only_subagents_hear_of_their_tasks() {

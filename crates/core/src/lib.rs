@@ -46,9 +46,14 @@ pub use atroxabot_claude_agent::{
 pub use atroxabot_codex::{
     Account as CodexAccount, Error as CodexError, Info as CodexInfo, Model as CodexModel, RateLimits as CodexLimits,
 };
-pub use claude::{ClaudeAgent, TerminalCommand, claude_connectors, claude_info, claude_login, find_claude};
+pub use claude::{
+    CLAUDE_INSTALL, ClaudeAgent, TerminalCommand, claude_connectors, claude_info, claude_install, claude_login,
+    find_claude,
+};
 pub use client::{Client, Model};
-pub use codex::{CodexAgent, codex_info, codex_limits, codex_login, codex_mcp_config, find_codex};
+pub use codex::{
+    CODEX_INSTALL, CodexAgent, codex_info, codex_install, codex_limits, codex_login, codex_mcp_config, find_codex,
+};
 pub use config::{Config, Connection, ConnectionKind, McpServer, VoiceSettings, lock_instance};
 pub use engine::{AgentEvent, ApiEngine, Ask, Control, FollowUp, Inbox, LimitWindow, Limits, Verdict};
 pub use error::{Error, Result};
