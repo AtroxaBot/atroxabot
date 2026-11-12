@@ -409,6 +409,14 @@ impl Shell {
         let needle = needle.to_lowercase();
         let mut commands = vec![("clear".to_owned(), "Empty this session and start with a fresh context".to_owned())];
         let connection = self.selected_agent().and_then(|agent| self.connection(agent));
+        // An API agent is summarised by the app, and has the library's skills.
+        if connection.as_ref().is_some_and(|connection| !connection.kind.is_account()) {
+            commands.push(("compact".to_owned(), "Summarise the conversation to free up its context".to_owned()));
+            commands.extend(self.skills.installed.iter().map(|skill| {
+                let line = skill.description.lines().next().unwrap_or_default();
+                (skill.name.clone(), line.chars().take(160).collect())
+            }));
+        }
         if let Some(connection) = connection.filter(|connection| connection.kind == ConnectionKind::ClaudeAgent) {
             commands.push(("compact".to_owned(), "Summarise the conversation to free up its context".to_owned()));
             if let Some(Account::Ready(info)) = self.claude.get(&connection.id) {

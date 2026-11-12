@@ -647,6 +647,7 @@ impl Shell {
             return;
         };
         thread.session.title.clone_from(&title);
+        thread.session.named = true;
         actions.push(Action::SaveSession(Box::new(thread.session.clone())));
         let id = thread.session.id.clone();
         if let Some(summary) = self.sessions.iter_mut().find(|summary| summary.id == id) {
@@ -798,13 +799,33 @@ impl Shell {
         self.apply_choice(&thread.session, &mut agent);
         let chosen = agent.clone();
         let Some((agent, connection)) = self.ready(agent) else { return false };
-        if text.starts_with("/compact") && connection.kind != ConnectionKind::ClaudeAgent {
+        let compact = text.split_whitespace().next() == Some("/compact");
+        if compact && connection.kind == ConnectionKind::Codex {
             self.notify(format!(
                 "{} summarises the conversation by itself when its context fills up.",
                 connection.name
             ));
             return true;
         }
+        // An API session is summarised by the app itself: no message joins the conversation.
+        if compact && !connection.kind.is_account() {
+            let model = self.model_info(&connection.id, &agent.model).cloned();
+            let Some(thread) = self.threads.get_mut(session).filter(|thread| thread.loaded) else { return false };
+            thread.begin_turn();
+            actions.push(Action::Compact {
+                agent: Box::new(agent),
+                connection: Box::new(connection),
+                model: model.map(Box::new),
+                session: Box::new(thread.session.clone()),
+            });
+            return true;
+        }
+        // A skill named the way Claude Code takes one: an API agent is told to load it.
+        let skill = text.strip_prefix('/').and_then(|rest| rest.split_whitespace().next()).filter(|name| {
+            !connection.kind.is_account() && self.skills.installed.iter().any(|skill| skill.name == *name)
+        });
+        let skill_note =
+            skill.map(|name| format!("(The user asks for the skill `{name}`: load it with the `skill` tool first.)"));
         let model = self.model_info(&connection.id, &agent.model).cloned();
         let Some(thread) = self.threads.get_mut(session) else { return false };
         let going_on = self.going_on;
@@ -822,7 +843,7 @@ impl Shell {
         let stopped_note = if interrupted { Self::interrupting_note(connection.kind, text) } else { "" };
         // A command (`/compact`) must come first to run: it goes as it is.
         let limit_note = if going_on && !text.trim_start().starts_with('/') { limits::GO_ON } else { "" };
-        let note = [call_note, stopped_note, limit_note]
+        let note = [call_note, stopped_note, limit_note, skill_note.as_deref().unwrap_or_default()]
             .into_iter()
             .filter(|note| !note.is_empty())
             .collect::<Vec<_>>()
@@ -895,7 +916,9 @@ impl Shell {
 
     /// `/clear`: the session keeps its place, its name in the sidebar and
     /// its folder, and starts over: its messages are deleted and the agent
-    /// begins with an empty context (a Claude account's process too).
+    /// begins with an empty context (a Claude account's process too). A
+    /// title the user gave it stays; one taken from the first message goes,
+    /// so the next message names it again.
     fn clear_session(&mut self, session: &str, actions: &mut Vec<Action>) {
         let Some(thread) = self.threads.get_mut(session).filter(|thread| thread.loaded && !thread.busy) else {
             return;
@@ -904,6 +927,8 @@ impl Shell {
         let fresh = Session {
             id: old.id.clone(),
             agent: old.agent.clone(),
+            title: if old.named { old.title.clone() } else { String::new() },
+            named: old.named,
             created: old.created,
             workdir: old.workdir.clone(),
             worktree: old.worktree.clone(),
@@ -915,6 +940,8 @@ impl Shell {
         };
         *thread = Thread::new(fresh);
         actions.push(Action::CloseLive(session.to_owned()));
+        // What the agent left running belongs to the conversation that is gone.
+        actions.push(Action::StopJobs(session.to_owned()));
         actions.push(Action::SaveSession(Box::new(thread.session.clone())));
         self.touch_summary(session);
     }
@@ -995,6 +1022,32 @@ impl Shell {
         let speaking = on_call && self.call.as_ref().is_some_and(|call| !call.hold);
         let Some(thread) = self.threads.get_mut(session) else { return };
         thread.session.apply(&event);
+        // What a subagent's response used is logged too, apart: it is no reply of the session's.
+        if let AgentEvent::Sub { event: inner, .. } = &event
+            && let AgentEvent::ReplyEnded { model, usage, cost, .. } = inner.as_ref()
+        {
+            let reply = atroxabot_core::Reply {
+                model: model.clone(),
+                usage: *usage,
+                cost: *cost,
+                at: unix_now(),
+                ..atroxabot_core::Reply::default()
+            };
+            let spent = Session {
+                id: thread.session.id.clone(),
+                agent: thread.session.agent.clone(),
+                entries: vec![atroxabot_core::Entry::Reply(reply)],
+                ..Session::default()
+            };
+            if let Some(mut record) = Ledger::collect(std::slice::from_ref(&spent)).records.pop()
+                && record.input + record.output > 0
+            {
+                let agent = self.agents.iter().find(|agent| agent.id == thread.session.agent);
+                record.provider = agent.map(|agent| agent.connection.clone()).unwrap_or_default();
+                record.provider_name = self.config.connection(&record.provider).map(|c| c.name).unwrap_or_default();
+                actions.push(Action::LogUsage(Box::new(record)));
+            }
+        }
         // What a response used goes to the usage log, which outlives the session.
         if matches!(event, AgentEvent::ReplyEnded { .. })
             && let Some(mut record) = Ledger::collect(std::slice::from_ref(&thread.session)).records.pop()
@@ -2093,6 +2146,7 @@ mod tests {
         shell.agent_event(&session, AgentEvent::ToolCall(call), &mut actions);
         let ended = AgentEvent::ReplyEnded {
             raw: Vec::new(),
+            wire: atroxabot_core::Wire::default(),
             model: "claude-opus-5-5".into(),
             usage: atroxabot_core::Usage::new(1_200, 40),
             cost: 0.02,
@@ -2113,6 +2167,7 @@ mod tests {
         actions.clear();
         let empty = AgentEvent::ReplyEnded {
             raw: Vec::new(),
+            wire: atroxabot_core::Wire::default(),
             model: String::new(),
             usage: atroxabot_core::Usage::default(),
             cost: 0.0,
@@ -2425,6 +2480,65 @@ mod tests {
         shell.send("Hello again", false, Vec::new(), &mut actions);
         assert_eq!(sent_texts(&actions), ["Hello again"]);
         assert_eq!(shell.threads[&session].session.title, "Hello again");
+    }
+
+    #[test]
+    fn an_api_session_is_summarised_by_the_app_and_takes_skills_by_name() {
+        let mut config = Config::default();
+        config.connections.push(Connection { id: "or".into(), kind: ConnectionKind::OpenAi, ..Connection::default() });
+        let agent = Agent { connection: "or".into(), model: "deepseek-chat".into(), ..Agent::new("Scout") };
+        let mut shell = Shell::new(config, vec![agent], Vec::new());
+        shell.skills.installed.push(atroxabot_core::skills::Skill {
+            name: "pdf".into(),
+            description: "Read and fill PDF forms.\nMore.".into(),
+            ..atroxabot_core::skills::Skill::default()
+        });
+        let mut actions = Vec::new();
+        shell.send("/pdf fill the form", false, Vec::new(), &mut actions);
+        let sent = actions.iter().find_map(|a| match a {
+            Action::Send { session, .. } => session.entries.last().cloned(),
+            _ => None,
+        });
+        assert!(
+            matches!(&sent, Some(atroxabot_core::Entry::User { note, .. }) if note.contains("skill `pdf`")),
+            "{sent:?}"
+        );
+        let session = shell.current.clone().expect("a session");
+        shell.agent_event(&session, AgentEvent::Text("Filled.".into()), &mut actions);
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        actions.clear();
+        shell.send("/compact", false, Vec::new(), &mut actions);
+        assert!(matches!(&actions[..], [Action::Compact { .. }]), "no message is sent");
+        let thread = &shell.threads[&session];
+        assert!(thread.busy && thread.session.entries.len() == 2, "nothing joins the conversation");
+        // The list a slash opens names both.
+        shell.threads.get_mut(&session).unwrap().busy = false;
+        shell.composer.editor.insert("/");
+        let listed: Vec<String> = shell.slash_matches().into_iter().map(|(name, _)| name).collect();
+        assert!(listed.contains(&"compact".to_owned()) && listed.contains(&"pdf".to_owned()), "{listed:?}");
+    }
+
+    #[test]
+    fn clear_keeps_a_title_the_user_gave() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        let session = working(&mut shell, &mut actions);
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        let mut editor = Editor::default();
+        editor.insert("Parser work");
+        shell.renaming = Some(editor);
+        shell.finish_rename(true, &mut actions);
+        actions.clear();
+        shell.send("/clear", false, Vec::new(), &mut actions);
+        let cleared = &shell.threads[&session].session;
+        assert!(cleared.entries.is_empty());
+        assert_eq!((cleared.title.as_str(), cleared.named), ("Parser work", true));
+        assert_eq!(shell.sessions[0].title, "Parser work", "the sidebar keeps it too");
+        let saved = |a: &Action| matches!(a, Action::SaveSession(saved) if saved.title == "Parser work" && saved.named);
+        assert!(actions.iter().any(saved));
+        // The next message does not rename it.
+        shell.send("Something else", false, Vec::new(), &mut actions);
+        assert_eq!(shell.threads[&session].session.title, "Parser work");
     }
 
     #[test]

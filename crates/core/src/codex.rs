@@ -638,6 +638,7 @@ impl Mapper {
             cache_write_tokens: self.last.cache_write_input,
         };
         out.push(AgentEvent::ReplyEnded {
+            wire: crate::Wire::Messages,
             raw: Vec::new(),
             model: self.model.clone(),
             usage,

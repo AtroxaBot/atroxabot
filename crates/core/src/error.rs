@@ -120,10 +120,77 @@ impl Error {
     }
 
     /// Whether the request was too long for the model's context window.
+    /// Providers say so each in their own words (OpenAI and its kin with
+    /// a code, Anthropic, Gemini, vLLM, Mistral and others in a sentence),
+    /// so the message is read too; a rate limit on tokens is not this.
     #[must_use]
     pub fn is_context_overflow(&self) -> bool {
-        self.code() == Some("context_length_exceeded")
+        if self.code() == Some("context_length_exceeded") {
+            return true;
+        }
+        // A 429 is a rate limit, whatever it says.
+        match self {
+            Self::Api { status: 413, .. } => true,
+            Self::Api { status: 400 | 422 | 500, message, .. } | Self::Response { message, .. } => {
+                overflow_said(message)
+            }
+            _ => false,
+        }
     }
+
+    /// The model's context window, when an overflow's message names it
+    /// ("maximum context length is 131072 tokens").
+    #[must_use]
+    pub fn context_limit(&self) -> Option<u64> {
+        /// What comes just before the number, in the providers' words.
+        const BEFORE: [&str; 7] = [
+            "maximum context length is",
+            "maximum context length of",
+            "context length is",
+            "context length of",
+            "context window of",
+            "maximum number of tokens allowed (",
+            "tokens > ",
+        ];
+        let (Self::Api { message, .. } | Self::Response { message, .. }) = self else { return None };
+        if !self.is_context_overflow() {
+            return None;
+        }
+        let lower = message.to_ascii_lowercase();
+        BEFORE.iter().find_map(|before| {
+            let at = lower.find(before)? + before.len();
+            let digits: String = lower[at..]
+                .trim_start()
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',')
+                .filter(char::is_ascii_digit)
+                .collect();
+            digits.parse::<u64>().ok().filter(|n| (1_000..=100_000_000).contains(n))
+        })
+    }
+}
+
+/// Whether a provider's error message says the prompt did not fit the
+/// model's context.
+fn overflow_said(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    let has = |words: &str| lower.contains(words);
+    // A limit on tokens per minute or per day is a rate limit, not a full context.
+    if has("per minute") || has("per day") || has("rate limit") || has("tpm") {
+        return false;
+    }
+    has("context_length_exceeded")
+        || has("prompt is too long")
+        || has("maximum context length")
+        || has("context length exceeded")
+        || has("exceeds the context window")
+        || has("exceeds the maximum number of tokens")
+        || has("exceed context limit")
+        || has("too large for model with")
+        || has("input is too long")
+        || has("input too long")
+        || has("reduce the length of the messages")
+        || (has("context") && (has("too long") || has("overflow") || has("exceed")))
 }
 
 impl fmt::Display for Error {
@@ -208,6 +275,35 @@ mod tests {
                 && !api(403).is_unauthorized()
                 && !coded(402, "insufficient_balance").is_unauthorized()
         );
+        let said =
+            |status, message: &str| Error::Api { status, code: None, message: message.into(), retry_after: None };
+        for overflow in [
+            said(400, "prompt is too long: 210000 tokens > 200000 maximum"),
+            said(400, "This model's maximum context length is 131,072 tokens. However, you requested 140000 tokens."),
+            said(400, "The input token count (1200000) exceeds the maximum number of tokens allowed (1048576)."),
+            said(
+                400,
+                "Prompt contains 40000 tokens and 0 draft tokens, too large for model with 32768 maximum context length",
+            ),
+            said(413, "Request too large"),
+        ] {
+            assert!(overflow.is_context_overflow() && !overflow.is_retryable(), "{overflow}");
+        }
+        assert_eq!(said(400, "This model's maximum context length is 131,072 tokens.").context_limit(), Some(131_072));
+        assert_eq!(
+            said(400, "exceeds the maximum number of tokens allowed (1048576).").context_limit(),
+            Some(1_048_576)
+        );
+        assert_eq!(said(400, "prompt is too long: 210000 tokens > 200000 maximum").context_limit(), Some(200_000));
+        assert_eq!(said(400, "prompt is too long").context_limit(), None, "no number named");
+        for not in [
+            said(429, "Request too large for gpt-5 on tokens per min (TPM): Limit 30000, Requested 50000."),
+            said(400, "Rate limit reached: too many tokens, context exceeded per minute"),
+            said(400, "Invalid tool schema"),
+            said(401, "maximum context length is 8192"),
+        ] {
+            assert!(!not.is_context_overflow(), "{not}");
+        }
         assert!(Error::Io(std::io::ErrorKind::ConnectionReset.into()).is_retryable());
         assert!(!Error::Io(std::io::Error::other("attachment missing")).is_retryable());
         assert!(Error::Transport(Box::new(ureq::Error::HostNotFound)).is_retryable(), "offline");

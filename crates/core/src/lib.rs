@@ -26,6 +26,7 @@ mod error;
 pub mod git;
 mod mcp;
 mod messages;
+mod openai;
 mod pattern;
 mod responses;
 mod session;
@@ -50,7 +51,9 @@ pub use config::{Config, Connection, ConnectionKind, McpServer, VoiceSettings, l
 pub use engine::{AgentEvent, ApiEngine, Ask, Control, FollowUp, Inbox, LimitWindow, Limits, Verdict};
 pub use error::{Error, Result};
 pub use mcp::{McpHub, claude_mcp_config};
-pub use responses::{Completion, InputItem, ResponseRequest, Role, StreamEvent, ToolCall, ToolChoice, ToolSpec, Usage};
+pub use responses::{
+    Completion, InputItem, Picture, ResponseRequest, Role, StreamEvent, ToolCall, ToolChoice, ToolSpec, Usage, Wire,
+};
 pub use session::{
     Block, ContextPart, Entry, Reply, SearchHit, Session, SessionStore, SessionSummary, Todo, TodoState, ToolUse,
     new_id, unix_now,

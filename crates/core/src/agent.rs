@@ -3,6 +3,7 @@
 //! Each is one `<id>.json` file in `~/.atroxabot/agents/`, with its notes
 //! in `~/.atroxabot/memory/<id>/notes.md`.
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::ErrorKind;
@@ -15,8 +16,16 @@ use crate::config::{Config, Connection, write_private};
 use crate::error::{Error, Result};
 use crate::session::valid_id;
 
-/// Most of an agent's notes that ride along with every conversation, in bytes.
-const MEMORY_BUDGET: usize = 6_000;
+/// Most of an agent's notes that ride along with every conversation, in
+/// bytes: the newest part of a longer file, and the agent is told so.
+const MEMORY_BUDGET: usize = 12_000;
+/// Most of a project's instruction files an API agent is given, in bytes.
+const PROJECT_BUDGET: usize = 24_000;
+/// Largest instruction file read at all, in bytes.
+const MAX_INSTRUCTIONS: u64 = 1 << 20;
+/// The instruction files a project keeps for agents, in each folder, in
+/// the order they are given. Codex reads the first, Claude Code the others.
+const INSTRUCTION_FILES: [&str; 3] = ["AGENTS.md", "CLAUDE.md", ".claude/CLAUDE.md"];
 
 /// How much an agent may do without asking.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +210,24 @@ impl Agent {
     /// serving it.
     #[must_use]
     pub fn system_prompt(&self, folder: &Path) -> String {
+        self.system_prompt_with(folder, "")
+    }
+
+    /// The system prompt of an API session working in `folder`, at its
+    /// first turn (it is kept with the session from then on, see
+    /// [`crate::Session::system`]): the agent's own, then `worktree` (what
+    /// it is told about a worktree it works in), the engine's tools, and
+    /// the project's instruction files, which Claude Code and Codex read by
+    /// themselves; the agent's notes last.
+    #[must_use]
+    pub fn api_system_prompt(&self, folder: &Path, worktree: &str) -> String {
+        let extra = format!("{worktree}{API_TOOLS}{}", project_instructions(folder));
+        self.system_prompt_with(folder, &extra)
+    }
+
+    /// The system prompt with `extra` after where the agent works and
+    /// before its notes, which come last.
+    fn system_prompt_with(&self, folder: &Path, extra: &str) -> String {
         let mut prompt =
             format!("You are {}.", if self.name.trim().is_empty() { "an assistant" } else { self.name.trim() });
         if !self.tagline.trim().is_empty() {
@@ -213,18 +240,29 @@ impl Agent {
         if !folder.as_os_str().is_empty() {
             let _ = write!(prompt, "\n\nYou work in the folder `{}`.", folder.display());
         }
+        prompt.push_str(extra);
         if let Some(path) = self.memory_path() {
             let _ = write!(
                 prompt,
-                "\n\nYou keep notes across sessions in `{}`. Keep them short and current: add what will matter \
-                 next time (the user's preferences, decisions, where things are), and correct or remove what is \
-                 no longer true.",
-                path.display()
+                "\n\nYou keep notes across sessions in `{}`. Keep them short and current, under {} KB: add what \
+                 will matter next time (the user's preferences, decisions, where things are), and correct or \
+                 remove what is no longer true.",
+                path.display(),
+                MEMORY_BUDGET / 1000
             );
             let notes = fs::read_to_string(&path).unwrap_or_default();
-            let notes = tail(notes.trim(), MEMORY_BUDGET);
-            if !notes.is_empty() {
-                let _ = write!(prompt, "{NOTES_HEADING}{notes}");
+            let notes = notes.trim();
+            let shown = tail(notes, MEMORY_BUDGET);
+            if shown.len() < notes.len() {
+                let _ = write!(
+                    prompt,
+                    " Your notes have grown to {} KB, so only their newest part is below: read the file when the \
+                     older part matters, and condense it to fit (merge, shorten, drop what no longer holds).",
+                    notes.len().div_ceil(1000)
+                );
+            }
+            if !shown.is_empty() {
+                let _ = write!(prompt, "{NOTES_HEADING}{shown}");
             }
         }
         prompt
@@ -233,6 +271,99 @@ impl Agent {
 
 /// What comes before an agent's notes at the end of its system prompt.
 pub const NOTES_HEADING: &str = "\n\nYour notes so far:\n\n";
+
+/// What comes before the project's instruction files in an API agent's
+/// system prompt.
+pub const PROJECT_HEADING: &str = "\n\n# Project instructions\n\n";
+
+/// What an agent on an API is told about the engine's tools (Claude Code
+/// and Codex have their own words for theirs).
+const API_TOOLS: &str = "\n\n# Your tools\n\n\
+    - When a decision is the user's to make, or they ask you to interview them, ask with the `ask` tool: a few \
+    clear options per question, rather than guessing or asking in prose.\n\
+    - For broad searches and for pieces of work that do not depend on each other, start subagents with the \
+    `agent` tool, several in one reply, each with a complete brief.\n\
+    - For work of three or more steps, keep a task list with the `todo` tool: mark a task in progress when you \
+    start it and completed as soon as it is done. The user sees the list.\n\
+    - Use a skill when one fits the task.\n\
+    - Search before you read whole files, and read only the part you need. Do not read a file again after \
+    editing it: the edit's answer says what changed.\n\
+    - A command that keeps running (a server, a watcher) goes to the background with `shell`'s `background`; \
+    check on it and stop it with `job`.";
+
+/// The project's instruction files for an agent working in `folder`:
+/// those of [`INSTRUCTION_FILES`] in each folder from the top of its git
+/// repository down to `folder` itself (only `folder`'s, outside a
+/// repository), the nearest last, at most [`PROJECT_BUDGET`] of them.
+/// Empty when there are none. Claude's own folder in the home directory
+/// is never looked in.
+#[must_use]
+pub fn project_instructions(folder: &Path) -> String {
+    if folder.as_os_str().is_empty() {
+        return String::new();
+    }
+    let mut folders: Vec<&Path> = Vec::new();
+    for dir in folder.ancestors() {
+        folders.push(dir);
+        if dir.join(".git").exists() {
+            break;
+        }
+    }
+    if !folders.last().is_some_and(|top| top.join(".git").exists()) {
+        folders.truncate(1);
+    }
+    let home = std::env::home_dir();
+    let mut seen = HashSet::new();
+    let (mut out, mut room) = (String::new(), PROJECT_BUDGET);
+    for dir in folders.into_iter().rev() {
+        for name in INSTRUCTION_FILES {
+            if name.starts_with(".claude") && home.as_deref() == Some(dir) {
+                continue;
+            }
+            let path = dir.join(name);
+            let small = fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() <= MAX_INSTRUCTIONS);
+            let Some(text) = small.then(|| fs::read_to_string(&path).ok()).flatten() else { continue };
+            let text = text.trim();
+            // One file linked under both names is given once.
+            if text.is_empty() || !seen.insert(text.to_owned()) {
+                continue;
+            }
+            if room == 0 {
+                let _ =
+                    write!(out, "(`{}` is left out: there was no more room. Read it yourself.)\n\n", path.display());
+                continue;
+            }
+            let shown = head(text, room);
+            room -= shown.len();
+            let _ = write!(out, "## `{}`\n\n{shown}\n\n", path.display());
+            if shown.len() < text.len() {
+                out.push_str("(The file goes on: read it for the rest.)\n\n");
+            }
+        }
+    }
+    if out.is_empty() {
+        return String::new();
+    }
+    format!(
+        "{PROJECT_HEADING}The project's own instructions for agents, as they were when this session began. Follow \
+         them: where they differ from your usual habits, they win.\n\n{}",
+        out.trim_end()
+    )
+}
+
+/// The first `max` bytes of `text`, cut at a line where possible and never
+/// inside a character.
+fn head(text: &str, max: usize) -> &str {
+    if text.len() <= max {
+        return text;
+    }
+    let mut end = max;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let part = &text[..end];
+    part.rfind('\n').map_or(part, |line| &part[..line])
+}
 
 /// What an agent is told, ahead of the user's first words, when a voice
 /// call begins. It rides on that message rather than in the system prompt,
@@ -379,6 +510,38 @@ mod tests {
         let prompt = agent.system_prompt(Path::new("/work"));
         assert!(prompt.starts_with("You are Scout. Finds bugs.\n\nBe brief."));
         assert!(prompt.contains("`/work`") && !prompt.contains("voice call"));
+    }
+
+    #[test]
+    fn an_api_agent_is_told_its_tools_and_the_projects_instructions() {
+        let dir = std::env::temp_dir().join(format!("atroxabot-instructions-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let deep = dir.join("crates").join("core");
+        fs::create_dir_all(dir.join(".git")).unwrap();
+        fs::create_dir_all(&deep).unwrap();
+        fs::write(dir.join("CLAUDE.md"), "Top rules.\n").unwrap();
+        fs::write(dir.join("AGENTS.md"), "Top rules.").unwrap();
+        fs::write(deep.join("AGENTS.md"), "Core rules.").unwrap();
+        let agent = Agent { memory: false, ..Agent::new("Scout") };
+        let prompt = agent.api_system_prompt(&deep, "\n\nA worktree.");
+        let at = |text: &str| prompt.find(text).unwrap_or_else(|| panic!("{text} is missing"));
+        assert!(at("A worktree.") < at("# Your tools") && at("# Your tools") < at(PROJECT_HEADING.trim()));
+        assert!(at("Top rules.") < at("Core rules."), "the nearest folder's come last");
+        assert_eq!(prompt.matches("Top rules.").count(), 1, "the same text twice is given once");
+        assert!(agent.system_prompt(&deep).find("# Your tools").is_none(), "only API agents are told");
+        // Outside a repository, only the folder's own files count.
+        fs::remove_dir_all(dir.join(".git")).unwrap();
+        let alone = project_instructions(&deep);
+        assert!(alone.contains("Core rules.") && !alone.contains("Top rules."));
+        assert!(project_instructions(&dir.join("missing")).is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn head_cuts_at_lines_and_characters() {
+        assert_eq!(head("short", 10), "short");
+        assert_eq!(head("first\nsecond\nthird", 9), "first");
+        assert_eq!(head("ééééé", 3), "é", "never inside a character");
     }
 
     #[test]

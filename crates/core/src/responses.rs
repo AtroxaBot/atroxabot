@@ -1,5 +1,8 @@
-//! Streamed replies: text messages, function tools and their results, sent
-//! to the provider with Chat Completions (see `completions.rs`).
+//! Streamed replies: text messages, function tools and their results, in
+//! one shape for every provider, sent over the wire that provider speaks:
+//! Anthropic's Messages (`messages.rs`), OpenAI's Responses (`openai.rs`)
+//! or Chat Completions for every other OpenAI-compatible one
+//! (`completions.rs`).
 
 use std::io::{BufRead, Read as _};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +58,40 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
+/// How a provider is spoken to. A reply kept as it arrived goes back only
+/// over the wire it came by: each has its own shape for it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Wire {
+    /// Anthropic's Messages API (`/messages`); what replies saved before
+    /// the wire was noted came by.
+    #[default]
+    Messages,
+    /// Chat Completions (`/chat/completions`): OpenRouter, DeepSeek,
+    /// local servers and every other OpenAI-compatible provider.
+    Chat,
+    /// OpenAI's own Responses API (`/responses`).
+    Responses,
+}
+
+impl Wire {
+    /// Whether it is [`Wire::Messages`] (which a saved reply leaves out).
+    #[must_use]
+    pub fn is_messages(&self) -> bool {
+        *self == Self::Messages
+    }
+}
+
+/// A picture a tool's result shows the model (a `read` of a PNG).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Picture {
+    /// Its MIME type, e.g. `image/png`.
+    pub media_type: String,
+    /// Its bytes in base64.
+    pub data: String,
+}
+
 /// A function call requested by the model.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -86,6 +123,8 @@ pub enum InputItem {
         output: String,
         /// Whether the tool failed or was refused.
         is_error: bool,
+        /// A picture the result shows, when it has one.
+        picture: Option<Picture>,
     },
     /// A picture the user sent along with their next words.
     Image {
@@ -94,10 +133,13 @@ pub enum InputItem {
         /// Its bytes in base64.
         data: String,
     },
-    /// A reply of Claude's as the Messages API sent it: its content blocks,
-    /// replayed unchanged (thinking signatures, compaction blocks). Only
-    /// Messages understands it; Chat Completions skips it.
-    Blocks(Vec<Value>),
+    /// A reply exactly as its wire sent it, replayed unchanged so the model
+    /// keeps its reasoning: Claude's content blocks (thinking signatures,
+    /// compaction blocks), a Chat Completions assistant message (with its
+    /// `reasoning_content` or `reasoning_details`), or the Responses API's
+    /// output items (encrypted reasoning). Only sent over the wire it came
+    /// by (see [`Wire`]).
+    Replay(Vec<Value>),
 }
 
 impl InputItem {
@@ -173,8 +215,9 @@ pub struct Completion {
     /// `content_filter`); `None` when it finished. Tool calls of an
     /// incomplete response may have truncated arguments and must not run.
     pub incomplete: Option<String>,
-    /// The reply's content blocks as the Messages API sent them, to replay
-    /// unchanged with [`InputItem::Blocks`]; empty from Chat Completions.
+    /// The reply as its wire sent it, to replay unchanged with
+    /// [`InputItem::Replay`]: Claude's content blocks, a Chat Completions
+    /// assistant message, or the Responses API's output items.
     pub content: Vec<Value>,
     /// Whether the server paused a long turn of its own tools: send the
     /// conversation again, with this reply, to let it go on.
@@ -200,6 +243,10 @@ pub struct ResponseRequest<'a> {
     /// Let Claude search and read the web with Anthropic's server tools.
     /// Ignored by Chat Completions.
     pub web: bool,
+    /// What names the conversation to the provider's prompt cache (the
+    /// session's id): OpenRouter's `session_id`, OpenAI's
+    /// `prompt_cache_key`. Anthropic needs none.
+    pub cache_key: Option<&'a str>,
 }
 
 /// What a response must do with its tools.
@@ -230,10 +277,10 @@ impl Client {
         cancel: &AtomicBool,
         mut on_event: impl FnMut(StreamEvent),
     ) -> Result<bool> {
-        if self.speaks_messages(request.model) {
-            crate::messages::stream(self, request, cancel, &mut on_event)
-        } else {
-            crate::completions::stream(self, request, cancel, &mut on_event)
+        match self.wire(request.model) {
+            Wire::Messages => crate::messages::stream(self, request, cancel, &mut on_event),
+            Wire::Responses => crate::openai::stream(self, request, cancel, &mut on_event),
+            Wire::Chat => crate::completions::stream(self, request, cancel, &mut on_event),
         }
     }
 }

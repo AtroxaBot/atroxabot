@@ -1,8 +1,10 @@
 //! `POST /v1/messages`, Anthropic's own API: the same [`ResponseRequest`] in
 //! and the same [`StreamEvent`]s out as Chat Completions, plus what Claude
-//! only offers here: prompt caching and its summarized thinking.
+//! only offers here: prompt caching, its summarized thinking, and (from
+//! Anthropic itself) old tool results cleared and long conversations
+//! summarised on the server.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -19,6 +21,13 @@ const MAX_TOKENS: u64 = 64_000;
 const MAX_CALLS: usize = 64;
 /// The efforts Claude accepts, weakest first.
 const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+/// How full the context gets before Anthropic clears old tool results, in
+/// input tokens: under the 150,000 its compaction starts at.
+const CLEAR_AT: u64 = 100_000;
+/// How many of the latest tool results clearing leaves.
+const KEEP_TOOL_USES: u64 = 8;
+/// The fewest tokens a clearing takes away: each one costs the cache after it.
+const CLEAR_AT_LEAST: u64 = 20_000;
 /// Most web searches, and most page fetches, one reply may make.
 const WEB_USES: u64 = 8;
 /// Largest reply kept for replaying, in content blocks; a hostile stream can't grow past it.
@@ -26,6 +35,15 @@ const MAX_BLOCKS: usize = 512;
 /// The betas requests to Anthropic itself opt into: server-side compaction
 /// of long conversations, and fallbacks for declined requests.
 pub(crate) const BETAS: &str = "compact-2026-01-12,server-side-fallback-2026-07-01";
+/// [`BETAS`] and context editing, which clears old tool results.
+const BETAS_CLEARING: &str = "compact-2026-01-12,server-side-fallback-2026-07-01,context-management-2025-06-27";
+/// Tools whose results are never cleared: what the user answered, the task
+/// list, a skill's instructions and what a subagent found are what the
+/// agent goes on from.
+const KEPT_TOOLS: [&str; 4] = ["ask", "todo", "skill", "agent"];
+/// Set once Anthropic refused to clear tool results alongside compaction:
+/// from then on this run only compacts.
+static CLEARING_REFUSED: AtomicBool = AtomicBool::new(false);
 /// Models whose declined requests Anthropic can answer with another model.
 const FALLBACK_MODELS: [&str; 4] = ["claude-fable-5-", "claude-opus-5", "claude-sonnet-5-5", "claude-mythos-5-"];
 
@@ -36,7 +54,18 @@ pub(crate) fn stream(
     cancel: &AtomicBool,
     on_event: &mut dyn FnMut(StreamEvent),
 ) -> Result<bool> {
-    let response = client.post("/messages", &body(request, client.first_party)).map_err(overflow)?;
+    let first_party = client.first_party;
+    let clearing = first_party && !CLEARING_REFUSED.load(Ordering::Relaxed);
+    let betas = |clearing: bool| first_party.then_some(if clearing { BETAS_CLEARING } else { BETAS });
+    let sent = match client.post_messages(&body(request, first_party, clearing), betas(clearing)) {
+        // Clearing is a beta of its own: should Anthropic refuse it beside compaction, it goes.
+        Err(Error::Api { status: 400, message, .. }) if clearing && refuses_clearing(&message) => {
+            CLEARING_REFUSED.store(true, Ordering::Relaxed);
+            client.post_messages(&body(request, first_party, false), betas(false))
+        }
+        sent => sent,
+    };
+    let response = sent.map_err(overflow)?;
     let mut blocks = Blocks::default();
     let done = read_events(response, cancel, on_event, |event, on_event| blocks.event(&event.data, on_event))?;
     if done {
@@ -106,6 +135,12 @@ fn price(id: &str) -> Option<(f64, f64, f64)> {
     PRICES.iter().find(|(prefix, ..)| id.starts_with(prefix)).map(|(_, input, output, read)| (*input, *output, *read))
 }
 
+/// Whether a refused request was refused for its context editing.
+fn refuses_clearing(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    ["context_management", "context-management", "clear_tool_uses"].iter().any(|word| message.contains(word))
+}
+
 /// Anthropic says a prompt is too long only in words; the app knows it by its code.
 fn overflow(error: Error) -> Error {
     match error {
@@ -120,7 +155,9 @@ fn overflow(error: Error) -> Error {
 /// up to its latest block are cached, and nothing before that block is ever
 /// rewritten: histories are append-only, which keeps both the cache and
 /// Claude's thinking blocks (bound to the conversation before them) valid.
-fn body(request: &ResponseRequest<'_>, first_party: bool) -> Value {
+/// What Anthropic itself clears or summarises it does on its side, which
+/// leaves both valid too. `clearing` asks it to clear old tool results.
+fn body(request: &ResponseRequest<'_>, first_party: bool, clearing: bool) -> Value {
     let mut turns: Vec<(Role, Vec<Value>)> = Vec::new();
     for item in request.input {
         let (role, block) = match item {
@@ -137,15 +174,24 @@ fn body(request: &ResponseRequest<'_>, first_party: bool) -> Value {
                 let block = json!({ "type": "tool_use", "id": tool_id(&call.call_id), "name": call.name, "input": input.unwrap_or_else(|| json!({})) });
                 (Role::Assistant, block)
             }
-            InputItem::ToolOutput { call_id, output, is_error } => {
-                let mut block = json!({ "type": "tool_result", "tool_use_id": tool_id(call_id), "content": output });
+            InputItem::ToolOutput { call_id, output, is_error, picture } => {
+                // A picture rides inside its result, where clearing old results takes it too.
+                let content = match picture {
+                    Some(picture) => {
+                        let source =
+                            json!({ "type": "base64", "media_type": picture.media_type, "data": picture.data });
+                        json!([{ "type": "text", "text": output }, { "type": "image", "source": source }])
+                    }
+                    None => output.as_str().into(),
+                };
+                let mut block = json!({ "type": "tool_result", "tool_use_id": tool_id(call_id), "content": content });
                 if *is_error {
                     block["is_error"] = true.into();
                 }
                 (Role::User, block)
             }
             // A reply exactly as it arrived: its own turn, never merged or edited.
-            InputItem::Blocks(blocks) => {
+            InputItem::Replay(blocks) => {
                 if !blocks.is_empty() {
                     turns.push((Role::Assistant, blocks.clone()));
                 }
@@ -204,7 +250,25 @@ fn body(request: &ResponseRequest<'_>, first_party: bool) -> Value {
     if first_party {
         // Long conversations are summarised by the server once they near the
         // limit; the compaction block it returns is replayed like any other.
-        body["context_management"] = json!({ "edits": [{ "type": "compact_20260112" }] });
+        // Before that, old tool results (most of a coding session) are
+        // cleared, enough at once to be worth the cache it costs.
+        let mut edits = Vec::new();
+        if clearing {
+            let kept: Vec<&str> =
+                KEPT_TOOLS.into_iter().filter(|name| request.tools.iter().any(|tool| tool.name == *name)).collect();
+            let mut clear = json!({
+                "type": "clear_tool_uses_20250919",
+                "trigger": { "type": "input_tokens", "value": CLEAR_AT },
+                "keep": { "type": "tool_uses", "value": KEEP_TOOL_USES },
+                "clear_at_least": { "type": "input_tokens", "value": CLEAR_AT_LEAST },
+            });
+            if !kept.is_empty() {
+                clear["exclude_tools"] = kept.into();
+            }
+            edits.push(clear);
+        }
+        edits.push(json!({ "type": "compact_20260112" }));
+        body["context_management"] = json!({ "edits": edits });
         // A request a safety classifier declines is answered by the model
         // Anthropic names for that case, inside the same call.
         if FALLBACK_MODELS.iter().any(|prefix| request.model.starts_with(prefix)) {
@@ -397,8 +461,12 @@ mod tests {
         let call = |id: &str| {
             InputItem::ToolCall(ToolCall { call_id: id.into(), name: "speak".into(), arguments: "{\"a\":1}".into() })
         };
-        let output =
-            |id: &str| InputItem::ToolOutput { call_id: id.into(), output: "ok".into(), is_error: id == "b.1" };
+        let output = |id: &str| InputItem::ToolOutput {
+            call_id: id.into(),
+            output: "ok".into(),
+            is_error: id == "b.1",
+            picture: None,
+        };
         let input = [
             InputItem::text(Role::User, "hi"),
             InputItem::text(Role::Assistant, "  "),
@@ -418,8 +486,9 @@ mod tests {
             tools: &tools,
             tool_choice: Some(ToolChoice::Function("speak")),
             web: false,
+            cache_key: None,
         };
-        let body = body(&request, false);
+        let body = body(&request, false, false);
         let messages = body["messages"].as_array().unwrap();
         let roles: Vec<&str> = messages.iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(roles, ["user", "assistant", "user"], "blank text dropped, a reply's calls together");
@@ -440,7 +509,7 @@ mod tests {
 
         let plain =
             ResponseRequest { reasoning: Some("none"), tools: &[], tool_choice: Some(ToolChoice::None), ..request };
-        let plain = super::body(&plain, false);
+        let plain = super::body(&plain, false, false);
         assert!(plain.get("thinking").is_none() && plain.get("tool_choice").is_none(), "not Claude's");
 
         // A reply replayed as it arrived is its own turn, and Anthropic gets the betas.
@@ -448,15 +517,29 @@ mod tests {
         let call = json!({ "type": "tool_use", "id": "t1", "name": "read", "input": {} });
         let input = [
             InputItem::text(Role::User, "hi"),
-            InputItem::Blocks(vec![thinking.clone(), call]),
-            InputItem::ToolOutput { call_id: "t1".into(), output: "ok".into(), is_error: false },
+            InputItem::Replay(vec![thinking.clone(), call]),
+            InputItem::ToolOutput {
+                call_id: "t1".into(),
+                output: "A picture.".into(),
+                is_error: false,
+                picture: Some(crate::Picture { media_type: "image/png".into(), data: "AAAA".into() }),
+            },
         ];
         let replay = ResponseRequest { model: "claude-opus-5-5", input: &input, web: true, ..request };
-        let replay = super::body(&replay, true);
+        let compacting = super::body(&replay, true, false);
+        let replay = super::body(&replay, true, true);
         assert_eq!(replay["messages"][1]["content"][0], thinking, "thinking goes back unchanged");
         assert!(replay["messages"][1]["content"][1].get("cache_control").is_none());
         assert_eq!(replay["messages"][2]["content"][0]["cache_control"]["type"], "ephemeral");
-        assert_eq!(replay["context_management"]["edits"][0]["type"], "compact_20260112");
+        let result = &replay["messages"][2]["content"][0]["content"];
+        assert_eq!((&result[0]["text"], &result[1]["source"]["data"]), (&json!("A picture."), &json!("AAAA")));
+        let edits = replay["context_management"]["edits"].as_array().unwrap();
+        assert_eq!(
+            (&edits[0]["type"], &edits[1]["type"]),
+            (&json!("clear_tool_uses_20250919"), &json!("compact_20260112"))
+        );
+        assert!(edits[0].get("exclude_tools").is_none(), "only tools the request has are named");
+        assert_eq!(compacting["context_management"]["edits"], json!([{ "type": "compact_20260112" }]));
         assert_eq!(replay["fallbacks"], "default");
         assert_eq!(replay["tools"][1]["type"], "web_search_20260209");
         assert!(replay["tools"][1].get("eager_input_streaming").is_none());
@@ -523,6 +606,8 @@ mod tests {
             retry_after: None,
         };
         assert!(overflow(long).is_context_overflow());
+        assert!(refuses_clearing("context_management.edits.0: Extra inputs are not permitted"));
+        assert!(!refuses_clearing("messages.1: tool_use ids must be unique"));
         assert_eq!(price("claude-opus-5-5"), Some((4.0, 20.0, 0.2)));
         assert_eq!(price("claude-opus-5"), Some((5.0, 25.0, 0.5)));
         assert_eq!(price("gpt-5"), None);

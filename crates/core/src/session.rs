@@ -27,7 +27,7 @@ use serde_json::Value;
 use crate::agent::Agent;
 use crate::config::{Config, write_private};
 use crate::error::{Error, Result};
-use crate::responses::Usage;
+use crate::responses::{Picture, Usage, Wire};
 use crate::worktree::Worktree;
 
 /// Name of the index file. The leading dot keeps it out of session scans,
@@ -46,6 +46,10 @@ pub struct Session {
     pub agent: String,
     /// Shown in the sidebar; taken from the first prompt until renamed.
     pub title: String,
+    /// Whether the user gave it its title: `/clear` then keeps it, where a
+    /// title taken from the first prompt goes with the messages.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub named: bool,
     /// Creation time, seconds since the Unix epoch.
     pub created: u64,
     /// Last change, seconds since the Unix epoch.
@@ -75,6 +79,17 @@ pub struct Session {
     /// engine said; empty when it did not.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub context: Vec<ContextPart>,
+    /// The system prompt an API engine started the session with: rendered
+    /// at its first turn and sent unchanged from then on, so the prompt
+    /// cache and the model's kept reasoning stay valid while the agent's
+    /// notes or the project's instruction files change. `/clear` starts
+    /// over without it. Empty until then, and for the account engines.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub system: String,
+    /// Whether its model turned out to take no pictures (its provider
+    /// refused one): a `read` of one shows it no more.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub blind: bool,
     /// The git worktree of its own it works in, when it asked for one:
     /// [`Session::workdir`] is a folder in it once it is made. See [`crate::worktree`].
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,11 +146,16 @@ pub enum Entry {
 pub struct Reply {
     /// What it contained, in order.
     pub blocks: Vec<Block>,
-    /// The Messages API's content blocks exactly as they arrived (thinking
-    /// signatures, compaction blocks), replayed unchanged so Claude keeps its
-    /// reasoning between tool calls. Empty for other engines.
+    /// The reply exactly as its wire sent it (Claude's content blocks with
+    /// their thinking signatures, a Chat Completions message with its
+    /// reasoning, the Responses API's output items), replayed unchanged so
+    /// the model keeps its reasoning between tool calls. Empty for the
+    /// account engines and for a reply cut short.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub raw: Vec<Value>,
+    /// The wire `raw` came by, which alone can take it back.
+    #[serde(skip_serializing_if = "Wire::is_messages")]
+    pub wire: Wire,
     /// The model that wrote it.
     pub model: String,
     /// What it used.
@@ -188,6 +208,10 @@ pub struct ToolUse {
     /// For a subagent: what it is doing now, or how it ended.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub activity: String,
+    /// A picture its result showed the model (a `read` of a PNG), kept so
+    /// every later request sends the same bytes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub picture: Option<Picture>,
 }
 
 /// One thing on the agent's task list.
@@ -235,14 +259,15 @@ impl Session {
 
     /// The agent's task list as its tool calls left it: Claude Code's
     /// `TaskCreate` and `TaskUpdate`, or a whole list at once from
-    /// `TodoWrite`. A task added once every earlier one is done starts a
+    /// `TodoWrite` (or an API agent's `todo`). A task added once every earlier one is done starts a
     /// new list.
     #[must_use]
     pub fn todos(&self) -> Vec<Todo> {
         let mut todos: Vec<Todo> = Vec::new();
         let calls = self.replies().flat_map(|reply| &reply.blocks).filter_map(|block| match block {
             Block::Tool(call)
-                if !call.is_error && matches!(call.name.as_str(), "TaskCreate" | "TaskUpdate" | "TodoWrite") =>
+                if !call.is_error
+                    && matches!(call.name.as_str(), "TaskCreate" | "TaskUpdate" | "TodoWrite" | "todo") =>
             {
                 Some(call)
             }
@@ -252,7 +277,8 @@ impl Session {
             let input = serde_json::from_str::<Value>(&call.input).unwrap_or(Value::Null);
             let text = |value: &Value, key: &str| value.get(key).and_then(Value::as_str).unwrap_or_default().to_owned();
             match call.name.as_str() {
-                "TodoWrite" => {
+                // An API agent's `todo` takes the same list.
+                "TodoWrite" | "todo" => {
                     let listed = input.get("todos").and_then(Value::as_array).map(Vec::as_slice).unwrap_or_default();
                     todos = (1..)
                         .zip(listed)

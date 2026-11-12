@@ -17,7 +17,7 @@ use arboard::Clipboard;
 use atroxabot_core::git;
 use atroxabot_core::skills::{self, Library, Skill};
 use atroxabot_core::stats::{self, Ledger, Record};
-use atroxabot_core::tools::Workspace;
+use atroxabot_core::tools::{Jobs, Workspace};
 use atroxabot_core::worktree;
 use atroxabot_core::{
     Agent, AgentEvent, ApiEngine, ClaudeAgent, ClaudeError, ClaudeInfo, ClaudeMcpServer, Client, CodexAgent,
@@ -199,8 +199,21 @@ pub enum Action {
         /// The answer.
         verdict: Verdict,
     },
+    /// Summarise the conversation of an API session now (`/compact`).
+    Compact {
+        /// Who summarises.
+        agent: Box<Agent>,
+        /// What it thinks through.
+        connection: Box<Connection>,
+        /// The model's prices and context window, when listed.
+        model: Option<Box<Model>>,
+        /// The session.
+        session: Box<Session>,
+    },
     /// End the agent's process (Claude Code, Codex) of this session, if it has one.
     CloseLive(String),
+    /// Stop the commands an API session's agent left running in the background.
+    StopJobs(String),
     /// Ask the Claude Agent process of this session, if it has one, what its context holds.
     AskContext(String),
     /// Read a session's messages.
@@ -360,6 +373,9 @@ pub struct App {
     /// The skills each API session has had since its first turn here: its
     /// tool list stays as it began.
     skill_sets: HashMap<String, Arc<Vec<Skill>>>,
+    /// The commands each API session's agent runs in the background: they
+    /// outlive its turns, and stop with the session, `/clear` or the app.
+    jobs: HashMap<String, Arc<Jobs>>,
     /// The user's MCP servers, connected for API sessions, and the settings they were made from.
     mcp: Option<(Vec<McpServer>, McpHub)>,
     /// The voice call in progress.
@@ -500,6 +516,7 @@ impl App {
             next_generation: 1,
             approved: HashMap::new(),
             skill_sets: HashMap::new(),
+            jobs: HashMap::new(),
             mcp: None,
             call: None,
             scheme,
@@ -828,6 +845,8 @@ impl App {
             Action::Send { agent, connection, model, session, text } => {
                 self.send(&agent, &connection, model, *session, &text);
             }
+            Action::Compact { agent, connection, model, session } => self.compact(&agent, &connection, model, *session),
+            Action::StopJobs(session) => self.stop_jobs(&session),
             Action::Stop(session) => {
                 // Not started yet: its worktree is still being made ready.
                 if self.preparing.remove(&session) {
@@ -890,6 +909,7 @@ impl App {
                 self.preparing.remove(&session);
                 self.approved.remove(&session);
                 self.skill_sets.remove(&session);
+                self.stop_jobs(&session);
                 self.writer.send(Job::DeleteSession(session));
             }
             Action::SaveAgent(agent) => {
@@ -1163,28 +1183,7 @@ impl App {
             }
             return;
         }
-        let library = Library::open().ok();
-        let skill_set = self
-            .skill_sets
-            .entry(id.clone())
-            .or_insert_with(|| Arc::new(library.as_ref().map(Library::skills).unwrap_or_default()));
-        let mut workspace = Workspace::new(&session.folder(), agent.memory_dir().as_deref());
-        if let Some(library) = &library {
-            workspace = workspace.with_skills(&library.skills_dir(), Arc::clone(skill_set));
-        }
-        let engine = ApiEngine {
-            client: client_for(connection),
-            model: agent.model.clone(),
-            effort: Some(agent.effort.clone()).filter(|effort| !effort.is_empty()),
-            system: format!("{}{}", agent.system_prompt(&session.folder()), session.worktree_note()),
-            workspace,
-            autonomy: agent.autonomy,
-            // Anthropic's own web tools; other providers have none to offer here.
-            web: connection.kind == ConnectionKind::ClaudeApi,
-            pricing: model.map(|model| *model),
-            approved: Arc::clone(self.approved.entry(id.clone()).or_default()),
-            mcp: self.mcp_hub(),
-        };
+        let engine = self.api_engine(agent, connection, model, &session);
         let (control, inbox) = Control::new();
         self.turns.insert(id.clone(), control);
         self.renew(&id);
@@ -1196,6 +1195,79 @@ impl App {
         if let Err(e) = spawned {
             self.turns.remove(&id);
             fail(self.emitter(&id), format!("The turn could not be started: {e}"));
+        }
+    }
+
+    /// The engine that answers an API session: with the system prompt the
+    /// session was started with (rendered now, at its first turn), the
+    /// skills it began with, its background commands and its approvals.
+    fn api_engine(
+        &mut self,
+        agent: &Agent,
+        connection: &Connection,
+        model: Option<Box<Model>>,
+        session: &Session,
+    ) -> ApiEngine {
+        let id = session.id.clone();
+        let library = Library::open().ok();
+        let skill_set = self
+            .skill_sets
+            .entry(id.clone())
+            .or_insert_with(|| Arc::new(library.as_ref().map(Library::skills).unwrap_or_default()));
+        let jobs = Arc::clone(self.jobs.entry(id.clone()).or_default());
+        let mut workspace = Workspace::new(&session.folder(), agent.memory_dir().as_deref()).with_jobs(jobs);
+        if let Some(library) = &library {
+            workspace = workspace.with_skills(&library.skills_dir(), Arc::clone(skill_set));
+        }
+        // A model the provider lists without pictures among its inputs is not shown any.
+        workspace.blind = session.blind
+            || model.as_ref().is_some_and(|model| {
+                !model.input_types.is_empty() && !model.input_types.iter().any(|kind| kind == "image")
+            });
+        let system = if session.system.is_empty() {
+            agent.api_system_prompt(&session.folder(), &session.worktree_note())
+        } else {
+            session.system.clone()
+        };
+        ApiEngine {
+            client: client_for(connection),
+            model: agent.model.clone(),
+            effort: Some(agent.effort.clone()).filter(|effort| !effort.is_empty()),
+            system,
+            workspace,
+            autonomy: agent.autonomy,
+            // Anthropic's own web tools; other providers have none to offer here.
+            web: connection.kind == ConnectionKind::ClaudeApi,
+            pricing: model.map(|model| *model),
+            approved: Arc::clone(self.approved.entry(id).or_default()),
+            mcp: self.mcp_hub(),
+        }
+    }
+
+    /// `/compact` for an API session: its conversation is summarised now,
+    /// as a turn of its own that adds no message.
+    fn compact(&mut self, agent: &Agent, connection: &Connection, model: Option<Box<Model>>, session: Session) {
+        let id = session.id.clone();
+        let engine = self.api_engine(agent, connection, model, &session);
+        let (control, inbox) = Control::new();
+        self.turns.insert(id.clone(), control);
+        self.renew(&id);
+        let mut emit = self.emitter(&id);
+        let spawned = std::thread::Builder::new().name("atroxabot-compact".into()).spawn(move || {
+            let mut session = session;
+            engine.compact_now(&mut session, &inbox, &mut emit);
+        });
+        if let Err(e) = spawned {
+            self.turns.remove(&id);
+            fail(self.emitter(&id), format!("The summary could not be started: {e}"));
+        }
+    }
+
+    /// Stops the commands `session`'s agent runs in the background; ending
+    /// them waits for them, so not on this thread.
+    fn stop_jobs(&mut self, session: &str) {
+        if let Some(jobs) = self.jobs.remove(session) {
+            let _ = std::thread::Builder::new().name("atroxabot-jobs".into()).spawn(move || jobs.stop_all());
         }
     }
 
@@ -1375,6 +1447,10 @@ impl Drop for App {
         for turn in self.turns.values() {
             turn.stop();
         }
+        // So do the commands API agents left running, even those a turn still holds.
+        for (_, jobs) in self.jobs.drain() {
+            jobs.stop_all();
+        }
         if let Some((_, hub)) = self.mcp.take() {
             hub.close();
         }
@@ -1483,6 +1559,7 @@ fn fail(mut emit: impl FnMut(AgentEvent), problem: String) {
     emit(AgentEvent::ReplyStarted);
     emit(AgentEvent::ReplyEnded {
         raw: Vec::new(),
+        wire: atroxabot_core::Wire::default(),
         model: String::new(),
         usage: atroxabot_core::Usage::default(),
         cost: 0.0,

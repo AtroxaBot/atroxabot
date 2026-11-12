@@ -597,6 +597,7 @@ impl Mapper {
                     cache_write_tokens: context.cache_creation_input_tokens,
                 };
                 out.push(AgentEvent::ReplyEnded {
+                    wire: crate::Wire::Messages,
                     raw: Vec::new(),
                     model: std::mem::take(&mut self.model),
                     usage,
@@ -625,6 +626,7 @@ impl Mapper {
                         why.as_ref().map_or_else(String::new, |why| format!(": {why}"))
                     );
                     out.push(AgentEvent::ReplyEnded {
+                        wire: crate::Wire::Messages,
                         raw: Vec::new(),
                         model: String::new(),
                         usage: Usage::default(),

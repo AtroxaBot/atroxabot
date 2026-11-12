@@ -1,6 +1,8 @@
-//! Blocking HTTP client for an OpenAI-compatible provider, spoken to with
-//! Chat Completions (see `completions.rs`), or for Anthropic's own API,
-//! spoken to with Messages (see `messages.rs`).
+//! Blocking HTTP client for a model provider: Anthropic's own API, spoken
+//! to with Messages (see `messages.rs`), OpenAI's own, spoken to with
+//! Responses (`openai.rs`), or any other OpenAI-compatible one, spoken to
+//! with Chat Completions (`completions.rs`). Which is which goes by the
+//! address's host; see [`Client::wire`].
 //!
 //! Every call blocks the calling thread; the desktop app runs them on worker
 //! threads so the render loop never waits on the network.
@@ -37,6 +39,12 @@ pub struct Client {
     cloudflare: bool,
     /// Whether requests go to Anthropic itself, which takes its betas.
     pub(crate) first_party: bool,
+    /// Whether requests go to OpenAI itself (`api.openai.com`), spoken to
+    /// with its Responses API.
+    pub(crate) openai: bool,
+    /// Whether requests go to OpenRouter, which takes its own caching,
+    /// reasoning and session fields.
+    pub(crate) openrouter: bool,
 }
 
 impl std::fmt::Debug for Client {
@@ -45,6 +53,8 @@ impl std::fmt::Debug for Client {
         f.debug_struct("Client")
             .field("base", &self.base)
             .field("anthropic", &self.anthropic)
+            .field("openai", &self.openai)
+            .field("openrouter", &self.openrouter)
             .field("authenticated", &self.token.is_some())
             .finish_non_exhaustive()
     }
@@ -132,7 +142,16 @@ impl Client {
             Some(root) => root,
             None => base.to_owned(),
         };
-        Self { agent, base, token: api_key, anthropic, cloudflare, first_party: on("api.anthropic.com") }
+        Self {
+            agent,
+            base,
+            token: api_key,
+            anthropic,
+            cloudflare,
+            first_party: on("api.anthropic.com"),
+            openai: on("api.openai.com"),
+            openrouter: on("openrouter.ai"),
+        }
     }
 
     /// The same client, speaking Anthropic's Messages API whatever the
@@ -150,7 +169,7 @@ impl Client {
     pub fn models(&self) -> Result<Vec<Model>> {
         #[derive(Deserialize)]
         struct Body {
-            data: Vec<Model>,
+            data: Vec<Value>,
         }
         // ponytail: Cloudflare lists no models (`GET /ai/v1/models` is a 405),
         // so their names are typed; read its list once cloudflare/ai#549 adds one.
@@ -164,7 +183,7 @@ impl Client {
         }
         let response = self.authorize(self.agent.get(format!("{}/models", self.base))).call()?;
         let body: Body = read_json(response)?;
-        Ok(body.data)
+        Ok(body.data.iter().filter_map(listed_model).collect())
     }
 
     /// Whether replies from `model` use Messages: every model on Anthropic
@@ -174,16 +193,41 @@ impl Client {
         self.anthropic || (self.cloudflare && model.starts_with("anthropic/"))
     }
 
+    /// How replies from `model` are asked for: Messages where
+    /// [`Client::speaks_messages`], OpenAI's Responses on OpenAI itself,
+    /// Chat Completions everywhere else.
+    #[must_use]
+    pub fn wire(&self, model: &str) -> crate::Wire {
+        if self.speaks_messages(model) {
+            crate::Wire::Messages
+        } else if self.openai {
+            crate::Wire::Responses
+        } else {
+            crate::Wire::Chat
+        }
+    }
+
     /// POSTs `body` as JSON, authenticated, and returns the raw response
     /// after checking the status. Used by streaming calls that consume the
     /// body incrementally.
     pub(crate) fn post(&self, path: &str, body: &Value) -> Result<Response<ureq::Body>> {
-        let mut request = self.agent.post(format!("{}{path}", self.base)).content_type("application/json");
         if path == "/messages" {
-            request = request.header("anthropic-version", ANTHROPIC_VERSION);
-            if self.first_party {
-                request = request.header("anthropic-beta", crate::messages::BETAS);
-            }
+            return self.post_messages(body, self.first_party.then_some(crate::messages::BETAS));
+        }
+        let request = self.agent.post(format!("{}{path}", self.base)).content_type("application/json");
+        check_status(self.authorize(request).send(&serde_json::to_vec(body)?[..])?)
+    }
+
+    /// POSTs `body` to `/messages`, with Anthropic's version and the
+    /// `betas` the request opts into (only Anthropic itself takes any).
+    pub(crate) fn post_messages(&self, body: &Value, betas: Option<&str>) -> Result<Response<ureq::Body>> {
+        let mut request = self
+            .agent
+            .post(format!("{}/messages", self.base))
+            .content_type("application/json")
+            .header("anthropic-version", ANTHROPIC_VERSION);
+        if let Some(betas) = betas.filter(|_| self.first_party) {
+            request = request.header("anthropic-beta", betas);
         }
         check_status(self.authorize(request).send(&serde_json::to_vec(body)?[..])?)
     }
@@ -208,6 +252,20 @@ impl Default for Client {
     fn default() -> Self {
         Self::new("", None)
     }
+}
+
+/// A model as an OpenAI-compatible `/models` lists it; `None` for an entry
+/// that is no model. What it takes in is OpenRouter's
+/// `architecture.input_modalities` when it does not say so itself: a model
+/// that takes no pictures is never shown one.
+fn listed_model(entry: &Value) -> Option<Model> {
+    let mut model = Model::deserialize(entry).ok().filter(|model| !model.id.is_empty())?;
+    if model.input_types.is_empty()
+        && let Some(kinds) = entry.pointer("/architecture/input_modalities").and_then(Value::as_array)
+    {
+        model.input_types = kinds.iter().filter_map(Value::as_str).map(str::to_owned).collect();
+    }
+    Some(model)
 }
 
 /// Decodes a JSON body after checking the status code.
@@ -242,14 +300,17 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 }
 
 /// Extracts `(code, message)` from an error body. Accepts both
-/// `{"error": {"code", "message"}}` and flat `{"error": "code", "message"}`.
+/// `{"error": {"code", "message"}}` and flat `{"error": "code", "message"}`;
+/// OpenRouter's code is a number, its kind in `metadata.error_type`.
 pub(crate) fn parse_error_body(text: &str) -> (Option<String>, Option<String>) {
     let Ok(value) = serde_json::from_str::<Value>(text) else {
         return (None, None);
     };
     let error = value.get("error").unwrap_or(&value);
     let field = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_owned);
-    let code = field(error, "code").or_else(|| error.as_str().map(str::to_owned));
+    let code = field(error, "code")
+        .or_else(|| error.pointer("/metadata/error_type").and_then(Value::as_str).map(str::to_owned))
+        .or_else(|| error.as_str().map(str::to_owned));
     let message = field(error, "message").or_else(|| field(&value, "message"));
     (code, message)
 }
@@ -295,6 +356,32 @@ mod tests {
     }
 
     #[test]
+    fn what_a_model_takes_in_is_read_where_openrouter_says_it() {
+        let entry = serde_json::json!({ "id": "x/text-only", "context_length": 8192, "architecture": { "input_modalities": ["text"] } });
+        let model = super::listed_model(&entry).unwrap();
+        assert_eq!((model.input_types, model.context_window), (vec!["text".to_owned()], 8192));
+        let own = serde_json::json!({ "id": "m", "input_types": ["text", "image"], "architecture": { "input_modalities": ["text"] } });
+        assert_eq!(super::listed_model(&own).unwrap().input_types, ["text", "image"]);
+        assert!(super::listed_model(&serde_json::json!({ "object": "list" })).is_none());
+        assert!(super::listed_model(&serde_json::json!("odd")).is_none());
+    }
+
+    #[test]
+    fn each_host_gets_its_wire() {
+        use crate::Wire;
+        let client = |url: &str| super::Client::new(url, None);
+        assert_eq!(client("https://api.anthropic.com").wire("claude-opus-5-5"), Wire::Messages);
+        assert_eq!(client("https://api.openai.com/v1").wire("gpt-5.6"), Wire::Responses);
+        assert_eq!(client("https://API.openai.com/v1/").wire("o4-mini"), Wire::Responses);
+        let openrouter = client("https://openrouter.ai/api/v1");
+        assert!(openrouter.openrouter && !openrouter.openai);
+        assert_eq!(openrouter.wire("anthropic/claude-opus-5.5"), Wire::Chat, "OpenRouter speaks Chat Completions");
+        assert_eq!(client("http://localhost:11434/v1").wire("llama4"), Wire::Chat);
+        assert_eq!(client("https://api.openai.com.evil.example/v1").wire("gpt-5.6"), Wire::Chat);
+        assert_eq!(client("https://proxy.example/v1").speaking_messages().wire("claude-opus-5-5"), Wire::Messages);
+    }
+
+    #[test]
     fn cloudflare_speaks_what_its_address_ends_in() {
         let account = "https://api.cloudflare.com/client/v4/accounts/abc";
         let root = format!("{account}/ai/v1");
@@ -320,6 +407,9 @@ mod tests {
         let flat = r#"{"error":"authorization_pending","message":"Not yet"}"#;
         assert_eq!(parse_error_body(flat), (Some("authorization_pending".into()), Some("Not yet".into())));
         assert_eq!(parse_error_body("<html>"), (None, None));
+        let openrouter =
+            r#"{"error":{"code":400,"message":"Too long","metadata":{"error_type":"context_length_exceeded"}}}"#;
+        assert_eq!(parse_error_body(openrouter), (Some("context_length_exceeded".into()), Some("Too long".into())));
     }
 
     #[test]

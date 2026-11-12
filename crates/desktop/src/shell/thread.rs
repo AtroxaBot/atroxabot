@@ -43,7 +43,8 @@ const BRIEF_KEY: usize = usize::MAX / 2;
 /// did: a command or a monitor sent to the background has some too (saved
 /// sessions still hold such news), and none of a subagent's own messages.
 fn is_agent(call: &ToolUse) -> bool {
-    matches!(call.name.as_str(), "Agent" | "Task") || !call.sub.is_empty()
+    // `agent` is an API agent's.
+    matches!(call.name.as_str(), "Agent" | "Task" | "agent") || !call.sub.is_empty()
 }
 
 /// The subagent calls in `blocks`, those of subagents included, in order.

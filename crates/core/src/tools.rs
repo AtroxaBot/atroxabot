@@ -1,7 +1,10 @@
 //! The tools an agent has when it thinks through an API (the Claude Agent
-//! brings its own): reading, writing and editing files, listing and
-//! searching folders, running commands and fetching pages; and, when the
-//! library has skills, loading one ([`crate::skills::TOOL`]).
+//! brings its own): reading, writing and editing files (and looking at
+//! pictures), listing and searching folders, running commands (in the
+//! background too, see [`Jobs`]) and fetching pages; and, when the library
+//! has skills, loading one ([`crate::skills::TOOL`]). Commands run in bash
+//! where there is one (Git for Windows' on Windows), which models write
+//! best, and in PowerShell on a Windows without it.
 //!
 //! Each call is a typed action, so the app can judge it before it runs
 //! ([`risk`]) and show what it did. Outputs are bounded: a long file is read
@@ -16,17 +19,19 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs;
-use std::io::Read as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
+use crate::attach;
 use crate::config::Config;
 use crate::pattern::Pattern;
+use crate::responses::Picture;
 use crate::skills::{self, Skill};
 
 /// Most lines one `read` returns.
@@ -62,6 +67,16 @@ const OUTPUTS: &str = "atroxabot-output-";
 const OUTPUTS_AGE: Duration = Duration::from_secs(24 * 3600);
 /// How long a command may run unless it asks for longer, and the most it may ask for.
 const SHELL_TIMEOUT: (u64, u64) = (120, 900);
+/// Most a background command's output file keeps, in bytes; what it prints
+/// past that is let go.
+const JOB_OUTPUT: u64 = 32 << 20;
+/// Most commands one session keeps running in the background.
+const MAX_JOBS: usize = 8;
+/// How long `shell` watches a background command before it answers: one
+/// that fails at once says so.
+const JOB_START: Duration = Duration::from_secs(2);
+/// Longest `job` waits for a command to end, in seconds.
+const JOB_WAIT: u64 = 600;
 /// Largest page `fetch` reads, in bytes.
 const MAX_PAGE: u64 = 2 << 20;
 /// Folders that are never worth listing or searching.
@@ -78,6 +93,11 @@ pub struct Workspace {
     pub library: Option<PathBuf>,
     /// The skills it has, as they were when its session began.
     pub skills: Arc<Vec<Skill>>,
+    /// Whether the model cannot look at pictures: `read` then says so
+    /// rather than show one.
+    pub blind: bool,
+    /// The commands its session runs in the background.
+    pub jobs: Arc<Jobs>,
     /// The files it read or wrote, as they were on disk then: what tells
     /// `edit` and `write` that one was changed since by something else.
     seen: Arc<Mutex<HashMap<PathBuf, Stamp>>>,
@@ -119,6 +139,13 @@ impl Workspace {
         let library = Some(resolve(&library.to_string_lossy(), &Self::default()));
         Self { library, skills, ..self }
     }
+
+    /// The same workspace running background commands among `jobs`: its
+    /// session's, which outlive a turn.
+    #[must_use]
+    pub fn with_jobs(self, jobs: Arc<Jobs>) -> Self {
+        Self { jobs, ..self }
+    }
 }
 
 /// How much a tool call can change, which decides whether it is asked about.
@@ -144,7 +171,7 @@ pub fn definitions() -> Vec<(&'static str, &'static str, Value)> {
     vec![
         (
             "read",
-            "Read a text file. Returns numbered lines. Long files come in pages: pass `offset` (first line, from 1) and `limit` to read on, or to read only the part you need.",
+            "Read a text file. Returns numbered lines. Long files come in pages: pass `offset` (first line, from 1) and `limit` to read on, or to read only the part you need. A picture (PNG, JPEG, GIF, WebP) is shown to you instead.",
             object(
                 json!({ "path": text("File path, absolute or relative to your folder."), "offset": number("First line to return, from 1."), "limit": number("Most lines to return.") }),
                 &["path"],
@@ -203,14 +230,26 @@ pub fn definitions() -> Vec<(&'static str, &'static str, Value)> {
         ),
         (
             "shell",
-            if cfg!(windows) {
-                "Run a PowerShell command in your folder and return its output and exit code. Each call is a fresh shell. Long output is cut in the middle and kept whole in a file the answer names: search that file rather than run the command again."
-            } else {
-                "Run a shell command (`sh -c`) in your folder and return its output and exit code. Each call is a fresh shell. Long output is cut in the middle and kept whole in a file the answer names: search that file rather than run the command again."
-            },
+            shell_description(),
             object(
-                json!({ "command": text("The command line."), "timeout": number("Seconds before it is stopped; 120 by default, 900 at most.") }),
+                json!({
+                    "command": text("The command line."),
+                    "timeout": number("Seconds before it is stopped; 120 by default, 900 at most."),
+                    "background": { "type": "boolean", "description": "Keep it running after the call returns, as a job." },
+                }),
                 &["command"],
+            ),
+        ),
+        (
+            "job",
+            "Look at the commands you started in the background. Without `id`, lists them. With `id`, says how that one is doing and shows what it printed since you last looked; `wait` first waits up to that many seconds for it to end, and `stop` ends it, with whatever it started.",
+            object(
+                json!({
+                    "id": number("The job's number, as `shell` named it."),
+                    "wait": number("Seconds to wait for it to end first; 600 at most."),
+                    "stop": { "type": "boolean", "description": "End it." },
+                }),
+                &[],
             ),
         ),
         (
@@ -236,7 +275,8 @@ pub fn risk(name: &str, input: &Value, workspace: &Workspace) -> Risk {
     // What its own commands printed, kept whole for it to look through.
     let kept = kept_outputs().is_some_and(|outputs| path.starts_with(outputs));
     match name {
-        skills::TOOL => Risk::Safe,
+        // Only ever the session's own background commands.
+        skills::TOOL | "job" => Risk::Safe,
         // A skill's files are read, never changed, by an agent.
         "read" | "list" | "search" if library || kept => Risk::Safe,
         "read" | "list" | "search" | "write" | "edit" if private => Risk::Forbidden,
@@ -279,7 +319,15 @@ pub fn run(name: &str, input: &Value, workspace: &Workspace, cancel: &AtomicBool
         "search" => {
             search(&path("path"), need("pattern")?, text("match"), flag("files"), count("context").unwrap_or(0))
         }
+        "shell" if flag("background") => start_job(need("command")?, workspace, cancel),
         "shell" => shell(need("command")?, input.get("timeout").and_then(Value::as_u64), &workspace.dir, cancel),
+        "job" => job(
+            input.get("id").and_then(Value::as_u64),
+            input.get("wait").and_then(Value::as_u64),
+            flag("stop"),
+            workspace,
+            cancel,
+        ),
         "fetch" => fetch(need("url")?),
         skills::TOOL => skills::load(&workspace.skills, input),
         other => Err(format!("there is no tool named `{other}`")),
@@ -344,6 +392,23 @@ fn load(path: &Path) -> Result<String, String> {
 }
 
 fn read(path: &Path, offset: Option<usize>, limit: Option<usize>, workspace: &Workspace) -> Result<String, String> {
+    if let Some(kind) = attach::media_type(&path.to_string_lossy()) {
+        let size = fs::metadata(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?.len();
+        if workspace.blind {
+            return Err(format!("{} is a picture, and this model cannot look at pictures", path.display()));
+        }
+        if size > attach::MAX_IMAGE {
+            return Err(format!(
+                "{} is a picture of {} KB, larger than the {} KB a model is shown",
+                path.display(),
+                size / 1000,
+                attach::MAX_IMAGE / 1000
+            ));
+        }
+        workspace.saw(path);
+        let kind = kind.trim_start_matches("image/").to_uppercase();
+        return Ok(format!("{}: a {kind} picture of {} KB.", path.display(), size.div_ceil(1000)));
+    }
     let text = load(path)?;
     workspace.saw(path);
     let first = offset.unwrap_or(1).max(1);
@@ -365,6 +430,20 @@ fn read(path: &Path, offset: Option<usize>, limit: Option<usize>, workspace: &Wo
         let _ = write!(out, "\n[lines {first}-{last} of {total}; read on with offset {}]", last + 1);
     }
     Ok(out)
+}
+
+/// The picture a `read` with `input` shows the model, when it reads one it
+/// may look at; what [`run`] said of it is the result's text.
+#[must_use]
+pub fn picture(input: &Value, workspace: &Workspace) -> Option<Picture> {
+    let path = resolve(input.get("path").and_then(Value::as_str)?, workspace);
+    let media_type = attach::media_type(&path.to_string_lossy())?;
+    let small = fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() <= attach::MAX_IMAGE);
+    if workspace.blind || !small {
+        return None;
+    }
+    let bytes = fs::read(&path).ok()?;
+    Some(Picture { media_type: media_type.to_owned(), data: atroxabot_mcp::base64(&bytes) })
 }
 
 /// `line`, or its first `max` characters and a note of how many more there
@@ -785,17 +864,7 @@ fn kept_outputs() -> Option<&'static Path> {
 /// the app left are removed.
 fn keep(output: &str) -> Option<PathBuf> {
     static COUNT: AtomicUsize = AtomicUsize::new(0);
-    let dir = KEPT
-        .get_or_init(|| {
-            let temp = std::env::temp_dir();
-            sweep_outputs(&temp);
-            let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.subsec_nanos());
-            let dir = temp.join(format!("{OUTPUTS}{}-{nanos}", std::process::id()));
-            // Fails on a folder that is there already: one somebody else made is never used.
-            make_private(&dir).ok()?;
-            fs::canonicalize(&dir).ok().map(strip_verbatim)
-        })
-        .as_deref()?;
+    let dir = kept_dir()?;
     let number = COUNT.fetch_add(1, Ordering::Relaxed);
     let path = dir.join(format!("output-{number}.txt"));
     fs::write(&path, output).ok()?;
@@ -803,6 +872,22 @@ fn keep(output: &str) -> Option<PathBuf> {
         let _ = fs::remove_file(dir.join(format!("output-{old}.txt")));
     }
     Some(path)
+}
+
+/// This process's folder of kept outputs, made the first time it is
+/// needed, new and closed to other users, so nothing in it is anyone
+/// else's; the ones earlier runs of the app left are removed then.
+fn kept_dir() -> Option<&'static Path> {
+    KEPT.get_or_init(|| {
+        let temp = std::env::temp_dir();
+        sweep_outputs(&temp);
+        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.subsec_nanos());
+        let dir = temp.join(format!("{OUTPUTS}{}-{nanos}", std::process::id()));
+        // Fails on a folder that is there already: one somebody else made is never used.
+        make_private(&dir).ok()?;
+        fs::canonicalize(&dir).ok().map(strip_verbatim)
+    })
+    .as_deref()
 }
 
 /// Makes the folder `dir`, which must not be there yet, for this user alone.
@@ -835,30 +920,147 @@ fn sweep_outputs(temp: &Path) {
     }
 }
 
-fn shell(command: &str, timeout: Option<u64>, dir: &Path, cancel: &AtomicBool) -> Result<String, String> {
-    let timeout = Duration::from_secs(timeout.unwrap_or(SHELL_TIMEOUT.0).clamp(1, SHELL_TIMEOUT.1));
-    let mut process = if cfg!(windows) {
-        let mut process = Command::new("powershell.exe");
-        process.args(["-NoProfile", "-NonInteractive", "-Command", command]);
-        process
-    } else {
-        let mut process = Command::new("sh");
-        process.args(["-c", command]);
-        process
+/// The shell commands run in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShellKind {
+    /// bash: Git for Windows' on Windows, the system's elsewhere.
+    Bash(PathBuf),
+    /// PowerShell 7 (`pwsh`) or, failing it, Windows PowerShell.
+    PowerShell(PathBuf),
+    /// The POSIX shell, where there is no bash.
+    Sh,
+}
+
+/// The shell of this computer, found once.
+fn shell_kind() -> &'static ShellKind {
+    static KIND: OnceLock<ShellKind> = OnceLock::new();
+    KIND.get_or_init(|| {
+        if cfg!(windows) {
+            if let Some(bash) = git_bash() {
+                return ShellKind::Bash(bash);
+            }
+            return ShellKind::PowerShell(on_path("pwsh.exe").unwrap_or_else(|| PathBuf::from("powershell.exe")));
+        }
+        let bash = Path::new("/bin/bash");
+        if bash.is_file() {
+            return ShellKind::Bash(bash.to_owned());
+        }
+        on_path("bash").map_or(ShellKind::Sh, ShellKind::Bash)
+    })
+}
+
+/// Git for Windows' `bin\bash.exe`, found from the `git` on the `PATH` or
+/// where it installs. Never `System32\bash.exe`, which starts WSL.
+fn git_bash() -> Option<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    // `…\Git\cmd\git.exe`, `…\Git\bin\git.exe` or `…\Git\mingw64\bin\git.exe`.
+    if let Some(git) = on_path("git.exe") {
+        roots.extend(git.ancestors().skip(1).take(3).map(Path::to_path_buf));
+    }
+    for (variable, below) in [("ProgramFiles", ""), ("ProgramW6432", ""), ("LOCALAPPDATA", "Programs")] {
+        if let Some(dir) = std::env::var_os(variable) {
+            roots.push(PathBuf::from(dir).join(below).join("Git"));
+        }
+    }
+    roots.iter().map(|root| root.join("bin").join("bash.exe")).find(|bash| bash.is_file())
+}
+
+/// The file `name` in a folder of the `PATH`.
+fn on_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths).map(|dir| dir.join(name)).find(|path| path.is_file())
+}
+
+/// What the model is told of `shell`: which shell it is, and how to write for it.
+fn shell_description() -> &'static str {
+    static TEXT: OnceLock<String> = OnceLock::new();
+    TEXT.get_or_init(|| {
+        let (which, syntax) = match shell_kind() {
+            ShellKind::Bash(_) if cfg!(windows) => (
+                "Git Bash (`bash -c`) on Windows",
+                " Write bash, with forward slashes in paths; Windows programs run too.",
+            ),
+            ShellKind::Bash(_) => ("bash (`bash -c`)", ""),
+            ShellKind::PowerShell(path) if path.to_string_lossy().contains("pwsh") => ("PowerShell 7", ""),
+            ShellKind::PowerShell(_) => {
+                ("Windows PowerShell 5.1", " Write PowerShell: `;` between commands, as it has no `&&`.")
+            }
+            ShellKind::Sh => ("sh (`sh -c`)", ""),
+        };
+        format!(
+            "Run a command with {which} in your folder and return its output and exit code.{syntax} Each call is a \
+             fresh shell. Long output is cut in the middle and kept whole in a file the answer names: search that \
+             file rather than run the command again. With `background`, the command keeps running after the call \
+             returns (a server, a watcher): the answer names its job, which `job` checks on and stops."
+        )
+    })
+}
+
+/// The process that runs `line` in `dir`, its output piped: without a
+/// console window on Windows, and leading a process group of its own on
+/// Unix, so that whatever it starts can be ended with it ([`kill_tree`]).
+fn command(line: &str, dir: &Path) -> Command {
+    let mut process = match shell_kind() {
+        ShellKind::Bash(bash) => {
+            let mut process = Command::new(bash);
+            process.args(["-c", line]);
+            process
+        }
+        ShellKind::PowerShell(exe) => {
+            let mut process = Command::new(exe);
+            process.args(["-NoProfile", "-NonInteractive", "-Command", line]);
+            process
+        }
+        ShellKind::Sh => {
+            let mut process = Command::new("sh");
+            process.args(["-c", line]);
+            process
+        }
     };
+    process.current_dir(dir).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt as _;
         // CREATE_NO_WINDOW: no console flashes up over the app.
         process.creation_flags(0x0800_0000);
     }
-    let mut child = process
-        .current_dir(dir)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("cannot start the shell: {e}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        process.process_group(0);
+    }
+    process
+}
+
+/// Ends `child` and whatever it started (a test runner's workers, a dev
+/// server's watchers), which ending the shell alone would leave running.
+fn kill_tree(child: &mut Child) {
+    let quiet = |mut process: Command| {
+        process.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt as _;
+            process.creation_flags(0x0800_0000);
+        }
+        let _ = process.status();
+    };
+    if cfg!(windows) {
+        let mut taskkill = Command::new("taskkill");
+        taskkill.args(["/T", "/F", "/PID", &child.id().to_string()]);
+        quiet(taskkill);
+    } else {
+        // The command leads its own process group (see `command`): the whole group goes.
+        let mut kill = Command::new("kill");
+        kill.args(["-KILL", "--", &format!("-{}", child.id())]);
+        quiet(kill);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn shell(line: &str, timeout: Option<u64>, dir: &Path, cancel: &AtomicBool) -> Result<String, String> {
+    let timeout = Duration::from_secs(timeout.unwrap_or(SHELL_TIMEOUT.0).clamp(1, SHELL_TIMEOUT.1));
+    let mut child = command(line, dir).spawn().map_err(|e| format!("cannot start the shell: {e}"))?;
     // Both pipes are drained on their own threads, so a chatty command never
     // blocks on a full pipe while this thread waits for it.
     let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
@@ -884,8 +1086,7 @@ fn shell(command: &str, timeout: Option<u64>, dir: &Path, cancel: &AtomicBool) -
         }
     };
     if ended.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
+        kill_tree(&mut child);
     }
     let mut out = stdout.join().unwrap_or_default();
     let errors = stderr.join().unwrap_or_default();
@@ -903,6 +1104,223 @@ fn shell(command: &str, timeout: Option<u64>, dir: &Path, cancel: &AtomicBool) -
         }
         Err(why) => Err(format!("{out}\n[the command {why} after {}s]", started.elapsed().as_secs())),
     }
+}
+
+/// The commands an agent left running in the background (`shell` with
+/// `background`), for one session; `job` looks at them and stops them.
+/// They are stopped, with whatever they started, when the last workspace
+/// holding them goes (the app keeps one per session while it runs, and
+/// drops it with the session or when it quits).
+#[derive(Debug, Default)]
+pub struct Jobs {
+    list: Mutex<Vec<Job>>,
+}
+
+/// One command running (or that ran) in the background.
+#[derive(Debug)]
+struct Job {
+    /// What `job` knows it by, from 1.
+    number: usize,
+    /// The command line.
+    command: String,
+    child: Child,
+    /// The file its output goes to.
+    output: PathBuf,
+    /// How much of the output `job` showed already, in bytes.
+    shown: u64,
+    started: Instant,
+    /// How it ended, once it did.
+    ended: Option<String>,
+}
+
+impl Job {
+    /// Notes how it ended, if it did since it was last looked at.
+    fn check(&mut self) {
+        if self.ended.is_none()
+            && let Ok(Some(status)) = self.child.try_wait()
+        {
+            self.ended =
+                Some(status.code().map_or_else(|| "ended by a signal".to_owned(), |code| format!("exit code {code}")));
+        }
+    }
+
+    /// How it is doing, in a few words.
+    fn state(&self) -> String {
+        match &self.ended {
+            Some(how) => format!("ended, {how}"),
+            None => format!("running for {}s", self.started.elapsed().as_secs()),
+        }
+    }
+
+    /// What it printed since it was last looked at, cut like any command's output.
+    fn news(&mut self) -> String {
+        let Ok(mut file) = fs::File::open(&self.output) else { return String::new() };
+        let mut bytes = Vec::new();
+        let read = std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(self.shown))
+            .and_then(|_| file.take(JOB_OUTPUT).read_to_end(&mut bytes));
+        let Ok(read) = read else { return String::new() };
+        self.shown += read as u64;
+        let text = String::from_utf8_lossy(&bytes);
+        let Some((head, tail, left_out)) = halves(text.trim_end(), SHELL_HEAD) else {
+            return text.trim_end().to_owned();
+        };
+        format!(
+            "{head}\n\n[{left_out} characters left out here; the whole output is in {}]\n\n{tail}",
+            self.output.display()
+        )
+    }
+}
+
+impl Jobs {
+    /// Stops every command still running, with whatever each started.
+    pub fn stop_all(&self) {
+        let mut list = self.list.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for job in list.iter_mut() {
+            job.check();
+            if job.ended.is_none() {
+                kill_tree(&mut job.child);
+                job.ended = Some("stopped".to_owned());
+            }
+        }
+    }
+
+    /// How many commands are running now.
+    pub fn running(&self) -> usize {
+        let mut list = self.list.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut running = 0;
+        for job in list.iter_mut() {
+            job.check();
+            running += usize::from(job.ended.is_none());
+        }
+        running
+    }
+}
+
+impl Drop for Jobs {
+    fn drop(&mut self) {
+        self.stop_all();
+    }
+}
+
+/// Starts `line` in the background, its output going to a file of the
+/// kept outputs' folder, and answers once it has had [`JOB_START`] to fail.
+fn start_job(line: &str, workspace: &Workspace, cancel: &AtomicBool) -> Result<String, String> {
+    static FILES: AtomicUsize = AtomicUsize::new(0);
+    if workspace.jobs.running() >= MAX_JOBS {
+        return Err(format!("{MAX_JOBS} commands already run in the background: stop one with `job` first"));
+    }
+    let dir = kept_dir().ok_or("there is no folder to keep the command's output in")?;
+    let output = dir.join(format!("job-{}.txt", FILES.fetch_add(1, Ordering::Relaxed)));
+    let file = fs::File::create(&output).map_err(|e| format!("cannot create {}: {e}", output.display()))?;
+    let mut child = command(line, &workspace.dir).spawn().map_err(|e| format!("cannot start the shell: {e}"))?;
+    // Both pipes go to the file, each on a thread of its own that ends when the command does.
+    let file = Arc::new(Mutex::new(file));
+    let written = Arc::new(AtomicU64::new(0));
+    let pipes: [Option<Box<dyn std::io::Read + Send>>; 2] = [
+        child.stdout.take().map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+        child.stderr.take().map(|pipe| Box::new(pipe) as Box<dyn std::io::Read + Send>),
+    ];
+    for mut pipe in pipes.into_iter().flatten() {
+        let (file, written) = (Arc::clone(&file), Arc::clone(&written));
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            // What it prints past the limit is read and let go, so it never blocks on a full pipe.
+            while let Ok(read) = pipe.read(&mut chunk) {
+                if read == 0 {
+                    break;
+                }
+                let room = JOB_OUTPUT.saturating_sub(written.fetch_add(read as u64, Ordering::Relaxed));
+                let kept = &chunk[..read.min(usize::try_from(room).unwrap_or(usize::MAX))];
+                if !kept.is_empty() {
+                    let _ = file.lock().map(|mut file| file.write_all(kept));
+                }
+            }
+        });
+    }
+    let started = Instant::now();
+    while started.elapsed() < JOB_START && !cancel.load(Ordering::Relaxed) {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let mut list = workspace.jobs.list.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let number = list.len() + 1;
+    let mut job = Job { number, command: line.to_owned(), child, output, shown: 0, started, ended: None };
+    job.check();
+    // Read after a moment more, so what it printed before it ended is in the file.
+    if job.ended.is_some() {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let news = job.news();
+    let answer = match &job.ended {
+        Some(how) => {
+            format!("The command ended at once ({how}):\n\n{}", if news.is_empty() { "(no output)" } else { &news })
+        }
+        None => format!(
+            "Started job {number}, running in the background: `{line}`. Its output goes to {}, which `read` and \
+             `search` can look through; `job` with id {number} shows what is new, waits for it or stops it. It is \
+             stopped when the session ends.{}",
+            job.output.display(),
+            if news.is_empty() { String::new() } else { format!("\n\nSo far it printed:\n\n{news}") }
+        ),
+    };
+    let failed = job.ended.as_deref().is_some_and(|how| how != "exit code 0");
+    list.push(job);
+    if failed { Err(answer) } else { Ok(answer) }
+}
+
+/// `job`: the background commands, or one of them (`id`), waited for up to
+/// `wait` seconds and stopped when `stop`.
+fn job(
+    id: Option<u64>,
+    wait: Option<u64>,
+    stop: bool,
+    workspace: &Workspace,
+    cancel: &AtomicBool,
+) -> Result<String, String> {
+    let lock = || workspace.jobs.list.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(id) = id else {
+        let mut list = lock();
+        if list.is_empty() {
+            return Ok("No command was started in the background.".to_owned());
+        }
+        let lines: Vec<String> = list
+            .iter_mut()
+            .map(|job| {
+                job.check();
+                format!("job {}: {}, `{}`", job.number, job.state(), job.command)
+            })
+            .collect();
+        return Ok(lines.join("\n"));
+    };
+    let find = |list: &mut Vec<Job>| list.iter().position(|job| job.number as u64 == id);
+    if find(&mut lock()).is_none() {
+        return Err(format!("there is no job {id}; `job` without an id lists them"));
+    }
+    let until = Instant::now() + Duration::from_secs(wait.unwrap_or(0).min(JOB_WAIT));
+    while Instant::now() < until && !cancel.load(Ordering::Relaxed) {
+        {
+            let mut list = lock();
+            let at = find(&mut list).unwrap_or_default();
+            list[at].check();
+            if list[at].ended.is_some() {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let mut list = lock();
+    let at = find(&mut list).unwrap_or_default();
+    let job = &mut list[at];
+    job.check();
+    if stop && job.ended.is_none() {
+        kill_tree(&mut job.child);
+        job.ended = Some("stopped".to_owned());
+    }
+    let news = job.news();
+    let news = if news.is_empty() { "(nothing new)".to_owned() } else { news };
+    Ok(format!("Job {}, {}: `{}`\n\n{news}", job.number, job.state(), job.command))
 }
 
 fn fetch(url: &str) -> Result<String, String> {
@@ -1250,12 +1668,78 @@ mod tests {
         let ws = workspace("shell");
         assert!(call("shell", &json!({ "command": "echo hi" }), &ws).unwrap().contains("hi"));
         assert!(call("shell", &json!({ "command": "exit 3" }), &ws).unwrap_err().contains("[exit code 3]"));
-        let sleep = if cfg!(windows) { "Start-Sleep -Seconds 20" } else { "sleep 20" };
+        let sleep =
+            if matches!(shell_kind(), ShellKind::PowerShell(_)) { "Start-Sleep -Seconds 20" } else { "sleep 20" };
         let started = Instant::now();
         let slow = call("shell", &json!({ "command": sleep, "timeout": 1 }), &ws).unwrap_err();
         assert!(slow.contains("timed out") && started.elapsed() < Duration::from_secs(15));
         let stopped = run("shell", &json!({ "command": sleep }), &ws, &AtomicBool::new(true)).unwrap_err();
         assert!(stopped.contains("stopped by the user"));
+        fs::remove_dir_all(&ws.dir).unwrap();
+    }
+
+    #[test]
+    fn the_shell_is_bash_where_there_is_one() {
+        let kind = shell_kind();
+        if cfg!(windows) {
+            if let ShellKind::Bash(bash) = kind {
+                assert!(bash.ends_with("bin\\bash.exe") && !bash.to_string_lossy().to_lowercase().contains("system32"));
+            }
+        } else {
+            assert!(matches!(kind, ShellKind::Bash(_) | ShellKind::Sh));
+        }
+        assert!(shell_description().contains("`background`"));
+        let ws = workspace("bash");
+        let both = if matches!(kind, ShellKind::PowerShell(_)) { "echo one; echo two" } else { "echo one && echo two" };
+        assert_eq!(call("shell", &json!({ "command": both }), &ws).unwrap().lines().count(), 2);
+        fs::remove_dir_all(&ws.dir).unwrap();
+    }
+
+    #[test]
+    fn background_commands_run_report_and_stop() {
+        let ws = workspace("jobs");
+        let powershell = matches!(shell_kind(), ShellKind::PowerShell(_));
+        let (talk, quick) = if powershell {
+            ("Write-Output started; Start-Sleep -Seconds 60", "Write-Output done")
+        } else {
+            ("echo started; sleep 60", "echo done")
+        };
+        let started = call("shell", &json!({ "command": talk, "background": true }), &ws).unwrap();
+        assert!(started.contains("Started job 1") && started.contains("started"), "{started}");
+        let listed = call("job", &json!({}), &ws).unwrap();
+        assert!(listed.contains("job 1: running"), "{listed}");
+        assert!(call("job", &json!({ "id": 1 }), &ws).unwrap().contains("(nothing new)"), "shown once");
+        let at = Instant::now();
+        let stopped = call("job", &json!({ "id": 1, "stop": true }), &ws).unwrap();
+        assert!(stopped.contains("ended, stopped") && at.elapsed() < Duration::from_secs(10), "{stopped}");
+        assert_eq!(ws.jobs.running(), 0);
+        let ended = call("shell", &json!({ "command": quick, "background": true }), &ws).unwrap();
+        assert!(ended.contains("ended at once") && ended.contains("done"), "{ended}");
+        assert!(call("job", &json!({ "id": 9 }), &ws).unwrap_err().contains("no job 9"));
+        assert_eq!(risk("job", &json!({ "id": 1 }), &ws), Risk::Safe);
+        // The last workspace to go stops what still runs.
+        call("shell", &json!({ "command": talk, "background": true }), &ws).unwrap();
+        let jobs = Arc::clone(&ws.jobs);
+        assert_eq!(jobs.running(), 1);
+        jobs.stop_all();
+        assert_eq!(jobs.running(), 0);
+        fs::remove_dir_all(&ws.dir).unwrap();
+    }
+
+    #[test]
+    fn a_picture_is_shown_not_read() {
+        let mut ws = workspace("picture");
+        let png = ws.dir.join("shot.png");
+        fs::write(&png, [0x89, b'P', b'N', b'G']).unwrap();
+        let input = json!({ "path": "shot.png" });
+        let said = call("read", &input, &ws).unwrap();
+        assert!(said.contains("PNG picture of 1 KB"), "{said}");
+        let shown = picture(&input, &ws).unwrap();
+        assert_eq!((shown.media_type.as_str(), shown.data.as_str()), ("image/png", "iVBORw=="));
+        assert!(picture(&json!({ "path": "src" }), &ws).is_none());
+        ws.blind = true;
+        assert!(call("read", &input, &ws).unwrap_err().contains("cannot look at pictures"));
+        assert!(picture(&input, &ws).is_none());
         fs::remove_dir_all(&ws.dir).unwrap();
     }
 

@@ -28,24 +28,33 @@ cargo clippy --workspace --all-targets -- -D warnings
   session's folder (what git tracks or would; without a repository, what is there short of hidden and
   dependency folders): type on to narrow it, arrows move, Tab or Enter writes the picked file's path
   into the message, Esc puts the list away.
-- **Questions.** When an agent on a Claude account asks you something (Claude's `AskUserQuestion`: say
-  "interview me"), a card over the message box shows one question at a time with its options. Click or
+- **Questions.** When an agent asks you something (Claude's `AskUserQuestion`, or an API agent's `ask`:
+  say "interview me"), a card over the message box shows one question at a time with its options. Click or
   press its number to pick, type to answer in your own words, Enter goes on and sends when every question
   is answered, Tab moves between questions, Esc dismisses.
 - **Subagents.** An agent that delegates shows each subagent as a card in the conversation (what it is
   for, what it is doing now, and what it took), and the side panel lists the turn's subagents under the
   tasks, each with how it is doing. A click on either opens the subagent's own conversation in the
   session's place (what it was asked, what it said and every tool it called), under a bar that leads back.
-- **Tasks.** When an agent keeps a task list (Claude Code's `TaskCreate` and `TaskUpdate`, or `TodoWrite`),
+  An agent on an API starts its own with its `agent` tool: each works on its brief in a conversation of
+  its own, with the agent's tools (but it cannot ask you anything, keep a task list or start subagents),
+  on the same system prompt and tool list, so the provider's cache serves them all. Several started in one
+  reply work side by side; what they would need your approval for asks you as the agent's own calls do,
+  and what they use is counted in the statistics.
+- **Tasks.** When an agent keeps a task list (Claude Code's `TaskCreate` and `TaskUpdate`, `TodoWrite`, or an
+  API agent's `todo`),
   the side panel shows it: what is done, what it is doing now and what is still to do; while it works,
   the conversation names the task in hand. Resting the mouse on a task that is cut short (or that the
   agent described) shows it whole, with its description. Claude Code gives a session an app starts those tools only
   when they are named as allowed (`--allowedTools`), so AtroxaBot names them.
 - **Commands and skills.** Type `/` in the message box for the list: `/clear` empties the session (its
-  messages are deleted and the agent starts over with an empty context, while the session keeps its place,
-  its name in the sidebar until the next message names it, and its folder), `/compact` has a Claude
-  account summarise its context, and every command and skill Claude Code offers
-  (yours included) is there by name. Arrows move, Tab or Enter takes one.
+  messages are deleted and the agent starts over with an empty context, on an API with a system prompt
+  made anew, and what it left running in the background is stopped, while the session keeps its place, its
+  folder and its name in the sidebar: a name you gave it stays, one taken from the first message goes
+  until the next message names it), `/compact` has a Claude account summarise its context (on an API the
+  app summarises it, as a turn of its own that adds no message), and every command and skill Claude Code
+  offers (yours included) is there by name; on an API the library's skills are, and `/<skill>` tells the
+  agent to load that one. Arrows move, Tab or Enter takes one.
 - **Sessions.** Every agent has as many sessions as you like (Ctrl/Cmd+N starts one). A session shows the
   agent's answer as Markdown (code highlighted, with a copy button), its reasoning folded away, and every
   tool call as a row that opens to its input and output. Text can be selected with the mouse, across
@@ -104,7 +113,16 @@ cargo clippy --workspace --all-targets -- -D warnings
   - **Claude API**: Anthropic's Messages API with your API key.
   - **OpenAI-compatible**: OpenRouter, Inworld, OpenAI, Ollama, or any other Chat Completions gateway.
   With an API provider the app runs the agent loop itself, with its own tools: `read`, `write`, `edit`,
-  `list`, `search`, `shell` and `fetch` (and, on the Claude API, Anthropic's web search and fetch).
+  `list`, `search`, `shell` (with `job` for what it runs in the background), `fetch`, `todo` (its task
+  list), `ask` (a question to you), `agent` (a subagent) and, with skills installed, `skill` (and, on the
+  Claude API, Anthropic's web search and fetch). Commands run in bash: on Windows Git for Windows' Git
+  Bash when it is installed (never WSL's), else PowerShell 7, else Windows PowerShell; elsewhere bash, or
+  `sh`. One that keeps running (a server, a watcher) goes to the background: its output goes to a file in
+  the temporary folder that `job` reads, and it is stopped, with whatever it started, when its session is
+  cleared or deleted and when the app quits (a command that runs too long or is stopped is ended with
+  whatever it started too). `read` shows a picture (PNG, JPEG, GIF, WebP, up to 3.5 MB) to a model that
+  takes pictures; it is kept with the session, so every later request sends the same bytes, and a model
+  whose provider refuses one is shown none from then on.
   They are made to cost the model few steps and few tokens: `search` takes a regular expression, leaves
   out what `.gitignore` excludes, and can name the matching files alone or show lines around a match;
   `edit` makes several changes to a file at once (all or none) and answers with the lines that changed,
@@ -113,6 +131,25 @@ cargo clippy --workspace --all-targets -- -D warnings
   in the temporary folder that the agent can search (the last twenty; a later run of the app removes
   those older than a day); and the calls of one reply that only look (`read`, `list`, `search`) run side
   by side.
+  Each provider is spoken to in its own way. Anthropic's API gets Messages: the prompt cache, Claude's
+  thinking replayed unchanged, old tool results cleared once the context passes 100,000 tokens (at least
+  20,000 tokens at a time, the latest eight kept, and never your answers, the task list, a skill or a
+  subagent's answer), and the conversation summarised by the server near its limit. OpenAI itself gets its
+  Responses API, with nothing stored on its side: a reasoning model's encrypted reasoning goes back with
+  its reply, so it keeps it between tool calls, and the session's id keeps the conversation on OpenAI's
+  cache. Every other provider gets Chat Completions, and a reply goes back to the model that wrote it as
+  it arrived, its reasoning included (DeepSeek's and Moonshot's `reasoning_content`, which DeepSeek
+  requires, and OpenRouter's `reasoning_details`, which carry Gemini's thought signatures). OpenRouter is
+  also asked to cache Claude (which it does not by itself), given the effort in its own field, and told the
+  session's id, so the conversation stays with the provider that holds its cache. A context that fills up
+  is summarised: what came before the prompt when a turn begins, and mid-turn everything, the turn's own
+  work included, after which the agent carries on; a provider that names its window when it is exceeded
+  is believed from then on. An API agent's system prompt (its instructions, its folder, a worktree, its
+  tools, the project's instruction files and its notes) is made at the session's first turn and kept with
+  the session: the cache stays valid, and so does Claude's kept reasoning, which Anthropic refuses under a
+  changed prompt. A change to the agent or its notes reaches a session after `/clear`, and every new
+  one. Should Anthropic refuse a session's kept reasoning all the same (one saved by an older version of
+  the app), its replies go back as plain text from then on.
   Swapping provider mid-session works: a Claude or Codex account that never saw the conversation is
   handed what was said so far. Swapping to another account of the same kind (one Claude account for
   another) keeps the model and effort, and takes away the notice of the account that was left.
@@ -213,7 +250,12 @@ cargo clippy --workspace --all-targets -- -D warnings
   part of the session, so it can be read back. M mutes, Esc hangs up. Use headphones: there is no echo
   cancellation.
 - **Memory.** An agent can keep notes between sessions, in a file of its own that rides along with every
-  session and that it updates itself.
+  session and that it updates itself. The newest 12 KB ride along; an agent whose notes grew past that is
+  told so, to read the rest when it matters and to condense them.
+- **Project instructions.** An agent on an API is given the project's own instruction files, which Claude
+  Code and Codex read by themselves: `AGENTS.md`, `CLAUDE.md` and `.claude/CLAUDE.md` in each folder from
+  the top of the git repository down to the session's folder (outside a repository, that folder's own),
+  up to 24 KB, the nearest last; the same text under two names is given once.
 - **Token discipline.** A session's system prompt and tool list do not change and history is only appended
   to, so every request reuses the provider's prompt cache. Tool outputs are bounded (long files read in
   pages, long outputs cut in the middle, both saying so). Claude's thinking blocks are replayed unchanged,
@@ -321,7 +363,7 @@ are written from Codex's own protocol types and were not run against a signed-in
 | `crates/claude-agent` (`atroxabot-claude-agent`) | Rust port of the Claude Agent SDK's transport and control protocol. Only dependency: `serde_json`. |
 | `crates/codex` (`atroxabot-codex`) | Drives the installed Codex CLI through `codex app-server`: the handshake, threads and turns as a state machine without I/O (`machine.rs`), its messages (`parse.rs`), the process (`session.rs`), finding the binary (`cli.rs`). Only dependency: `serde_json`. |
 | `crates/mcp` (`atroxabot-mcp`) | A small MCP client (stdio and Streamable HTTP): lists a server's tools and calls them. |
-| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Messages and Chat Completions); the agent loop and its tools (`engine.rs`, `tools.rs`, and `pattern.rs`, the regular expressions `search` reads); the Claude Agent and Codex engines (`claude.rs`, `codex.rs`); usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the sessions' worktrees and their cleaning up (`worktree.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
+| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Anthropic's Messages in `messages.rs`, OpenAI's Responses in `openai.rs`, Chat Completions in `completions.rs`); the agent loop and its tools (`engine.rs`, `tools.rs`, and `pattern.rs`, the regular expressions `search` reads); the Claude Agent and Codex engines (`claude.rs`, `codex.rs`); usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the sessions' worktrees and their cleaning up (`worktree.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
 | `crates/voice` (`atroxabot-voice`) | Fish Audio and ElevenLabs speech-to-text and text-to-speech, voice-activity detection, the call loop, and audio devices (`cpal`). |
 | `crates/desktop` | The app (`atroxabot`): winit window, wgpu renderer, text engine, immediate-mode UI. |
 
@@ -369,7 +411,7 @@ Everything lives in `~/.atroxabot/`:
   makes and removes them; agents' file tools may work in them as in any folder.
 - `codex/<id>/`: the Codex home of each extra Codex account. Codex owns what is in it. Removing an account
   in Settings leaves the folder, and so its sign-in, where it is.
-- `sessions/<id>.json`: one file per session, with its folder (and its worktree, if it has one) and the model and effort chosen in it; `.index.json` next to them holds titles.
+- `sessions/<id>.json`: one file per session, with its folder (and its worktree, if it has one) and the model and effort chosen in it, and for an API session the system prompt it began with, its replies as they arrived and the pictures its tools showed; `.index.json` next to them holds titles.
 - `claude/<id>/`: the Claude Code configuration folder of each extra Claude account. Claude Code owns what
   is in it. Removing an account in Settings leaves the folder, and so its sign-in, where it is.
 - `desktop.log`, `desktop-crash.log`, `desktop.lock`.
@@ -387,9 +429,12 @@ saved for.
   rule cleans it up. What git ignores in a worktree (build output, a local `.env`) goes with it. A session
   that has started cannot move into or out of a worktree; start a new one.
 - No agent-to-agent handoff and no scheduled jobs.
-- API agents have no subagents (Claude accounts have them, from Claude Code), and only their calls that
-  look (`read`, `list`, `search`) run side by side. MCP servers behind OAuth are not supported for them:
-  static headers only.
+- API agents' subagents share their agent's model and cannot ask you anything, keep a task list or start
+  subagents of their own; what they use is in the statistics but not in their session's total. Of an API
+  agent's other calls in one reply, only those that look (`read`, `list`, `search`) run side by side. MCP
+  servers behind OAuth are not supported for API agents: static headers only. Anthropic does not document
+  clearing old tool results beside its compaction: should it refuse the two together, the app stops asking
+  for the clearing until it is started again.
 - An API agent's `search` reads the usual regular expressions (classes, groups, `|`, repetition, `\b`)
   but no look-around or back-references: such a pattern is looked for as plain text, and the answer says
   so. It matches within a line.
@@ -411,8 +456,8 @@ saved for.
   or MCP servers. A repository's `.json` address alone cannot be read; add the repository it is in.
   Repositories are not looked at by themselves: those your skills came from are read once when the Skills
   page first opens, to find updates.
-- Questions, subagents, the task list, `/compact` and the plan's limits are Claude Code's, so they
-  exist on Claude accounts only (skills work on every provider). A message sent while an agent works is read after the tool calls in
+- Questions, subagents, the task list and `/compact` are Claude accounts' and API agents' (Codex has its
+  own), and the plan's limits are the accounts' (skills work on every provider). A message sent while an agent works is read after the tool calls in
   progress: one long call (a test run, a subagent) keeps it waiting until it is done, unless you use
   *Send now*, which stops that call. A Claude Code older than about 2.1.219 cannot drop a message it was
   handed when you press Stop: it answers it after all. A turn's file changes cannot be undone (rewound) yet. A subagent's

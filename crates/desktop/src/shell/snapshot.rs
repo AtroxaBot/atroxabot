@@ -703,6 +703,7 @@ fn shell() -> Shell {
         AgentEvent::Text(answer.into()),
         AgentEvent::ReplyEnded {
             raw: Vec::new(),
+            wire: atroxabot_core::Wire::default(),
             model: "claude-opus-5-5".into(),
             usage,
             cost: 0.18,
