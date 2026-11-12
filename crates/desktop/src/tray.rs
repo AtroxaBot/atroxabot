@@ -70,6 +70,7 @@ impl CloseAction {
 
 /// What the user did with the tray icon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code, reason = "only the Windows tray sends them"))]
 pub enum TrayEvent {
     /// Open the window: a click on the icon, its menu, or a second start of the app.
     Open,
@@ -96,6 +97,7 @@ impl Tray {
     }
 
     /// Does nothing.
+    #[cfg_attr(target_os = "macos", allow(dead_code, reason = "macOS hides the whole app instead"))]
     pub fn show(&self) {}
 
     /// Does nothing.

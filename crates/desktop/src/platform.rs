@@ -277,7 +277,7 @@ fn clipboard_native(picture: &Path) -> io::Result<Option<Vec<PathBuf>>> {
 /// blue first. `None` for anything else, and for data shorter than its
 /// header says. The fourth byte of a pixel is not read: it is rarely alpha,
 /// and a copier that has transparency offers a PNG beside the bitmap.
-#[cfg(any(target_os = "windows", test))]
+#[cfg(target_os = "windows")]
 fn dib_rgb(dib: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let field = |at: usize| dib.get(at..at + 4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]));
     let header = field(0)? as usize;

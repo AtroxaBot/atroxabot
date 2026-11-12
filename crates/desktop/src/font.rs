@@ -360,6 +360,7 @@ impl Fonts {
     /// # Panics
     /// Only if an embedded font file is corrupt, which is a build defect.
     #[must_use]
+    #[allow(clippy::large_stack_arrays, reason = "the nine faces, made once at start and moved into the app")]
     pub fn load() -> Self {
         let embedded = |bytes: &'static [u8]| Face::parse(bytes, 0).expect("embedded font is a valid OpenType file");
         Self {
