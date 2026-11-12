@@ -56,6 +56,9 @@ const ZOOM: (u16, u16) = (50, 200);
 const ZOOM_STEP: u16 = 10;
 /// Wait between attempts to bring the GPU back after it was lost.
 const GPU_RETRY: Duration = Duration::from_secs(2);
+/// Wait before drawing again when a frame could not be shown (a hidden or
+/// busy surface) while something moves: not at once, which would spin.
+const SKIPPED_RETRY: Duration = Duration::from_millis(100);
 
 /// Results delivered from other threads.
 pub enum WorkerEvent {
@@ -358,6 +361,8 @@ pub struct App {
     renderer: Renderer,
     /// When to try again to bring back a lost GPU.
     gpu_retry: Option<Instant>,
+    /// When to draw again after a frame that could not be shown.
+    redraw_at: Option<Instant>,
     fonts: Fonts,
     atlas: GlyphAtlas,
     images: ImageAtlas,
@@ -442,7 +447,7 @@ impl App {
         let attributes = Window::default_attributes()
             .with_title("AtroxaBot")
             .with_inner_size(LogicalSize::new(width, height))
-            .with_min_inner_size(LogicalSize::new(MIN_WINDOW_SIZE.0, MIN_WINDOW_SIZE.1))
+            .with_min_inner_size(min_size(zoom, event_loop.primary_monitor()))
             // Windows shows a window as it maximizes it, so there it waits
             // for the first frame (see `frame`).
             .with_maximized(maximized && !cfg!(windows))
@@ -517,6 +522,7 @@ impl App {
             display,
             renderer,
             gpu_retry: None,
+            redraw_at: None,
             fonts: Fonts::load(),
             atlas: GlyphAtlas::default(),
             images: ImageAtlas::default(),
@@ -635,7 +641,10 @@ impl App {
                 }
                 return;
             }
-            WindowEvent::Resized(size) => self.renderer.resize(size.width, size.height),
+            WindowEvent::Resized(size) => {
+                self.renderer.resize(size.width, size.height);
+                self.window.request_redraw();
+            }
             WindowEvent::Focused(focused) => {
                 // Coming back, perhaps from signing in to Claude in a terminal.
                 if focused && !self.ui.focused {
@@ -695,6 +704,8 @@ impl App {
                 if primary && let Some(zoom) = zoomed(self.zoom, &event.logical_key) {
                     if zoom != self.zoom {
                         self.zoom = zoom;
+                        // The smallest window holds the same layout at any zoom.
+                        self.window.set_min_inner_size(Some(min_size(zoom, self.window.current_monitor())));
                         // Resent next frame at the new zoom.
                         self.ime_area = None;
                         self.shell.config.zoom = (zoom != 100).then(|| zoom.to_string());
@@ -1369,6 +1380,7 @@ impl App {
             self.recover_gpu();
         }
         let now = Instant::now();
+        self.redraw_at = None;
         let dt = (now - self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         self.ui.begin(dt, (now - self.start).as_secs_f32());
@@ -1475,7 +1487,11 @@ impl App {
             });
         }
         if self.ui.animating || self.shell.is_busy() {
-            self.window.request_redraw();
+            if drawn == Frame::Skipped {
+                self.redraw_at = Some(Instant::now() + SKIPPED_RETRY);
+            } else {
+                self.window.request_redraw();
+            }
         }
     }
 
@@ -1491,7 +1507,7 @@ impl App {
             let left = at.saturating_sub(atroxabot_core::unix_now()).clamp(1, 60);
             Instant::now() + Duration::from_secs(left)
         });
-        match blink.into_iter().chain(tip).chain(self.gpu_retry).chain(due).min() {
+        match blink.into_iter().chain(tip).chain(self.gpu_retry).chain(self.redraw_at).chain(due).min() {
             Some(at) => ControlFlow::WaitUntil(at),
             None => ControlFlow::Wait,
         }
@@ -1666,6 +1682,19 @@ fn zoomed(zoom: u16, key: &Key) -> Option<u16> {
 /// Whether `key` is the letter `letter`, in either case.
 fn is_key(key: &Key, letter: &str) -> bool {
     matches!(key, Key::Character(c) if c.eq_ignore_ascii_case(letter))
+}
+
+/// The smallest the window may be at `zoom` (percent): the interface is
+/// drawn larger, so the window is too, and the layout fits as at 100%;
+/// but never more than most of `screen`, so a zoomed window still fits.
+fn min_size(zoom: u16, screen: Option<winit::monitor::MonitorHandle>) -> LogicalSize<f64> {
+    let z = f64::from(zoom) / 100.0;
+    let (mut w, mut h) = (f64::from(MIN_WINDOW_SIZE.0) * z, f64::from(MIN_WINDOW_SIZE.1) * z);
+    if let Some(screen) = screen {
+        let room: LogicalSize<f64> = screen.size().to_logical(screen.scale_factor());
+        (w, h) = (w.min(room.width * 0.9), h.min(room.height * 0.9));
+    }
+    LogicalSize::new(w, h)
 }
 
 /// Logical size and maximized state of the window from the config's
@@ -1877,6 +1906,17 @@ mod tests {
         assert_eq!(zoomed(150, &key("0")), Some(100));
         assert_eq!(zoomed(ZOOM.1, &key("+")), Some(ZOOM.1), "clamped");
         assert_eq!(zoomed(100, &key("k")), None);
+    }
+
+    #[test]
+    fn the_smallest_window_grows_with_the_zoom() {
+        let size = |zoom| {
+            let size = min_size(zoom, None);
+            (size.width.round() as u32, size.height.round() as u32)
+        };
+        assert_eq!(size(100), MIN_WINDOW_SIZE);
+        assert_eq!(size(150), (1230, 840));
+        assert_eq!(size(50), (410, 280));
     }
 
     #[test]

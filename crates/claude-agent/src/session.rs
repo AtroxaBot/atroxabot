@@ -67,6 +67,39 @@ struct Shared {
 /// The variable the official SDK sets so that the binary reports its session state.
 const READS_SESSION_STATE: &str = "CLAUDE_CODE_SDK_READS_SESSION_STATE";
 
+/// What a Claude Code session (or an app made with the Agent SDK) hands the
+/// programs it starts: its own marks, the label it reports itself under,
+/// and a way back into it. An app started from inside one (as a developer
+/// does) would pass them on, and its own sessions would then run as part of
+/// that one and report its label (`claude-desktop`, `sdk-ts`, `cli`) as
+/// theirs. None goes on: Claude Code labels its process itself.
+const HOST_SESSION: [&str; 11] = [
+    "CLAUDECODE",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_AGENT_SDK_VERSION",
+    "CLAUDE_CODE_SESSION_ID",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_SESSION_ATTENDED",
+    "CLAUDE_CODE_MESSAGING_SOCKET",
+    "CLAUDE_CODE_MESSAGING_TOKEN",
+    "CLAUDE_CODE_EXECPATH",
+    "CLAUDE_PID",
+    "CLAUDE_EFFORT",
+];
+
+/// Takes from `command` what the host session would hand on ([`HOST_SESSION`]).
+/// Started from inside a Claude Code session (`nested`), the account folder
+/// it used goes too: an account of the caller's names its own in its
+/// options, and Claude Code's default is the one with none.
+fn leave_host_session(command: &mut std::process::Command, nested: bool) {
+    for name in HOST_SESSION {
+        command.env_remove(name);
+    }
+    if nested {
+        command.env_remove("CLAUDE_CONFIG_DIR");
+    }
+}
+
 /// Locks `mutex`; a panic in the caller's callback must not take the session down with it.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -91,9 +124,8 @@ impl Session {
         };
         let mut command = command(&path)?;
         command.args(build_args(options)?).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        // The environment is inherited as is. Only CLAUDECODE goes, as in the SDK, so that a launch from inside
-        // a Claude Code session is not taken for a nested one.
-        command.env_remove("CLAUDECODE");
+        // The environment is inherited, but for what a Claude Code session the app was started from would hand on.
+        leave_host_session(&mut command, std::env::var_os("CLAUDECODE").is_some());
         // As the official SDK does (unless the caller says otherwise): the binary then says when it runs a turn,
         // one it starts by itself included, and when it is idle ([`Event::SessionState`]).
         if !options.env.iter().any(|(key, _)| key.eq_ignore_ascii_case(READS_SESSION_STATE)) {
@@ -613,6 +645,35 @@ mod tests {
 
     use super::*;
     use crate::{Block, SystemPrompt};
+
+    #[test]
+    fn nothing_of_a_host_session_is_handed_on() {
+        let removed = |nested: bool| {
+            let mut command = std::process::Command::new("claude");
+            command.env("CLAUDE_CODE_ENTRYPOINT", "claude-desktop");
+            leave_host_session(&mut command, nested);
+            // An account of the caller's names its folder after this.
+            command.env("CLAUDE_CONFIG_DIR", "/accounts/a");
+            let mut gone: Vec<String> = command
+                .get_envs()
+                .filter(|(_, value)| value.is_none())
+                .map(|(name, _)| name.to_string_lossy().into_owned())
+                .collect();
+            gone.sort();
+            (gone, command.get_envs().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value.is_some()))
+        };
+        let (gone, folder) = removed(false);
+        assert_eq!(gone.len(), HOST_SESSION.len());
+        assert!(gone.iter().any(|name| name == "CLAUDE_CODE_ENTRYPOINT"), "the label is Claude Code's own");
+        assert!(folder);
+        let (gone, folder) = removed(true);
+        assert!(!gone.iter().any(|name| name == "CLAUDE_CONFIG_DIR"), "the account's own folder is set after");
+        assert!(folder);
+        // Claude Code's default account, started from inside a session: not that session's folder.
+        let mut command = std::process::Command::new("claude");
+        leave_host_session(&mut command, true);
+        assert!(command.get_envs().any(|(name, value)| name == "CLAUDE_CONFIG_DIR" && value.is_none()));
+    }
 
     #[test]
     fn session_is_send_and_sync() {

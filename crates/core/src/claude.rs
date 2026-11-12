@@ -610,6 +610,11 @@ impl Mapper {
                 }
                 if self.agents.contains(&task.tool_use_id) {
                     out.push(AgentEvent::Activity { text: activity(&task), id: task.tool_use_id });
+                } else if task.state != sdk::TaskState::Running {
+                    // A command or a monitor: the app lists it while it runs.
+                    let ended = task.state != sdk::TaskState::Started;
+                    let what = if ended { String::new() } else { task.description };
+                    out.push(AgentEvent::Background { id: task.tool_use_id, what, ended });
                 }
             }
             sdk::Event::ContextUsage(usage) => {
@@ -868,6 +873,12 @@ mod tests {
             let expected: &[&str] = if id == "a1" { &["a1", "a1"] } else { &[] };
             assert_eq!(said, expected, "{id}");
         }
+        // Those are listed as running in the background instead, and only those.
+        let listed = |out: Vec<AgentEvent>| out.iter().any(|e| matches!(e, AgentEvent::Background { .. }));
+        assert!(listed(mapper.map(task("b2", "local_bash", sdk::TaskState::Started))));
+        assert!(!listed(mapper.map(task("b2", "", sdk::TaskState::Running))), "only its start and end");
+        assert!(listed(mapper.map(task("b2", "", sdk::TaskState::Failed))));
+        assert!(!listed(mapper.map(task("a2", "local_agent", sdk::TaskState::Started))));
         // A call of another name is a subagent when its task says so.
         assert_eq!(news(mapper.map(task("r1", "remote_agent", sdk::TaskState::Started))), ["r1"]);
         assert_eq!(news(mapper.map(task("r1", "", sdk::TaskState::Completed))), ["r1"]);
@@ -971,12 +982,19 @@ mod tests {
             error: None,
         });
         assert_eq!(started[0], AgentEvent::ReplyStarted);
-        assert!(mapper.map(task(sdk::TaskState::Started, "Wait for the build")).is_empty());
+        // While it runs, the app lists it.
+        assert_eq!(
+            mapper.map(task(sdk::TaskState::Started, "Wait for the build")),
+            [AgentEvent::Background { id: "b1".into(), what: "Wait for the build".into(), ended: false }]
+        );
         mapper.map(result(false, None, 0.0));
         // Between turns, its end says why the agent goes on.
         assert_eq!(
             mapper.map(task(sdk::TaskState::Completed, "")),
-            [AgentEvent::Note("A background task finished: Wait for the build".into())]
+            [
+                AgentEvent::Note("A background task finished: Wait for the build".into()),
+                AgentEvent::Background { id: "b1".into(), what: String::new(), ended: true }
+            ]
         );
         // Its guess at what the user writes next comes after the turn, and is only passed on.
         assert_eq!(
@@ -999,7 +1017,8 @@ mod tests {
         // A task that ends during a turn is part of it: no line.
         mapper.map(sdk::Event::MessageStart { parent_tool_use_id: None });
         mapper.map(task(sdk::TaskState::Started, "Run the tests"));
-        assert!(mapper.map(task(sdk::TaskState::Failed, "")).is_empty());
+        let ended = mapper.map(task(sdk::TaskState::Failed, ""));
+        assert!(ended.iter().all(|event| matches!(event, AgentEvent::Background { ended: true, .. })), "{ended:?}");
     }
 
     #[test]

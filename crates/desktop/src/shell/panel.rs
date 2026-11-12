@@ -471,6 +471,43 @@ impl Shell {
         y + 6.0
     }
 
+    /// What the session's Claude Code runs in the background (a command, a
+    /// monitor), while it does: what each was started for. It is drawn
+    /// still, as a running command may take an hour. Returns where the
+    /// list ends (`y` itself when nothing runs).
+    fn draw_background(&self, p: &mut Painter, ui: &mut Ui, (x, mut y, w): (f32, f32, f32)) -> f32 {
+        let t = p.theme;
+        let Some(tasks) = self.thread().map(|thread| &thread.background).filter(|tasks| !tasks.is_empty()) else {
+            return y;
+        };
+        p.rect(Rect::new(x - 16.0, y, w + 32.0, 1.0), t.border, 0.0);
+        y += 18.0;
+        field_label(p, icon::TERMINAL, "IN THE BACKGROUND", x, y);
+        let count = p.layout(&tasks.len().to_string(), theme::TINY, None);
+        p.text(&count, x + w - count.width(), y + 1.0, t.text_faint);
+        y += 26.0;
+        for task in tasks.iter().take(AGENTS_SHOWN) {
+            p.rect(Rect::new(x + 4.0, y + 6.0, 6.0, 6.0), t.text_muted, 3.0);
+            let what = if task.what.is_empty() { "A command" } else { task.what.as_str() };
+            let mut label = p.layout(what, theme::SMALL, None);
+            let cut = label.width() > w - 22.0;
+            label.truncate(p.fonts, w - 22.0);
+            p.text(&label, x + 22.0, y, t.text);
+            if cut {
+                ui.tip(id(("background", &task.id)), Rect::new(x - 8.0, y - 4.0, w + 16.0, 24.0), || {
+                    Tip::text(what.to_owned())
+                });
+            }
+            y += 24.0;
+        }
+        let hidden = tasks.len().saturating_sub(AGENTS_SHOWN);
+        if hidden > 0 {
+            p.label(&format!("{hidden} more"), theme::TINY, x + 22.0, y, t.text_faint);
+            y += 20.0;
+        }
+        y + 6.0
+    }
+
     /// The account whose plan limits the panel shows: the one the top bar
     /// names, which the open session thinks through and its next message
     /// goes to (whatever account it ran on before). `None` when that is an
@@ -549,6 +586,7 @@ impl Shell {
         let mut y = self.draw_usage(p, ui, (x, rect.y + 48.0, w)) + 8.0;
         y = self.draw_todos(p, ui, (x, y, w));
         y = self.draw_subagents(p, ui, (x, y, w));
+        y = self.draw_background(p, ui, (x, y, w));
         y = self.draw_limits(p, ui, (x, y, w), actions);
         p.rect(Rect::new(rect.x, y, rect.w, 1.0), t.border, 0.0);
         y += 18.0;

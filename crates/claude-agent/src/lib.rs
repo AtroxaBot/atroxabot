@@ -5,8 +5,9 @@
 //! stream-json`). Everything the binary says arrives as an [`Event`] on a reader thread; the [`Session`] handle
 //! sends user messages, interrupts and permission decisions.
 //!
-//! The crate never touches authentication: the binary inherits the parent environment (minus `CLAUDECODE`, so a
-//! launch from inside a Claude Code session works, plus [`Options::env`]) and signs in however the user set it up.
+//! The crate never touches authentication: the binary inherits the parent environment (minus what a Claude Code
+//! session the caller was started from hands on, its label among them, so the binary labels itself; plus
+//! [`Options::env`]) and signs in however the user set it up.
 //!
 //! Blocking I/O and std threads only; the single dependency is `serde_json`.
 

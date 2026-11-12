@@ -188,6 +188,9 @@ pub struct Shell {
     /// The open session, one of the selected agent's.
     current: Option<String>,
     modal: Option<Modal>,
+    /// The side panel floats over the session (the window has no room to
+    /// set it beside it): Esc and a click outside it close it.
+    panel_floats: bool,
     composer: Composer,
     menu: Option<MenuState>,
     /// Model lists of API connections, by connection id.
@@ -265,6 +268,7 @@ impl Shell {
             agent,
             current: None,
             modal,
+            panel_floats: false,
             composer: Composer::default(),
             menu: None,
             models: HashMap::new(),
@@ -593,9 +597,9 @@ impl Shell {
     /// once: the sidebar knows them.
     fn open_session(&mut self, session: &str, actions: &mut Vec<Action>) {
         (self.menu, self.renaming) = (None, None);
-        // A Claude Agent process only stays up for the session being looked at.
+        // A Claude Agent process only stays up for the session being looked at, or one at work.
         if let Some(previous) = self.current.clone().filter(|previous| previous != session)
-            && self.threads.get(&previous).is_some_and(|thread| !thread.busy)
+            && self.threads.get(&previous).is_some_and(|thread| !thread.at_work())
         {
             actions.push(Action::CloseLive(previous));
         }
@@ -627,7 +631,7 @@ impl Shell {
             // Where the one being left worked: for one in a worktree, the folder that stands for.
             self.pending_folder = thread.session.origin();
             self.pending_worktree = thread.session.worktree.is_some();
-            if !thread.busy {
+            if !thread.at_work() {
                 actions.push(Action::CloseLive(previous));
             }
         }
@@ -979,6 +983,7 @@ impl Shell {
             // busy when the account was switched): this message, and the
             // limits it reports, belong to the new one, which starts its own.
             if !thread.session.account.is_empty() && thread.session.account != connection.id {
+                thread.background_lost();
                 actions.push(Action::CloseLive(session.to_owned()));
             }
             thread.session.remote.clear();
@@ -993,6 +998,8 @@ impl Shell {
         let guesses = connection.kind == ConnectionKind::ClaudeAgent && !self.config.hide_suggestions;
         let with = (agent.model.clone(), agent.effort.clone(), guesses);
         if connection.kind.is_account() && thread.sent_with.as_ref().is_some_and(|sent| *sent != with) {
+            // What it runs in the background goes with it (the user chose another model or effort).
+            thread.background_lost();
             actions.push(Action::CloseLive(session.to_owned()));
         }
         thread.sent_with = Some(with);
@@ -1204,6 +1211,7 @@ impl Shell {
             // Taken in: it is in the conversation now.
             AgentEvent::FollowUp { id, .. } => thread.follow_ups.retain(|waiting| waiting.message.id != id),
             AgentEvent::Queued(count) => thread.more = count,
+            AgentEvent::Background { id, what, ended } => thread.background_task(id, what, ended),
             // Only between turns: one that started since makes it stale.
             AgentEvent::Suggestion(text) if suggesting && !thread.busy => thread.suggestion = Some(text),
             AgentEvent::TurnEnded { problem } => {
@@ -1254,6 +1262,10 @@ impl Shell {
                         waiting.sent = false;
                     }
                 }
+                // What it ran in the background went with it: the conversation says so.
+                if thread.background_lost() {
+                    actions.push(Action::SaveSession(Box::new(thread.session.clone())));
+                }
             }
             _ => {}
         }
@@ -1283,7 +1295,7 @@ impl Shell {
     /// Stores a changed agent; sessions of it that are idle start their
     /// Claude Agent again with the new settings on the next message.
     fn update_agent(&mut self, agent: Agent, actions: &mut Vec<Action>) {
-        for thread in self.threads.values().filter(|t| t.session.agent == agent.id && !t.busy) {
+        for thread in self.threads.values().filter(|t| t.session.agent == agent.id && !t.at_work()) {
             actions.push(Action::CloseLive(thread.session.id.clone()));
         }
         match self.agents.iter_mut().find(|a| a.id == agent.id) {
@@ -1374,15 +1386,23 @@ impl Shell {
         p.rect(view, t.panel, 0.0);
         let body = Rect::new(view.x, view.y + theme::TITLE_HEIGHT, view.w, view.h - theme::TITLE_HEIGHT);
         let sidebar = Rect::new(body.x, body.y, theme::SIDEBAR_WIDTH.min(body.w * 0.4), body.h);
-        // The side panel takes its width from the session, where the window has it to give.
+        // The side panel takes its width from the session, where the window has it to give;
+        // where it has not, the panel floats over the session, under its top bar.
         let room = body.w - sidebar.w - theme::GAP;
-        let side = if self.config.panel && room >= panel::WIDTH + 520.0 { panel::WIDTH + theme::GAP } else { 0.0 };
+        let docked = room >= panel::WIDTH + 520.0;
+        let side = if self.config.panel && docked { panel::WIDTH + theme::GAP } else { 0.0 };
         let canvas = Rect::new(sidebar.right(), body.y, room - side, body.h - theme::GAP);
-        // A modal takes the mouse from the whole screen; an open list from what is under it.
+        let floating = (self.config.panel && !docked).then(|| {
+            let w = panel::WIDTH.min(canvas.w - 2.0 * theme::GAP);
+            let top = canvas.y + theme::HEADER_HEIGHT;
+            Rect::new(canvas.right() - w - theme::GAP, top, w, canvas.bottom() - top - theme::GAP)
+        });
+        self.panel_floats = floating.is_some();
+        // A modal takes the mouse from the whole screen; an open list, or else the floating panel, from what is under it.
         let list = self.menu.as_ref().map(|menu| menu.rect);
         // A modal opened by this frame's click must not take that same click for one outside it.
         let modal_was_open = self.modal.is_some();
-        ui.blocker = if self.modal.is_some() { Some(view) } else { list };
+        ui.blocker = if self.modal.is_some() { Some(view) } else { list.or(floating) };
         // The brand, where a title would be: on macOS the traffic lights sit there.
         if crate::titlebar::CUSTOM {
             let mid = view.y + theme::TITLE_HEIGHT * 0.5 + 1.0;
@@ -1404,6 +1424,15 @@ impl Shell {
         if side > 0.0 {
             let panel = Rect::new(canvas.right() + theme::GAP, canvas.y, panel::WIDTH, canvas.h);
             self.draw_panel(p, ui, panel, actions);
+        } else if let Some(floating) = floating {
+            ui.blocker = if self.modal.is_some() { Some(view) } else { list };
+            self.draw_panel(p, ui, floating, actions);
+            // A click outside it puts it away, but not one on the top bar, whose button does that itself.
+            let header = Rect::new(canvas.x, canvas.y, canvas.w, theme::HEADER_HEIGHT);
+            let outside = !floating.contains(ui.mouse) && !header.contains(ui.mouse);
+            if ui.pressed && outside && self.menu.is_none() && self.modal.is_none() && !modal_was_open {
+                self.toggle_panel(actions);
+            }
         }
 
         ui.blocker = list;
@@ -1532,15 +1561,18 @@ impl Shell {
         let folder = self.origin_in_use();
         let label = folder_label(&folder);
         let glyph = if self.wants_worktree() { icon::BRANCH } else { icon::FOLDER };
-        let width = 58.0 + p.layout(label, theme::SMALL, None).width().min(220.0);
-        let folder_chip = self.toolbar_button(p, ui, (right - width, mid - 15.0), (Some(glyph), label), Menu::Folder);
+        // On a narrow session the chips' names give way, so the agent's name keeps its place.
+        let names = (header.w * 0.16).clamp(60.0, 220.0);
+        let width = 58.0 + p.layout(label, theme::SMALL, None).width().min(names);
+        let folder_chip =
+            self.toolbar_button(p, ui, (right - width, mid - 15.0), (Some(glyph), label, names), Menu::Folder);
         right = folder_chip.x - 6.0;
 
         // The provider: a click swaps it.
         let connection = self.connection(agent);
         let name = connection.as_ref().map_or("No provider", |connection| connection.name.as_str());
         let mut label = p.layout(name, theme::SMALL, None);
-        label.truncate(p.fonts, 180.0);
+        label.truncate(p.fonts, names.min(180.0));
         let chip = Rect::new(right - label.width() - 58.0, mid - 15.0, label.width() + 58.0, 30.0);
         let open = self.menu_open(Menu::Provider);
         let hovered = ui.hovered(chip);
@@ -1780,6 +1812,9 @@ impl Shell {
             } else {
                 edit_key(editor, event, mods, clipboard);
             }
+        } else if escape && self.panel_floats && self.config.panel {
+            // The side panel floating over the session goes first.
+            self.toggle_panel(actions);
         } else if self.call.is_some() {
             if escape {
                 self.end_call(actions);
@@ -2460,6 +2495,54 @@ mod tests {
     }
 
     /// A shell whose agent (on a Claude account) is answering "Fix the bug": the session's id.
+    /// What Claude Code runs in the background keeps its process up when the user looks elsewhere.
+    #[test]
+    fn a_session_running_something_in_the_background_keeps_its_process() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        shell.start(&mut actions);
+        let first = working(&mut shell, &mut actions);
+        let task = |id: &str, ended: bool| AgentEvent::Background {
+            id: id.into(),
+            what: if ended { String::new() } else { format!("Watch build {id}") },
+            ended,
+        };
+        shell.agent_event(&first, task("b1", false), &mut actions);
+        shell.agent_event(&first, task("b2", false), &mut actions);
+        shell.agent_event(&first, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        shell.agent_event(&first, task("b1", true), &mut actions);
+        let running =
+            |shell: &Shell| shell.threads[&first].background.iter().map(|t| t.what.clone()).collect::<Vec<_>>();
+        assert_eq!(running(&shell), ["Watch build b2"]);
+        let closes = |actions: &[Action]| actions.iter().any(|a| matches!(a, Action::CloseLive(s) if *s == first));
+
+        // Leaving it for a new session, or for another one, leaves its process be.
+        actions.clear();
+        shell.new_session(&mut actions);
+        shell.send("Meanwhile", false, Vec::new(), &mut actions);
+        let second = shell.current.clone().unwrap();
+        shell.agent_event(&second, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        shell.open_session(&first, &mut actions);
+        shell.open_session(&second, &mut actions);
+        assert!(!closes(&actions), "it still runs b2");
+
+        // Once nothing runs, leaving it closes it as before.
+        shell.agent_event(&first, task("b2", true), &mut actions);
+        shell.open_session(&first, &mut actions);
+        shell.open_session(&second, &mut actions);
+        assert!(closes(&actions));
+
+        // A process that ends with a task running says so in the conversation.
+        shell.agent_event(&first, task("b3", false), &mut actions);
+        let notes = |shell: &Shell| {
+            shell.threads[&first].session.entries.iter().filter(|e| matches!(e, Entry::Note { .. })).count()
+        };
+        let before = notes(&shell);
+        shell.agent_event(&first, AgentEvent::Disconnected(None), &mut actions);
+        assert_eq!(notes(&shell), before + 1);
+        assert!(shell.threads[&first].background.is_empty());
+    }
+
     #[test]
     fn claude_guesses_the_next_message_and_tab_takes_it() {
         let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());

@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use atroxabot_core::attach::media_type;
 use atroxabot_core::{Ask, Block, Entry, Reply, Session, SessionSummary, TodoState, ToolUse, tools};
@@ -33,6 +33,11 @@ const BUBBLE_SHARE: f32 = 0.78;
 const DETAIL_CHARS: usize = 6_000;
 /// The style of tool details: small monospace.
 const DETAIL: Style = Style::mono(12.5);
+
+/// How long one frame may spend laying out again what is out of view at a
+/// new width (the window is being resized): the rest keeps its old layout
+/// for now and follows in the next frames.
+const RELAYOUT_BUDGET: Duration = Duration::from_millis(4);
 
 /// Layout keys of what a subagent said and did start here, far from any entry's index.
 const SUB_KEYS: usize = 1 << 62;
@@ -106,6 +111,17 @@ pub(super) struct Subagent {
     pub failed: bool,
     /// Whether it is the one open in the conversation's place.
     pub open: bool,
+}
+
+/// A task the session's Claude Code runs in the background that is no
+/// subagent (a command, a monitor), while it runs. It goes with the
+/// process: nothing of it is saved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Background {
+    /// The id of the call that started it.
+    pub id: String,
+    /// What it was started for; empty when not said.
+    pub what: String,
 }
 
 /// How a subagent is doing, as a small mark centred on `at`: a pulsing dot
@@ -246,6 +262,15 @@ pub(super) struct Thread {
     drawn: usize,
     /// What the agent's task list says it is doing, while a turn runs.
     doing: String,
+    /// How tall each entry was when last drawn, to know which are out of view.
+    heights: Vec<f32>,
+    /// The entry being drawn is out of view: a block of it whose layout is
+    /// only of another width keeps it once the frame's budget is spent.
+    lazy: bool,
+    /// Until when this frame lays out again what is out of view.
+    deadline: Option<Instant>,
+    /// Something out of view kept an old layout: the next frame goes on with it.
+    behind: bool,
     /// A picture of the conversation that was just clicked, for the shell to open whole.
     pub clicked_picture: Option<String>,
     /// The model and effort the last message went with, and whether its
@@ -266,6 +291,9 @@ pub(super) struct Thread {
     pub resume: Option<Resume>,
     /// How many turns in a row a usage limit stopped.
     pub tries: u32,
+    /// What its Claude Code runs in the background, oldest first: while
+    /// there is any, the process is not closed by itself (`mod.rs`).
+    pub background: Vec<Background>,
 }
 
 impl Thread {
@@ -298,6 +326,10 @@ impl Thread {
             order: Vec::new(),
             drawn: 0,
             doing: String::new(),
+            heights: Vec::new(),
+            lazy: false,
+            deadline: None,
+            behind: false,
             clicked_picture: None,
             sent_with: None,
             suggestion: None,
@@ -306,6 +338,7 @@ impl Thread {
             refused: false,
             resume: None,
             tries: 0,
+            background: Vec::new(),
         }
     }
 
@@ -331,6 +364,13 @@ impl Thread {
     pub fn tools_running(&self) -> bool {
         let Some(Entry::Reply(reply)) = self.session.entries.last() else { return false };
         reply.blocks.iter().any(|block| matches!(block, Block::Tool(call) if call.output.is_none()))
+    }
+
+    /// Whether its agent is at work: in a turn, or on something it runs in
+    /// the background, which Claude Code answers in a turn of its own once
+    /// it ends. Its process is not closed by itself meanwhile.
+    pub fn at_work(&self) -> bool {
+        self.busy || !self.background.is_empty()
     }
 
     /// A turn starts: the view follows it.
@@ -366,6 +406,36 @@ impl Thread {
         }
     }
 
+    /// Claude Code said a task of its runs in the background (`ended` false)
+    /// or no longer does.
+    pub fn background_task(&mut self, id: String, what: String, ended: bool) {
+        if ended {
+            self.background.retain(|task| task.id != id);
+        } else if !self.background.iter().any(|task| task.id == id) {
+            self.background.push(Background { id, what });
+        }
+    }
+
+    /// The process ends with tasks still running in the background: a line
+    /// in the conversation says each was stopped (between turns only, as a
+    /// running reply is written at the end). Returns whether any was, for
+    /// the session to be saved.
+    pub fn background_lost(&mut self) -> bool {
+        let lost = std::mem::take(&mut self.background);
+        if self.busy {
+            return false;
+        }
+        for task in &lost {
+            let text = if task.what.is_empty() {
+                "A background task was stopped with the agent's process".to_owned()
+            } else {
+                format!("A background task was stopped with the agent's process: {}", task.what)
+            };
+            self.session.entries.push(Entry::Note { text });
+        }
+        !lost.is_empty()
+    }
+
     /// Opens the reasoning or tool row at (entry, block), as a click would.
     #[cfg(test)]
     pub fn open_block(&mut self, entry: usize, block: usize) {
@@ -375,6 +445,7 @@ impl Thread {
     /// Entries moved (a summary was inserted): every layout is made again.
     pub fn invalidate(&mut self) {
         self.cache.clear();
+        self.heights.clear();
         self.open.clear();
         self.selection = None;
     }
@@ -383,7 +454,7 @@ impl Thread {
     /// the width changed; what was laid out before is reused where unchanged.
     fn markdown(&mut self, p: &Painter, key: (usize, usize), text: &str, width: f32, ink: u8) -> &mut Doc {
         let stale = self.cache.get(&key).is_none_or(|c| c.len != text.len() || !c.doc.fits(width, p.scale));
-        if stale {
+        if stale && !self.wait(key, text) {
             let previous = self.cache.remove(&key).map(|c| c.doc);
             let doc = Doc::markdown(p.fonts, text, width, p.scale, ink, previous);
             self.cache.insert(key, Cached { doc, len: text.len() });
@@ -391,11 +462,23 @@ impl Thread {
         &mut self.cache.entry(key).or_insert_with(|| Cached { doc: Doc::default(), len: 0 }).doc
     }
 
+    /// Whether block `key`, whose layout is only of another width or scale,
+    /// keeps it this frame: it is out of view and the frame's time for
+    /// laying out such blocks is spent. Resizing the window then costs what
+    /// is in view, not the whole conversation.
+    fn wait(&mut self, key: (usize, usize), text: &str) -> bool {
+        let spent = self.deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        let laid_out = self.cache.get(&key).is_some_and(|c| c.len == text.len());
+        let wait = self.lazy && spent && laid_out;
+        self.behind |= wait;
+        wait
+    }
+
     /// The plain layout of block `key` in `style`.
     fn plain(&mut self, p: &Painter, key: (usize, usize), text: &str, style: Style, width: f32) -> &mut Doc {
         let scale = p.scale;
         let outdated = self.cache.get(&key).is_none_or(|c| c.len != text.len() || !c.doc.fits(width, scale));
-        if outdated {
+        if outdated && !self.wait(key, text) {
             let doc = Doc::plain(p.fonts, text, style, width, p.scale);
             self.cache.insert(key, Cached { doc, len: text.len() });
         }
@@ -672,7 +755,15 @@ impl Thread {
         let hidden = self.fresh.then(|| p.push_clip(Rect::new(area.x, area.y, 0.0, 0.0)));
         let mut y = top;
         let last = entries.len().saturating_sub(1);
+        // Half a view above and below counts as in view: it is laid out at once.
+        let (above, below) = (area.y - area.h * 0.5, area.bottom() + area.h * 0.5);
+        (self.deadline, self.behind) = (Some(Instant::now() + RELAYOUT_BUDGET), false);
+        self.heights.resize(entries.len(), f32::NAN);
         for (index, entry) in entries.iter().enumerate() {
+            let known = self.heights[index];
+            // An entry not drawn before (NaN) is in view until it is measured.
+            self.lazy = y + known < above || y > below;
+            let start = y;
             match entry {
                 Entry::User { text, files, .. } => {
                     y = self.draw_prompt(p, ui, ((index, 0), text, files), (x, y, width));
@@ -686,6 +777,11 @@ impl Thread {
                 }
                 Entry::Note { text } => y = divider(p, text, (x, y, width)),
             }
+            self.heights[index] = y - start;
+        }
+        (self.lazy, self.deadline) = (false, None);
+        if std::mem::take(&mut self.behind) {
+            ui.animating = true;
         }
         // A turn that has not written anything yet still shows it is alive.
         if self.busy && !matches!(entries.last(), Some(Entry::Reply(reply)) if !reply.blocks.is_empty()) {
