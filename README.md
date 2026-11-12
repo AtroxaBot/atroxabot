@@ -234,7 +234,8 @@ cargo clippy --workspace --all-targets -- -D warnings
   account that has not replied yet says so, and numbers that have stood ten minutes or more say since
   when: only the account's replies in this app bring news of them); a window that is used up says *Limit reached* and when it
   starts over, and reaching a limit is said in a notice that names the account, counts down to when it
-  lifts and goes away by itself then. A Codex account's limits are shown the same way, as Codex reports
+  lifts and goes away by itself then. The notice shows on the sessions that think through that account
+  only: open a session on another account and it is out of sight, go back and it is there again. A Codex account's limits are shown the same way, as Codex reports
   them (when the app starts and with each turn). A message after the
   account was switched goes to a Claude Code started for the new account, even if the old one was still
   answering when it was switched.

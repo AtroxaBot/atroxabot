@@ -143,8 +143,9 @@ impl Shell {
 
     /// The provider menu of the top bar: the open session thinks through
     /// `to` from now on, and so do the sessions its agent starts next. The
-    /// agent's other sessions stay where each was left. The notices of the
-    /// account it leaves go: they are no news for it any more.
+    /// agent's other sessions stay where each was left. The notice of the
+    /// account it leaves is no news for it any more ([`Shell::notices_shown`]);
+    /// it stays for the sessions still on that account.
     pub(super) fn swap_provider(&mut self, to: &str, actions: &mut Vec<Action>) {
         let Some(agent) = self.agent_in_use().filter(|agent| agent.connection != to) else { return };
         if self.loading() {
@@ -154,13 +155,10 @@ impl Shell {
         if let Some(session) = self.current.clone() {
             self.cancel_resume(&session);
         }
-        let from = agent.connection.clone();
         let agent = self.moved(agent, to);
         if let Some(connection) = self.config.connection(to) {
             self.want_models(&connection, actions);
         }
-        let open = self.thread().map(|thread| thread.session.account.clone()).unwrap_or_default();
-        self.notices.retain(|notice| notice.account.is_empty() || (notice.account != from && notice.account != open));
         self.choose_thinking(agent, actions);
         // The account it goes to may have run out itself.
         if let Some(lifts) = self.out_until(to) {
@@ -178,7 +176,6 @@ impl Shell {
         let Some(thread) = self.threads.get_mut(session) else { return };
         thread.session.keep_choice(&moved);
         actions.push(Action::SaveSession(Box::new(thread.session.clone())));
-        self.notices.retain(|notice| notice.account.is_empty() || notice.account != from);
         let own = self.agents.iter().find(|own| own.id == moved.id && own.connection == from).cloned();
         if let Some(own) = own {
             let own = self.moved(own, to);
@@ -576,10 +573,30 @@ mod tests {
         assert!(shell.threads[&session].resume.is_some() && !shell.notices.is_empty());
         shell.choose(Menu::Provider, "work", &mut actions);
         assert!(shell.threads[&session].resume.is_none(), "the user chose where it goes on");
-        assert!(shell.notices.is_empty(), "the account it left is no news any more");
+        assert!(shell.notices_shown().is_empty(), "the account it left is no news any more");
         // Its model and effort stay: the other account has the same ones.
         let agent = shell.agent_in_use().expect("agent");
         assert_eq!((agent.connection.as_str(), agent.model.as_str(), agent.effort.as_str()), ("work", "opus", "high"));
+    }
+
+    #[test]
+    fn a_limit_is_only_said_on_the_sessions_of_its_account() {
+        let (mut shell, session, mut actions) = two_accounts(OutOfLimits::Wait);
+        run_out(&mut shell, &session, unix_now() + 3_600, &mut actions);
+        assert_eq!(shell.notices_shown().len(), 1, "the open session ran into it");
+        // A new session starts on the same account: it would run into the same limit.
+        shell.new_session(&mut actions);
+        assert_eq!(shell.notices_shown().len(), 1);
+        // On the other account the limit is nobody's business.
+        shell.choose(Menu::Provider, "work", &mut actions);
+        assert!(shell.notices_shown().is_empty());
+        // Any other news shows wherever the user is.
+        shell.notify("The folder is gone.".into());
+        assert_eq!(shell.notices_shown().len(), 1);
+        // Back on the session that waits, its limit is said again.
+        shell.open_session(&session, &mut actions);
+        assert_eq!(shell.notices_shown().len(), 2);
+        assert!(shell.threads[&session].resume.is_some(), "and it still waits for it");
     }
 
     #[test]
@@ -602,7 +619,7 @@ mod tests {
         run_out(&mut shell, &session, unix_now() + 3_600, &mut actions);
         let agent = shell.agent_in_use().expect("agent");
         assert_eq!((agent.connection.as_str(), agent.model.as_str(), agent.effort.as_str()), ("work", "opus", "high"));
-        assert!(shell.notices.is_empty(), "the notice of the spent account went");
+        assert!(shell.notices_shown().is_empty(), "the notice of the spent account went");
         // The new account gets the gist of the conversation in a process of its own, and is told to go on.
         let closed = actions.iter().position(|a| matches!(a, Action::CloseLive(closed) if *closed == session));
         let send = actions.iter().position(|a| matches!(a, Action::Send { session, .. } if session.account == "work"));

@@ -151,6 +151,12 @@ impl Notice {
     fn said(&self, now: u64) -> String {
         if self.lifts == 0 { self.text.clone() } else { format!("{} It lifts {}.", self.text, until(now, self.lifts)) }
     }
+
+    /// Whether it is news for a session that thinks through `account`: an
+    /// account's limit is only for the sessions on that account.
+    fn concerns(&self, account: &str) -> bool {
+        self.account.is_empty() || self.account == account
+    }
 }
 
 /// The whole user interface.
@@ -1623,6 +1629,18 @@ impl Shell {
         }
     }
 
+    /// Which of the notices are news for what is on screen. An account's
+    /// limit shows only while the open session thinks through that account:
+    /// on any other session it waits out of sight, and is back with its own.
+    fn notices_shown(&self) -> Vec<usize> {
+        if self.notices.is_empty() {
+            return Vec::new();
+        }
+        let account = self.agent_in_use().map(|agent| agent.connection).unwrap_or_default();
+        let shown = self.notices.iter().enumerate().filter(|(_, notice)| notice.concerns(&account));
+        shown.map(|(index, _)| index).collect()
+    }
+
     /// Problems, stacked under the header until dismissed.
     fn draw_notices(&mut self, p: &mut Painter, ui: &mut Ui, canvas: Rect) {
         let t = p.theme;
@@ -1633,7 +1651,8 @@ impl Shell {
         // A limit that has lifted is no news any more.
         let now = unix_now();
         self.notices.retain(|notice| notice.lifts == 0 || notice.lifts > now);
-        for (index, notice) in self.notices.iter().enumerate() {
+        for index in self.notices_shown() {
+            let notice = &self.notices[index];
             let text = p.layout(&notice.said(now), theme::SMALL, Some(width - 60.0));
             let card = Rect::new(x, y, width, text.height() + 24.0);
             p.shadow(Rect::new(card.x, card.y + 4.0, card.w, card.h), t.shadow, theme::RADIUS, 14.0);
