@@ -25,15 +25,18 @@ if git rev-parse -q --verify "refs/tags/v$version" > /dev/null; then
 fi
 
 # The first `version = "…"` is the workspace's; every crate takes it from there.
-awk -v version="$version" '
-    !done && /^version = "/ { sub(/"[^"]*"/, "\"" version "\""); done = 1 }
-    { print }
-' Cargo.toml > Cargo.toml.new
-mv Cargo.toml.new Cargo.toml
-# Cargo.lock names the workspace's crates with their version.
-cargo update --workspace --quiet
-
-git commit --quiet -m "Version $version" Cargo.toml Cargo.lock
+current=$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
+# Already the version in Cargo.toml (the first release, say): there is only the tag to make.
+if [ "$current" != "$version" ]; then
+    awk -v version="$version" '
+        !done && /^version = "/ { sub(/"[^"]*"/, "\"" version "\""); done = 1 }
+        { print }
+    ' Cargo.toml > Cargo.toml.new
+    mv Cargo.toml.new Cargo.toml
+    # Cargo.lock names the workspace's crates with their version.
+    cargo update --workspace --quiet
+    git commit --quiet -m "Version $version" Cargo.toml Cargo.lock
+fi
 git tag "v$version"
 echo "Version $version is committed and tagged. To publish it:"
 echo "    git push origin HEAD v$version"
