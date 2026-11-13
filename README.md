@@ -1,6 +1,26 @@
+<div align="center">
+
+<img src="docs/icon.png" width="88" alt="">
+
 # AtroxaBot
 
 **A fast, native desktop app for AI agents you chat with, hand work to, and call.**
+
+[![Latest release](https://img.shields.io/github/v/release/Atroxabot/atroxabot?style=flat-square&label=release&color=2b2b2f)](https://github.com/Atroxabot/atroxabot/releases/latest)
+[![Windows, macOS, Linux](https://img.shields.io/badge/runs_on-Windows_%C2%B7_macOS_%C2%B7_Linux-2b2b2f?style=flat-square)](#install)
+[![MIT or Apache-2.0](https://img.shields.io/badge/license-MIT_or_Apache--2.0-2b2b2f?style=flat-square)](#license)
+
+[**Download**](https://github.com/Atroxabot/atroxabot/releases/latest) ·
+[**atroxabot.com**](https://atroxabot.com) ·
+[Features](#features) ·
+[Shortcuts](#keyboard-shortcuts) ·
+[Build it yourself](#for-developers)
+
+</div>
+
+<p align="center">
+  <img src="docs/screenshots/subagents.webp" width="100%" alt="AtroxaBot: an agent called Scout fixing a failing test, with two subagents at work in the conversation and the side panel showing the session's usage, the subagents, a task in the background, the plan's limits and the repository's changes">
+</p>
 
 You make agents. Each one has a name, a face, instructions and as many sessions as you like, each
 working in a folder of its own (or a git worktree of its own). An agent thinks through one of your
@@ -9,20 +29,66 @@ you can switch a session between them at any time.
 
 Runs on Windows, macOS and Linux. Pure Rust, drawn on the GPU: no web view, no UI framework.
 
-- [Install](#install)
-- [What you need](#what-you-need)
-- [Getting started](#getting-started)
+## At a glance
+
+<table>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/panel-worktree.webp" alt="A session working in its own git worktree: the side panel shows its branch, two commits to merge and five changed files"><br>
+      <b>Worktrees that clean up after themselves.</b> One switch gives a session its own branch and folder.
+      Merged work goes by itself; uncommitted changes are never touched.
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/menu-provider-private.webp" alt="The provider menu of a session: two Claude accounts, OpenRouter and Codex, with the one in use ticked"><br>
+      <b>Every account in one place.</b> Several Claude accounts, Codex, Anthropic's API, any gateway. Swap a
+      session's provider from the top bar and the conversation goes with it.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/limit-wait.webp" alt="A session whose account reached its limit: a row above the message box says it goes on when the limit lifts"><br>
+      <b>A limit is not the end of the turn.</b> The session waits for the refill and carries on by itself, or
+      moves to an account that has usage left.
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/queued.webp" alt="Two messages waiting in the tray above the message box while the agent runs a test"><br>
+      <b>Keep talking while it works.</b> What you send waits in a tray and is read at the agent's next step.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/tasks.webp" alt="The side panel during a turn: the agent's tasks with the second in progress, the session's usage and the repository's changes"><br>
+      <b>Watch the plan unfold.</b> Its tasks, its subagents, what the session used and where your plan stands,
+      beside the work.
+    </td>
+    <td width="50%" valign="top">
+      <img src="docs/screenshots/call.webp" alt="A voice call with the agent Scout: its face, the word Speaking, and what it is saying"><br>
+      <b>Or just call it.</b> It listens until you pause, answers out loud, and stops when you talk over it.
+    </td>
+  </tr>
+</table>
+
+## Contents
+
+- [Install](#install) · [What you need](#what-you-need) · [Getting started](#getting-started)
 - [Features](#features)
+  - [Agents and sessions](#agents-and-sessions) · [Worktrees](#worktrees) ·
+    [While the agent works](#while-the-agent-works)
+  - [Providers and models](#providers-and-models) · [How API agents work](#how-api-agents-work)
+  - [Skills, integrations and memory](#skills-integrations-and-memory) ·
+    [Side panel, spotlight and statistics](#side-panel-spotlight-and-statistics)
+  - [Voice calls](#voice-calls) · [The app](#the-app)
 - [Keyboard shortcuts](#keyboard-shortcuts)
-- [Claude accounts and Anthropic's terms](#claude-accounts-and-anthropics-terms)
-- [Codex accounts](#codex-accounts)
-- [For developers](#for-developers)
-- [Known limits](#known-limits)
-- [License](#license)
+- [Claude accounts and Anthropic's terms](#claude-accounts-and-anthropics-terms) ·
+  [Codex accounts](#codex-accounts)
+- [For developers](#for-developers): [Build](#build) · [Layout](#layout) · [Storage](#storage) ·
+  [Releases](#releases)
+- [Known limits](#known-limits) · [License](#license)
 
 ## Install
 
-Download from the [latest release](https://github.com/Atroxabot/atroxabot/releases/latest):
+Download from the [latest release](https://github.com/Atroxabot/atroxabot/releases/latest) (or from
+[atroxabot.com](https://atroxabot.com)):
 
 | System | Download | How |
 |---|---|---|
@@ -67,6 +133,9 @@ it in place; you watch it there, and answer it if it asks anything. The account 
 then. Come back to AtroxaBot's settings and it finds Claude Code by itself; the account then offers
 **Sign in**. Codex has the same button, with OpenAI's own installer.
 
+<details>
+<summary><b>Installing Claude Code or Codex by hand</b></summary>
+
 To install it by hand instead, follow [Anthropic's setup page](https://code.claude.com/docs/en/setup). In
 short:
 
@@ -88,6 +157,8 @@ looks again.
 Codex by hand: `irm https://chatgpt.com/codex/install.ps1 | iex` on Windows,
 `curl -fsSL https://chatgpt.com/codex/install.sh | sh` elsewhere (OpenAI's native installers; npm's
 `npm install -g @openai/codex` works too).
+
+</details>
 
 Your first Claude account in AtroxaBot, "Claude", is the Claude Code you already use: whoever `claude` is
 signed in as in your terminal, with your skills, plugins and settings. Add more accounts (work, personal)
@@ -135,7 +206,9 @@ in Settings, Providers.
   larger than it is; a click beside it, the cross or Esc puts it away.
 - **`@` for files.** Typing `@` lists the files of the session's folder (what git tracks or would;
   without a repository, what is there, short of hidden and dependency folders). Type on to narrow it,
-  arrows move, Tab or Enter writes the file's path into the message, Esc closes the list.
+  arrows move, Tab or Enter writes the file's path into the message, Esc closes the list. `@../` goes up
+  out of the folder: it lists what is in the folder above, one level at a time, and taking a folder there
+  lists what is in it (hidden ones show once you type a `.`).
 - **`/` for commands and skills.** Typing `/` lists them; arrows move, Tab or Enter takes one.
   - `/clear` empties the session: its messages are deleted, the agent starts over with an empty context
     (on an API, with a new system prompt), and what it left running in the background is stopped. The
@@ -613,6 +686,9 @@ same way.
   `stats.rs`, `agent_form.rs`, `settings.rs`, `skills.rs`, `worktrees.rs`, `update.rs` (the app's version
   and its update button), `call.rs`, `widgets.rs`.
 - `app.rs`: events, threads, engines.
+
+`docs/`: the app's icon and the screenshots this README shows, made from the snapshot scenes
+(`shell/snapshot.rs`, drawn with `ATROXABOT_SNAPSHOT_SCALE=2`) by the website's `npm run shots`.
 
 `packaging/`: what a release is made with: the Windows installer's script and icon (`windows/`), the
 macOS bundle's `Info.plist`, the Linux launcher entry and `install.sh`, the release key's public half
