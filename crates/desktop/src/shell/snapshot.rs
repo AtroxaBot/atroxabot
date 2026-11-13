@@ -1,6 +1,7 @@
 //! Screens drawn offscreen and saved as PNGs, to look at the design in
 //! every scheme without opening the app. Run by hand:
 //! `ATROXABOT_SNAPSHOTS=<folder> cargo test -p atroxabot snapshots -- --ignored`
+//! `ATROXABOT_SNAPSHOT_SCALE=2` draws them at twice the pixels, as a high-density screen shows the app.
 
 use std::path::{Path, PathBuf};
 
@@ -34,8 +35,19 @@ use crate::text::{Fonts, GlyphAtlas};
 use crate::theme::Scheme;
 use crate::ui::Ui;
 
-/// Logical size of every snapshot, drawn at a scale of one.
+/// Logical size of every snapshot, drawn at a scale of one unless `ATROXABOT_SNAPSHOT_SCALE` says more.
 const SIZE: (u32, u32) = (1440, 900);
+
+/// The scale the snapshots are drawn at: 1, or what `ATROXABOT_SNAPSHOT_SCALE` asks for (1 to 4).
+fn scale() -> f32 {
+    let asked = std::env::var("ATROXABOT_SNAPSHOT_SCALE").ok().and_then(|scale| scale.parse::<f32>().ok());
+    asked.filter(|scale| (1.0..=4.0).contains(scale)).unwrap_or(1.0)
+}
+
+/// The size of a snapshot in pixels.
+fn pixel_size() -> (u32, u32) {
+    ((SIZE.0 as f32 * scale()).round() as u32, (SIZE.1 as f32 * scale()).round() as u32)
+}
 
 #[test]
 #[ignore = "draws on the GPU; run by hand to look at the design"]
@@ -625,14 +637,14 @@ fn snapshots() {
             let pixels = frame(&mut gpu, &fonts, scheme, mouse, &mut |p, ui, view| {
                 shell.draw(p, ui, view, scheme, &mut Vec::new());
             });
-            write_png(&dir.join(format!("{name}-{}.png", scheme.key())), SIZE, &pixels);
+            write_png(&dir.join(format!("{name}-{}.png", scheme.key())), pixel_size(), &pixels);
         }
         // The smallest window: no room beside the session, so the side panel floats over it.
         let mut narrow = panel();
         let pixels = frame(&mut gpu, &fonts, scheme, (-1.0, -1.0), &mut |p, ui, view| {
             narrow.draw(p, ui, Rect::new(view.x, view.y, 820.0, 560.0), scheme, &mut Vec::new());
         });
-        write_png(&dir.join(format!("panel-narrow-{}.png", scheme.key())), SIZE, &pixels);
+        write_png(&dir.join(format!("panel-narrow-{}.png", scheme.key())), pixel_size(), &pixels);
     }
 }
 
@@ -720,7 +732,7 @@ fn frame(
     for second in 0..5u8 {
         // A long frame: every ease lands at once. Whole seconds pass, so the caret blinks alike in each.
         ui.begin(1.0, 10.0 + f32::from(second));
-        let mut p = Painter::new(fonts, (&mut atlas, &mut images), &mut instances, 1.0, view, palette);
+        let mut p = Painter::new(fonts, (&mut atlas, &mut images), &mut instances, scale(), view, palette);
         draw(&mut p, &mut ui, view);
         crate::titlebar::draw(&mut p, &mut ui, view, false);
         ui.end();
@@ -730,7 +742,7 @@ fn frame(
             images.insert(key, pixels);
         }
     }
-    gpu.render(SIZE, &instances, (&mut atlas.uploads, &mut images.uploads), 1.0, palette.panel)
+    gpu.render(pixel_size(), &instances, (&mut atlas.uploads, &mut images.uploads), scale(), palette.panel)
 }
 
 /// What Claude Code says of an account signed in as `email`.
