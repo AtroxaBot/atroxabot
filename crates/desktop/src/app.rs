@@ -285,6 +285,8 @@ pub enum Action {
     Worktree(worktree::Job),
     /// List a folder's files, for naming one in a message.
     ListFiles(String),
+    /// List what is right inside a folder, for naming something outside the session's folder in a message.
+    ListEntries(String),
     /// Ask for a folder.
     PickFolder,
     /// Ask for an image file.
@@ -1050,6 +1052,9 @@ impl App {
             Action::Worktree(job) => self.spawn(move || WorkerEvent::Worktree(worktree::run(job))),
             Action::ListFiles(folder) => {
                 self.spawn(move || WorkerEvent::Files { files: git::files(std::path::Path::new(&folder)), folder });
+            }
+            Action::ListEntries(folder) => {
+                self.spawn(move || WorkerEvent::Files { files: git::entries(std::path::Path::new(&folder)), folder });
             }
             Action::PickFolder => {
                 self.spawn(|| match platform::pick_folder("Choose the folder this session works in") {

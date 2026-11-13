@@ -548,20 +548,31 @@ impl Shell {
     }
 
     /// The message changed: the files of the session's folder are listed
-    /// once for each `@` word (anew each time, as files come and go).
+    /// once for each `@` word (anew each time, as files come and go). A word
+    /// that leaves the folder (`../`) lists the folder it reaches instead, one
+    /// level at a time.
     pub(super) fn mention_typed(&mut self, actions: &mut Vec<Action>) {
-        let Some(start) = self.mention().map(|(start, _)| start) else {
+        let folder = self.work_folder();
+        let Some((start, up)) =
+            self.mention().map(|(start, needle)| (start, outside(needle).map(|(dir, _)| dir.to_owned())))
+        else {
             (self.composer.mention_off, self.composer.listed_at) = (false, None);
             return;
         };
-        let folder = self.work_folder();
-        let elsewhere = self.composer.listing.0 != folder;
+        let (place, action) = match up {
+            Some(dir) => {
+                let place = std::path::Path::new(&folder).join(dir).display().to_string();
+                (place.clone(), Action::ListEntries(place))
+            }
+            None => (folder.clone(), Action::ListFiles(folder)),
+        };
+        let elsewhere = self.composer.listing.0 != place;
         if elsewhere {
-            self.composer.listing = (folder.clone(), Vec::new());
+            self.composer.listing = (place, Vec::new());
         }
         if elsewhere || self.composer.listed_at != Some(start) {
             self.composer.listed_at = Some(start);
-            actions.push(Action::ListFiles(folder));
+            actions.push(action);
         }
     }
 
@@ -578,16 +589,27 @@ impl Shell {
 
     /// The files the `@` word being written could name: those whose name
     /// starts with it, then those whose name holds it, then those whose
-    /// path does. Empty when no such word is being written.
+    /// path does. Past `../`, what is in the folder reached, folders ending
+    /// in `/` and hidden ones only once a `.` is typed. Empty when no such
+    /// word is being written.
     fn mention_matches(&self) -> Vec<String> {
         let Some((_, needle)) = self.mention().filter(|_| !self.composer.mention_off) else { return Vec::new() };
+        let (dir, needle) = outside(needle).map_or((None, needle), |(dir, name)| (Some(dir), name));
+        let hidden = dir.is_none() || needle.starts_with('.');
         let needle = needle.to_lowercase();
-        let mut found: Vec<_> = self.composer.listing.1.iter().filter(|(_, lower)| lower.contains(&needle)).collect();
+        let mut found: Vec<_> = self
+            .composer
+            .listing
+            .1
+            .iter()
+            .filter(|(path, lower)| lower.contains(&needle) && (hidden || !path.starts_with('.')))
+            .collect();
         found.sort_by_cached_key(|(path, lower)| {
-            let name = lower.rsplit('/').next().unwrap_or(lower);
+            let name = lower.trim_end_matches('/').rsplit('/').next().unwrap_or(lower);
             (!name.starts_with(&needle), !name.contains(&needle), path.len())
         });
-        found.into_iter().take(60).map(|(path, _)| path.clone()).collect()
+        let written = |path: &String| dir.map_or_else(|| path.clone(), |dir| format!("{dir}/{path}"));
+        found.into_iter().take(60).map(|(path, _)| written(path)).collect()
     }
 
     /// A key while the list of files is up: arrows move, Tab or Enter takes
@@ -612,20 +634,27 @@ impl Shell {
         true
     }
 
-    /// Writes the file `path` where the `@` word is, in quotes when it holds a space.
+    /// Writes the file `path` where the `@` word is, in quotes when it holds
+    /// a space. A folder (`…/`) is written open, so the list goes on into it.
     fn take_mention(&mut self, path: &str) {
         let Some((start, _)) = self.mention() else { return };
         let editor = &mut self.composer.editor;
         let end = editor.cursor();
         editor.set_cursor(start, false);
         editor.set_cursor(end, true);
-        editor.insert(&if path.contains(char::is_whitespace) { format!("@\"{path}\" ") } else { format!("@{path} ") });
+        editor.insert(&if path.contains(char::is_whitespace) {
+            format!("@\"{path}\" ")
+        } else if path.ends_with('/') {
+            format!("@{path}")
+        } else {
+            format!("@{path} ")
+        });
         self.composer.mention = 0;
     }
 
     /// The list of commands and skills, over the message box, while a slash
     /// is being typed, or of files while an `@` word is.
-    pub(super) fn draw_slash(&mut self, p: &mut Painter, ui: &mut Ui) {
+    pub(super) fn draw_slash(&mut self, p: &mut Painter, ui: &mut Ui, actions: &mut Vec<Action>) {
         if self.modal.is_some() {
             return;
         }
@@ -636,18 +665,23 @@ impl Shell {
             }
             return;
         }
-        // A file's name, then faintly where it is.
+        // A file's name, then faintly where it is; a folder's keeps its `/`.
         let files = self.mention_matches();
         let rows: Vec<_> = files
             .iter()
             .map(|path| {
-                path.rsplit_once('/').map_or((path.clone(), String::new()), |(dir, name)| (name.into(), dir.into()))
+                let slash = if path.ends_with('/') { "/" } else { "" };
+                let path = path.trim_end_matches('/');
+                path.rsplit_once('/').map_or((format!("{path}{slash}"), String::new()), |(dir, name)| {
+                    (format!("{name}{slash}"), dir.into())
+                })
             })
             .collect();
         if !rows.is_empty()
             && let Some(index) = self.draw_list(p, ui, &rows, self.composer.mention, icon::FILE)
         {
             self.take_mention(&files[index]);
+            self.mention_typed(actions);
         }
     }
 
@@ -679,6 +713,7 @@ impl Shell {
                 p.rect(row, if index == picked { t.hover } else { fade(t.hover, 0.5) }, theme::RADIUS_SM);
             }
             let mid = row.y + row.h * 0.5;
+            let glyph = if glyph == icon::FILE && name.ends_with('/') { icon::FOLDER } else { glyph };
             icon::draw(p, glyph, (row.x + 18.0, mid), 14.0, t.text_muted);
             let mut command = p.layout(name, theme::LABEL, None);
             command.truncate(p.fonts, row.w * 0.5);
@@ -786,6 +821,16 @@ impl Shell {
     }
 }
 
+/// An `@` word that leaves the session's folder (`..`, `../`, `../../web/sr`):
+/// the folder it reaches, written as typed without its last `/`, and the
+/// start of a name typed after it.
+fn outside(needle: &str) -> Option<(&str, &str)> {
+    if needle == ".." {
+        return Some(("..", ""));
+    }
+    if needle.starts_with("../") { needle.rsplit_once('/') } else { None }
+}
+
 /// The `@` word that ends at `cursor` in `text`, if one is being written
 /// there: where its `@` is and what follows it. An `@` only opens one at
 /// the start of the text or after a space, so an email address is left alone.
@@ -862,5 +907,44 @@ mod tests {
         shell.composer.editor.insert("@notes");
         shell.take_mention("docs/my main notes.md");
         assert_eq!(shell.composer.editor.text(), "fix @src/main.rs @\"docs/my main notes.md\" ");
+    }
+
+    #[test]
+    fn an_at_word_goes_up_out_of_the_folder() {
+        assert_eq!(outside("src/x"), None);
+        assert_eq!(outside(".."), Some(("..", "")));
+        assert_eq!(outside("../"), Some(("..", "")));
+        assert_eq!(outside("../../web/sr"), Some(("../../web", "sr")));
+        assert_eq!(outside("..x"), None);
+
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        shell.pending_folder = "/work/app".into();
+        let mut actions = Vec::new();
+        shell.composer.editor.insert("see @../");
+        shell.mention_typed(&mut actions);
+        let parent = std::path::Path::new("/work/app").join("..").display().to_string();
+        assert!(matches!(&actions[..], [Action::ListEntries(folder)] if *folder == parent));
+        shell.files_listed(&parent, vec![".git/".into(), "app/".into(), "web/".into(), "notes.md".into()]);
+        assert_eq!(shell.mention_matches(), ["../app/", "../web/", "../notes.md"], "hidden ones left out");
+        shell.composer.editor.insert("WE");
+        assert_eq!(shell.mention_matches(), ["../web/"]);
+        // A folder is written open and lists what is in it.
+        shell.take_mention("../web/");
+        assert_eq!(shell.composer.editor.text(), "see @../web/");
+        actions.clear();
+        shell.mention_typed(&mut actions);
+        let web = std::path::Path::new("/work/app").join("../web").display().to_string();
+        assert!(matches!(&actions[..], [Action::ListEntries(folder)] if *folder == web));
+        assert!(shell.mention_matches().is_empty(), "the parent's listing is dropped");
+        shell.files_listed(&web, vec!["src/".into(), "README.md".into()]);
+        shell.composer.editor.insert("read");
+        let first = shell.mention_matches()[0].clone();
+        shell.take_mention(&first);
+        assert_eq!(shell.composer.editor.text(), "see @../web/README.md ");
+        // Back inside the folder, its own files are listed again.
+        actions.clear();
+        shell.composer.editor.insert("@");
+        shell.mention_typed(&mut actions);
+        assert!(matches!(&actions[..], [Action::ListFiles(folder)] if folder == "/work/app"));
     }
 }

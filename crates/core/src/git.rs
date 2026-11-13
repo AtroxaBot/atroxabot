@@ -275,6 +275,25 @@ pub fn files(folder: &Path) -> Vec<String> {
     found
 }
 
+/// What is right inside `folder`, for naming something in a message that
+/// lies outside the session's folder: each name, a folder's with a `/` after
+/// it, sorted. At most [`FILES_LIMIT`] of them; nothing when it cannot be read.
+#[must_use]
+pub fn entries(folder: &Path) -> Vec<String> {
+    let Ok(listing) = std::fs::read_dir(folder) else { return Vec::new() };
+    let mut found: Vec<String> = listing
+        .flatten()
+        .take(FILES_LIMIT)
+        .map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // A link to a folder counts as one: it is only listed, never walked.
+            if entry.path().is_dir() { format!("{name}/") } else { name }
+        })
+        .collect();
+    found.sort();
+    found
+}
+
 /// Something the app asks of a folder's repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Job {
@@ -378,6 +397,9 @@ mod tests {
             assert_eq!(files(&dir), ["b.txt", "src/deep/a.rs"]);
         }
         assert!(files(&dir.join("no-such-folder")).is_empty());
+        // One level only, folders marked, hidden ones too (the composer leaves those out).
+        assert_eq!(entries(&dir), [".hidden/", "b.txt", "node_modules/", "src/"]);
+        assert!(entries(&dir.join("no-such-folder")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

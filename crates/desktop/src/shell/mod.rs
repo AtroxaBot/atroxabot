@@ -1519,7 +1519,7 @@ impl Shell {
             }
         }
         p.set_clip(clip);
-        self.draw_slash(p, ui);
+        self.draw_slash(p, ui, actions);
         self.draw_header(p, ui, header, &agent, (color, busy), actions);
     }
 
@@ -1850,6 +1850,8 @@ impl Shell {
         let primary = if cfg!(target_os = "macos") { mods.super_key() } else { mods.control_key() };
         let nothing_marked = self.composer.editor.selection().is_empty();
         if self.slash_key(event) || self.mention_key(event) {
+            // A folder that was taken lists what is in it.
+            self.mention_typed(actions);
             return;
         }
         let guessed = self.suggestion_shown().is_some();
