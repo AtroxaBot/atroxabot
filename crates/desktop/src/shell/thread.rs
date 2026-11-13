@@ -14,7 +14,9 @@ use atroxabot_core::{Ask, Block, Entry, Reply, Session, SessionSummary, TodoStat
 use serde_json::Value;
 use winit::window::CursorIcon;
 
+use super::change;
 use super::elapsed;
+use super::find::Find;
 use super::limits::Resume;
 use super::menu::folder_name;
 use super::queue::Waiting;
@@ -25,10 +27,20 @@ use crate::image::Lookup;
 use crate::paint::{Color, Painter, Rect, fade, mix};
 use crate::text::Style;
 use crate::theme;
-use crate::ui::{Ui, icon, id};
+use crate::ui::{Tip, Ui, icon, id};
+
+/// A file a run of replies changed: its path, the lines added to it and the lines removed from it.
+type FileCount = (String, u32, u32);
+/// The files a run of replies changed, after the weight of the calls they were gathered from.
+type Gathered = (usize, Vec<FileCount>);
+/// The lines a tool call added and removed (`None` when it changes no file), after the length of the
+/// input they were counted from.
+type Counted = (usize, Option<(u32, u32)>);
 
 /// Widest the user's bubble gets, as a share of the column.
 const BUBBLE_SHARE: f32 = 0.78;
+/// Most files a run of replies changed that are listed under it by name.
+const TOUCHED_SHOWN: usize = 8;
 /// Most of a tool's output shown when its row is open, in characters.
 const DETAIL_CHARS: usize = 6_000;
 /// The style of tool details: small monospace.
@@ -248,6 +260,10 @@ pub(super) struct Thread {
     follow: bool,
     /// Layouts by (entry, block); block `usize::MAX` is a tool's detail.
     cache: HashMap<(usize, usize), Cached>,
+    /// How many lines each tool call that changes a file added and removed
+    /// (`None` for a call that changes none), by (entry, block), with the
+    /// length of the input they were counted from.
+    changes: HashMap<(usize, usize), Counted>,
     /// Reasoning and tool rows the user opened.
     open: HashSet<(usize, usize)>,
     /// The code block last copied and when, to show "Copied" for a moment.
@@ -273,10 +289,29 @@ pub(super) struct Thread {
     behind: bool,
     /// A picture of the conversation that was just clicked, for the shell to open whole.
     pub clicked_picture: Option<String>,
-    /// The model and effort the last message went with, and whether its
-    /// Claude process guesses the next message: a process keeps what it
-    /// started with, so other ones need a new process.
-    pub sent_with: Option<(String, String, bool)>,
+    /// The search of what the conversation shows, while its bar is open (`find.rs`).
+    pub find: Option<Find>,
+    /// That search came from the search window, which found its words in
+    /// the messages as they were written: if the conversation shows them
+    /// nowhere (they stand in Markdown's marks), the message is shown.
+    find_first: bool,
+    /// The files each run of replies changed (their path, lines added and
+    /// lines removed), by the index of the run's last reply, with the
+    /// weight of the calls they were gathered from: listed under the run.
+    touched: HashMap<usize, Gathered>,
+    /// A file of such a list that was just clicked (the run's last reply,
+    /// and the file), for the shell to show what the run did to it.
+    pub clicked_change: Option<(usize, String)>,
+    /// Whether the Claude process the last message went to guesses the
+    /// next message: a process keeps that from its start, so another
+    /// choice needs a new process. `None` before the first message.
+    pub guessing: Option<bool>,
+    /// Whether an account's process (Claude Code, Codex) is taken to be up
+    /// for it: a message went to one, and it was not closed and did not end
+    /// since. One left with nothing to do is closed after a while (`warm.rs`).
+    pub live: bool,
+    /// When the user last left it for another session, in Unix seconds; 0 if never.
+    pub left: u64,
     /// What Claude Code guesses the user writes next, since the last turn
     /// ended: shown in the empty message box, taken with Tab (`composer.rs`).
     pub suggestion: Option<String>,
@@ -319,6 +354,7 @@ impl Thread {
             fresh: true,
             follow: true,
             cache: HashMap::new(),
+            changes: HashMap::new(),
             open: HashSet::new(),
             copied: None,
             selection: None,
@@ -331,7 +367,13 @@ impl Thread {
             deadline: None,
             behind: false,
             clicked_picture: None,
-            sent_with: None,
+            find: None,
+            find_first: false,
+            touched: HashMap::new(),
+            clicked_change: None,
+            guessing: None,
+            live: false,
+            left: 0,
             suggestion: None,
             sent_on: String::new(),
             limited: false,
@@ -445,9 +487,23 @@ impl Thread {
     /// Entries moved (a summary was inserted): every layout is made again.
     pub fn invalidate(&mut self) {
         self.cache.clear();
+        self.changes.clear();
+        self.touched.clear();
         self.heights.clear();
         self.open.clear();
         self.selection = None;
+        // What it found was in blocks that are others now.
+        if let Some(find) = self.find.take() {
+            self.find = Some(Find::new(find.editor.text(), find.focused));
+        }
+    }
+
+    /// Opens the bar that finds `words` in the conversation, with the
+    /// keyboard when `focused`. `first` when the search window found them
+    /// in this session's messages: the view goes to the first of them.
+    pub fn open_find(&mut self, words: &str, focused: bool, first: bool) {
+        self.find = Some(Find::new(words, focused));
+        self.find_first = first;
     }
 
     /// The Markdown layout of block `key`, made again when its text grew or
@@ -485,6 +541,32 @@ impl Thread {
         &mut self.cache.entry(key).or_insert_with(|| Cached { doc: Doc::default(), len: 0 }).doc
     }
 
+    /// How many lines the tool call `call` at `key` added to a file and
+    /// removed from it, when it is one that changes a file (`change.rs`).
+    /// Worked out once for each call.
+    fn changed(&mut self, key: (usize, usize), call: &ToolUse, input: &Value) -> Option<(u32, u32)> {
+        match self.changes.get(&key) {
+            Some((len, counts)) if *len == call.input.len() => *counts,
+            _ => {
+                let counts = change::of(&call.name, input).map(|change| (change.added, change.removed));
+                self.changes.insert(key, (call.input.len(), counts));
+                counts
+            }
+        }
+    }
+
+    /// The lines `call` changed, laid out as a diff for the detail of its row at `key`.
+    fn diff(&mut self, p: &Painter, key: (usize, usize), call: &ToolUse, input: &Value, width: f32) -> &mut Doc {
+        let scale = p.scale;
+        let outdated = self.cache.get(&key).is_none_or(|c| c.len != call.input.len() || !c.doc.fits(width, scale));
+        if outdated && !self.wait(key, &call.input) {
+            let lines = change::of(&call.name, input).map(|change| change.lines).unwrap_or_default();
+            let doc = Doc::diff(p.fonts, &lines, DETAIL, width, scale);
+            self.cache.insert(key, Cached { doc, len: call.input.len() });
+        }
+        &mut self.cache.entry(key).or_insert_with(|| Cached { doc: Doc::default(), len: 0 }).doc
+    }
+
     /// What is marked in the conversation, if anything: the marked part of
     /// each block, a blank line between them.
     pub fn selected_text(&self) -> Option<String> {
@@ -512,7 +594,8 @@ impl Thread {
             self.order.truncate(rank);
             self.order.push(key);
         }
-        let Some(doc) = self.cache.get(&key).map(|cached| &cached.doc) else { return };
+        self.mark_found(p, key, origin);
+        let Some(doc) = self.cache.get_mut(&key).map(|cached| &mut cached.doc) else { return };
         let at = (ui.mouse.0 - origin.0, ui.mouse.1 - origin.1);
         let over = Rect::new(origin.0, origin.1, size.0, size.1).contains(ui.mouse) && ui.hovered(p.clip());
         if over {
@@ -547,7 +630,19 @@ impl Thread {
             self.selection = Some(marked);
         }
         if let Some((from, to)) = marked.within(rank, doc.end()) {
-            doc.draw_selection(p, origin, from, to);
+            doc.mark_selection(from, to, p.theme.selection);
+        }
+    }
+
+    /// Has the places a search found in the block `key` washed when it is
+    /// drawn, at `origin`, next: call it for every block that shows text,
+    /// in the order they are drawn, which is the order the matches are
+    /// gone through in.
+    fn mark_found(&mut self, p: &Painter, key: (usize, usize), origin: (f32, f32)) {
+        if let Some(find) = &mut self.find
+            && let Some(cached) = self.cache.get_mut(&key)
+        {
+            find.block(key, (&mut cached.doc, cached.len), origin, p.theme.accent);
         }
     }
 
@@ -569,6 +664,15 @@ impl Thread {
         let doing = |todo: atroxabot_core::Todo| if todo.doing.is_empty() { todo.subject } else { todo.doing };
         let active = self.busy.then(|| self.session.todos().into_iter().find(|todo| todo.state == TodoState::Active));
         self.doing = active.flatten().map(doing).unwrap_or_default();
+        // The bar of a search floats over the conversation: what is under it is not hovered or clicked.
+        let bar = self.find.as_mut().map(|find| {
+            find.begin();
+            Find::bar(area)
+        });
+        let under = ui.blocker;
+        if under.is_none() {
+            ui.blocker = bar;
+        }
         // The entries are taken out while they are drawn: drawing needs the
         // layout cache, which lives beside them.
         let entries = std::mem::take(&mut self.session.entries);
@@ -585,6 +689,49 @@ impl Thread {
         }
         self.session.entries = entries;
         self.order.truncate(self.drawn);
+        ui.blocker = under;
+        if self.find.as_mut().is_some_and(|find| find.draw(p, ui, area)) {
+            self.find = None;
+            ui.animating = true;
+        }
+    }
+
+    /// The conversation was drawn in `area`, scrolled by `offset`: a search
+    /// brings the match it has in hand into view. `opened` on the frame the
+    /// conversation is first shown, where the view goes there at once.
+    fn show_found(&mut self, ui: &mut Ui, entries: &[Entry], (area, offset, opened): (Rect, f32, bool), main: bool) {
+        let Some(find) = &mut self.find else { return };
+        let (scroll, follow) =
+            if main { (&mut self.scroll, &mut self.follow) } else { (&mut self.sub_scroll, &mut self.sub_follow) };
+        let mut moved = find.end(scroll, area, offset);
+        if !moved && main && self.find_first && find.pending() && !find.words().is_empty() {
+            // Found in a message as it was written, not as it is shown: the message itself is shown.
+            let words = find.words();
+            let holds = |text: &str| text.to_lowercase().contains(&words);
+            let said = |entry: &Entry| match entry {
+                Entry::User { text, .. } | Entry::Summary { text } => holds(text),
+                Entry::Reply(reply) => {
+                    reply.blocks.iter().any(|block| matches!(block, Block::Text { text } if holds(text)))
+                }
+                Entry::Note { .. } => false,
+            };
+            if let Some(index) = entries.iter().position(said) {
+                let above: f32 = self.heights.iter().take(index).filter(|height| height.is_finite()).sum();
+                let tall = self.heights.get(index).copied().filter(|height| height.is_finite()).unwrap_or(0.0);
+                scroll.reveal(above, above + 56.0 + tall.min(area.h - 56.0), area.h);
+                moved = true;
+            }
+            find.settle();
+        }
+        if moved {
+            (*follow, ui.animating) = (false, true);
+            if opened {
+                scroll.settle();
+            }
+            if !find.pending() {
+                self.find_first = false;
+            }
+        }
     }
 
     /// Shows the subagent started by the call `id` in the conversation's place; `None` goes back to it.
@@ -593,6 +740,12 @@ impl Thread {
         self.sub = id;
         self.sub_scroll.reset();
         (self.sub_follow, self.selection) = (true, None);
+    }
+
+    /// How far down the conversation's view is (`0..=1`), when it scrolls.
+    #[cfg(test)]
+    pub fn progress(&self) -> Option<f32> {
+        self.scroll.progress()
     }
 
     /// How far down the open subagent's view is (`0..=1`), when it scrolls.
@@ -708,7 +861,8 @@ impl Thread {
             // Dragged to the end, it follows the newest words again; anywhere else, it stays.
             self.sub_follow = self.sub_scroll.at_end();
         }
-        if std::mem::take(&mut self.sub_fresh) {
+        let opened = std::mem::take(&mut self.sub_fresh);
+        if opened {
             self.sub_scroll.jump_to_end();
             ui.animating = true;
         } else if live && self.sub_follow && !self.sub_scroll.at_end() {
@@ -718,6 +872,7 @@ impl Thread {
         if self.busy {
             ui.animating = true;
         }
+        self.show_found(ui, &[], (area, offset, opened), false);
         self.sub_scroll.bar(p, ui, area, content);
     }
 
@@ -770,7 +925,14 @@ impl Thread {
                 }
                 Entry::Reply(reply) => {
                     let live = self.busy && index == last;
-                    y = self.draw_reply(p, ui, (index, reply, live), (x, y, width), agent, actions);
+                    // Under the last reply of a run that is over: the files the run changed.
+                    let ends = !live && !matches!(entries.get(index + 1), Some(Entry::Reply(_)));
+                    let touched = if ends { self.take_touched(index, entries) } else { None };
+                    let files = touched.as_ref().map_or(&[][..], |(_, files)| files.as_slice());
+                    y = self.draw_reply(p, ui, (index, reply, live), (x, y, width), (agent, files), actions);
+                    if let Some(touched) = touched {
+                        self.touched.insert(index, touched);
+                    }
                 }
                 Entry::Summary { .. } => {
                     y = divider(p, "Earlier messages were summarised to make room", (x, y, width));
@@ -800,7 +962,8 @@ impl Thread {
             // Dragged to the end, it follows the newest message again; anywhere else, it stays.
             self.follow = self.scroll.at_end();
         }
-        if std::mem::take(&mut self.fresh) {
+        let opened = std::mem::take(&mut self.fresh);
+        if opened {
             self.scroll.jump_to_end();
             ui.animating = true;
         } else if self.follow && !self.scroll.at_end() {
@@ -811,6 +974,7 @@ impl Thread {
         if self.busy {
             ui.animating = true;
         }
+        self.show_found(ui, entries, (area, offset, opened), true);
         self.scroll.bar(p, ui, area, content);
     }
 
@@ -905,7 +1069,7 @@ impl Thread {
         ui: &mut Ui,
         (index, reply, live): (usize, &Reply, bool),
         (x, y, width): (f32, f32, f32),
-        agent: (&str, Color),
+        (agent, files): ((&str, Color), &[FileCount]),
         actions: &mut Vec<Action>,
     ) -> f32 {
         let t = p.theme;
@@ -916,10 +1080,114 @@ impl Thread {
             p.text(&problem, x + 24.0, y, t.danger);
             y += problem.height() + 12.0;
         }
+        if !files.is_empty() {
+            y = self.draw_touched(p, ui, (index, files), (x, y, width));
+        }
         if !live {
             y = Self::draw_footer(p, ui, (index, reply), (x, y, width), actions);
         }
         y + 10.0
+    }
+
+    /// The replies of the run that ends with the reply at `index`: the
+    /// replies that follow each other there, with nothing else between.
+    fn run(entries: &[Entry], index: usize) -> impl Iterator<Item = &Reply> {
+        fn reply(entry: &Entry) -> Option<&Reply> {
+            if let Entry::Reply(reply) = entry { Some(reply) } else { None }
+        }
+        let before = entries.get(..index).unwrap_or_default();
+        let start = index - before.iter().rev().take_while(|entry| reply(entry).is_some()).count();
+        entries.get(start..=index).unwrap_or_default().iter().filter_map(reply)
+    }
+
+    /// The files the run that ends with the reply at `index` changed, with
+    /// the weight of the calls they were gathered from: taken out of where
+    /// they are kept (to be put back once drawn), gathered again when those
+    /// calls changed. `None` for a run that changed no file.
+    fn take_touched(&mut self, index: usize, entries: &[Entry]) -> Option<Gathered> {
+        let weight: usize = Self::run(entries, index).map(|reply| change::weight(&reply.blocks)).sum();
+        if weight == 0 {
+            return None;
+        }
+        let kept = self.touched.remove(&index).filter(|(of, _)| *of == weight);
+        let (_, files) = kept.unwrap_or_else(|| {
+            let calls = Self::run(entries, index).flat_map(|reply| change::calls(&reply.blocks));
+            let files = change::touched(calls).into_iter().map(|file| (file.path, file.added, file.removed));
+            (weight, files.collect())
+        });
+        Some((weight, files)).filter(|(_, files)| !files.is_empty())
+    }
+
+    /// What the run that ends with the reply at `index` did to the file
+    /// `path`, as its own edits say.
+    pub fn run_change(&self, index: usize, path: &str) -> Option<change::Touched> {
+        let calls = Self::run(&self.session.entries, index).flat_map(|reply| change::calls(&reply.blocks));
+        change::touched(calls).into_iter().find(|file| file.path == path)
+    }
+
+    /// The files a run of replies changed, under it: each by its name with
+    /// the lines added to it and removed from it, a click on one showing
+    /// what the run did to it. Past [`TOUCHED_SHOWN`] the rest is counted,
+    /// and listed under the mouse. Returns where they end.
+    fn draw_touched(
+        &mut self,
+        p: &mut Painter,
+        ui: &mut Ui,
+        (index, files): (usize, &[FileCount]),
+        (x, y, width): (f32, f32, f32),
+    ) -> f32 {
+        let t = p.theme;
+        icon::draw(p, icon::PEN, (x + 7.0, y + 12.0), 13.0, t.text_faint);
+        let (start, right) = (x + 20.0, x + width);
+        let (mut left, mut top) = (start, y);
+        for (path, added, removed) in files.iter().take(TOUCHED_SHOWN) {
+            let mut name = p.layout(folder_name(path), theme::SMALL, None);
+            name.truncate(p.fonts, 220.0);
+            let counted: f32 = [(*added, '+'), (*removed, '−')]
+                .iter()
+                .filter(|(count, _)| *count > 0)
+                .map(|(count, sign)| p.layout(&format!("{sign}{count}"), theme::TINY, None).width() + 6.0)
+                .sum();
+            let wide = name.width() + counted + 18.0;
+            if left + wide > right && left > start {
+                (left, top) = (start, top + 26.0);
+            }
+            let chip = Rect::new(left, top, wide, 24.0);
+            let hovered = ui.hovered(chip) && p.clip().contains(ui.mouse);
+            let hover = ui.anim(id(("touched", index, path)), f32::from(u8::from(hovered)));
+            p.rect(chip, fade(t.hover, hover), theme::RADIUS_SM);
+            p.text(&name, chip.x + 8.0, chip.y + (chip.h - name.height()) * 0.5, mix(t.text_muted, t.text, hover));
+            super::panel::counts(p, (*added, *removed), chip.right() - 8.0, chip.y + 6.0);
+            ui.tip(id(("touched-path", index, path)), chip, || Tip::text(path.clone()));
+            if hovered {
+                ui.cursor = CursorIcon::Pointer;
+                if ui.clicked(chip) {
+                    self.clicked_change = Some((index, path.clone()));
+                }
+            }
+            left = chip.right() + 4.0;
+        }
+        if let Some(rest) = files.get(TOUCHED_SHOWN..).filter(|rest| !rest.is_empty()) {
+            let more = p.layout(&format!("and {} more", rest.len()), theme::SMALL, None);
+            if left + more.width() + 16.0 > right && left > start {
+                (left, top) = (start, top + 26.0);
+            }
+            let label = Rect::new(left, top, more.width() + 16.0, 24.0);
+            p.text(&more, label.x + 8.0, label.y + (label.h - more.height()) * 0.5, t.text_faint);
+            let listed = |(path, added, removed): &FileCount| {
+                let counts = match (added, removed) {
+                    (added, 0) => format!("+{added}"),
+                    (0, removed) => format!("−{removed}"),
+                    (added, removed) => format!("+{added} −{removed}"),
+                };
+                (folder_name(path).to_owned(), counts)
+            };
+            ui.tip(id(("touched-more", index)), label, || Tip {
+                text: String::new(),
+                rows: rest.iter().map(listed).collect(),
+            });
+        }
+        top + 24.0 + 10.0
     }
 
     /// The pieces of a reply, or of what a subagent said and did; `base`
@@ -1118,9 +1386,10 @@ impl Thread {
         }
         y += 28.0;
         if open {
-            let doc = self.markdown(p, key, text, width - 22.0, INK_MUTED);
-            let height = doc.height;
+            let height = self.markdown(p, key, text, width - 22.0, INK_MUTED).height;
             p.rect(Rect::new(x + 6.0, y, 2.0, height), t.border_strong, 1.0);
+            self.mark_found(p, key, (x + 22.0, y));
+            let doc = self.markdown(p, key, text, width - 22.0, INK_MUTED);
             doc.draw(p, ui, (x + 22.0, y), t.text_muted, true, None);
             y += height + 12.0;
         }
@@ -1128,7 +1397,9 @@ impl Thread {
     }
 
     /// A tool call: what it was, on what, and how it went; opens to its
-    /// input and output.
+    /// input and output. One that changes a file says how many lines it
+    /// added and removed, and opens to those lines instead: what went, in
+    /// the diff's red, and what came, in its green.
     fn draw_tool(
         &mut self,
         p: &mut Painter,
@@ -1147,8 +1418,14 @@ impl Thread {
         icon::draw(p, tool_icon(&call.name), (x + 7.0, mid), 14.0, mix(t.text_faint, t.text_muted, hover));
         let name_w = p.label(&call.name, theme::LABEL, x + 22.0, y + 2.0, mix(t.text_muted, t.text, hover));
         let input = serde_json::from_str::<Value>(&call.input).unwrap_or(Value::Null);
+        let changed = self.changed(key, call, &input);
+        // What it added and removed, before the mark of how it went: one that failed changed nothing.
+        let counted = changed.filter(|_| !call.is_error).map_or(0.0, |lines| {
+            let right = x + width - 24.0;
+            right - super::panel::counts(p, lines, right, y + 5.0) + 8.0
+        });
         let mut about = p.layout(&tools::summary(&input), Style::mono(12.5), None);
-        about.truncate(p.fonts, (width - name_w - 76.0).max(0.0));
+        about.truncate(p.fonts, (width - name_w - 76.0 - counted).max(0.0));
         p.text(&about, x + 22.0 + name_w + 10.0, y + 3.0, t.text_faint);
         // How it went, at the row's right.
         let state = (x + width - 8.0, mid);
@@ -1165,23 +1442,43 @@ impl Thread {
             }
         }
         y += 28.0;
-        if open {
-            let mut detail = serde_json::to_string_pretty(&input).unwrap_or_else(|_| call.input.clone());
+        if open && changed.is_some() {
+            let lines = (key.0, usize::MAX / 2 - key.1);
+            let height = self.diff(p, lines, call, &input, width - 46.0).height;
+            let frame = Rect::new(x + 22.0, y + 2.0, width - 22.0, height + 20.0);
+            p.bordered(frame, t.code_bg, theme::RADIUS_SM, 1.0, t.border);
+            self.mark_found(p, lines, (frame.x + 12.0, frame.y + 10.0));
+            let doc = self.diff(p, lines, call, &input, width - 46.0);
+            doc.draw(p, ui, (frame.x + 12.0, frame.y + 10.0), t.text_muted, false, None);
+            y = frame.bottom() + if call.is_error { 6.0 } else { 10.0 };
+        }
+        // The lines say what an edit did: of its answer, only why it failed is worth reading.
+        if open && (changed.is_none() || call.is_error) {
+            let mut detail = match changed {
+                Some(_) => String::new(),
+                None => serde_json::to_string_pretty(&input).unwrap_or_else(|_| call.input.clone()),
+            };
             if let Some(output) = &call.output {
                 let shown: String = output.chars().take(DETAIL_CHARS).collect();
-                detail.push_str("\n\n");
+                if !detail.is_empty() {
+                    detail.push_str("\n\n");
+                }
                 detail.push_str(&shown);
                 if shown.len() < output.len() {
                     detail.push_str("\n…");
                 }
             }
-            let doc = self.plain(p, (key.0, usize::MAX - key.1), &detail, DETAIL, width - 46.0);
-            let height = doc.height;
-            let frame = Rect::new(x + 22.0, y + 2.0, width - 22.0, height + 20.0);
-            p.bordered(frame, t.code_bg, theme::RADIUS_SM, 1.0, t.border);
-            let ink = if call.is_error { mix(t.text_muted, t.danger, 0.5) } else { t.text_muted };
-            doc.draw(p, ui, (frame.x + 12.0, frame.y + 10.0), ink, false, None);
-            y = frame.bottom() + 10.0;
+            if !detail.is_empty() {
+                let said = (key.0, usize::MAX - key.1);
+                let height = self.plain(p, said, &detail, DETAIL, width - 46.0).height;
+                let frame = Rect::new(x + 22.0, y + 2.0, width - 22.0, height + 20.0);
+                p.bordered(frame, t.code_bg, theme::RADIUS_SM, 1.0, t.border);
+                let ink = if call.is_error { mix(t.text_muted, t.danger, 0.5) } else { t.text_muted };
+                self.mark_found(p, said, (frame.x + 12.0, frame.y + 10.0));
+                let doc = self.plain(p, said, &detail, DETAIL, width - 46.0);
+                doc.draw(p, ui, (frame.x + 12.0, frame.y + 10.0), ink, false, None);
+                y = frame.bottom() + 10.0;
+            }
         }
         y
     }

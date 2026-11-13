@@ -12,10 +12,16 @@ atroxabot-claude-agent.workspace = true
 atroxabot-codex.workspace = true
 atroxabot-mcp.workspace = true
 flate2.workspace = true
+# why: a picture too large for a model is decoded, scaled down and written again here, and files are
+# hostile input. The three decoders moved here from the desktop crate with the code that uses them, so
+# the tree holds nothing new.
+image-webp.workspace = true
+png.workspace = true
 ring.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 ureq.workspace = true
+zune-jpeg.workspace = true
 
 [lints]
 workspace = true

@@ -161,7 +161,12 @@ impl CodexAgent {
         mcp: &[McpServer],
         mut emit: impl FnMut(AgentEvent) + Send + 'static,
     ) -> Result<Self, sdk::Error> {
-        let options = options(agent, connection, session, mcp);
+        let (prompt, memory) = session.account_prompt(agent);
+        let options = options(agent, connection, session, mcp, prompt);
+        // What it is told of the agent's notes stays with the session: a later start says the same.
+        if let Some(memory) = memory {
+            emit(AgentEvent::Memory(memory));
+        }
         let shared: Arc<Mutex<Shared>> = Arc::default();
         let mut mapper =
             Mapper { asked_resume: options.resume.is_some(), shared: Arc::clone(&shared), ..Mapper::default() };
@@ -201,6 +206,14 @@ impl CodexAgent {
         let (id, input) = (message.id.clone(), input(&message.text, &message.files));
         lock(&self.shared).follow_ups.insert(id.clone(), message);
         self.session.steer(&input, &id)
+    }
+
+    /// Has it answer with `model` at `effort` from its next turn on (empty
+    /// for Codex's own choice): Codex takes both with every turn, so
+    /// nothing is started again.
+    pub fn retune(&self, model: &str, effort: &str) {
+        let some = |text: &str| Some(text.trim().to_owned()).filter(|text| !text.is_empty());
+        self.session.retune(some(model), some(effort));
     }
 
     /// Stops the turn in progress; the session stays usable.
@@ -319,8 +332,15 @@ pub fn codex_mcp_config(servers: &[McpServer]) -> Vec<(String, String)> {
     config
 }
 
-/// How Codex is started for `agent` on `connection` in `session`.
-fn options(agent: &Agent, connection: &Connection, session: &Session, mcp: &[McpServer]) -> sdk::Options {
+/// How Codex is started for `agent` on `connection` in `session`, with `prompt` for the agent's own
+/// instructions ([`Session::account_prompt`]).
+fn options(
+    agent: &Agent,
+    connection: &Connection,
+    session: &Session,
+    mcp: &[McpServer],
+    prompt: String,
+) -> sdk::Options {
     let some = |text: &str| Some(text.trim().to_owned()).filter(|text| !text.is_empty());
     let (approval, sandbox) = match agent.autonomy {
         // Whatever writes, runs or goes online is asked about.
@@ -342,7 +362,7 @@ fn options(agent: &Agent, connection: &Connection, session: &Session, mcp: &[Mcp
         cli_path: None,
         env: account_env(connection),
         // The agent's own instructions, on top of Codex's: who it is and how it works here.
-        instructions: Some(format!("{}{}", agent.system_prompt(&folder), session.worktree_note())),
+        instructions: Some(prompt),
         cwd: Some(folder).filter(|folder| !folder.as_os_str().is_empty()),
         model: some(&agent.model),
         effort: some(&agent.effort),
@@ -1207,7 +1227,7 @@ mod tests {
             account: "codex".into(),
             ..Session::new(&agent.id)
         };
-        let options = options(&agent, &own, &session, &[]);
+        let options = options(&agent, &own, &session, &[], session.account_prompt(&agent).0);
         assert_eq!(
             (options.model.as_deref(), options.resume.as_deref(), options.effort),
             (Some("gpt-6-astra"), Some("th"), None)
@@ -1218,7 +1238,7 @@ mod tests {
         // Another account runs in its own folder and cannot resume the first one's conversation.
         let work = Connection { id: "w".into(), config_dir: "/accounts/w".into(), ..own };
         let full = Agent { autonomy: Autonomy::Full, ..agent };
-        let other = super::options(&full, &work, &session, &[]);
+        let other = super::options(&full, &work, &session, &[], String::new());
         assert_eq!(other.env, [("CODEX_HOME".to_owned(), "/accounts/w".to_owned())]);
         assert_eq!(
             (other.resume, other.approval, other.sandbox),

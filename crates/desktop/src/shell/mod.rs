@@ -10,7 +10,9 @@
 
 mod agent_form;
 mod call;
+mod change;
 mod composer;
+mod find;
 mod limits;
 mod menu;
 mod panel;
@@ -27,6 +29,7 @@ mod spotlight;
 mod stats;
 mod thread;
 mod update;
+mod warm;
 mod widgets;
 mod worktrees;
 
@@ -153,24 +156,6 @@ enum CodexAccount {
 struct Notice {
     /// What it says.
     text: String,
-    /// For a limit that was reached: when it lifts, in Unix seconds. The
-    /// card says how long that is from now, and goes once it has; 0 for none.
-    lifts: u64,
-    /// The account whose limit it is about; empty for any other news.
-    account: String,
-}
-
-impl Notice {
-    /// What it says at `now`: a limit's with how long until it lifts.
-    fn said(&self, now: u64) -> String {
-        if self.lifts == 0 { self.text.clone() } else { format!("{} It lifts {}.", self.text, until(now, self.lifts)) }
-    }
-
-    /// Whether it is news for a session that thinks through `account`: an
-    /// account's limit is only for the sessions on that account.
-    fn concerns(&self, account: &str) -> bool {
-        self.account.is_empty() || self.account == account
-    }
 }
 
 /// The whole user interface.
@@ -187,6 +172,9 @@ pub struct Shell {
     agent: Option<String>,
     /// The open session, one of the selected agent's.
     current: Option<String>,
+    /// The session that was open when the clock was last looked at: one
+    /// that is no longer has just been left (`warm.rs`).
+    looked: Option<String>,
     modal: Option<Modal>,
     /// The side panel floats over the session (the window has no room to
     /// set it beside it): Esc and a click outside it close it.
@@ -267,6 +255,7 @@ impl Shell {
             threads: HashMap::new(),
             agent,
             current: None,
+            looked: None,
             modal,
             panel_floats: false,
             composer: Composer::default(),
@@ -437,18 +426,13 @@ impl Shell {
         }
     }
 
-    /// Shows a problem until the user dismisses it.
+    /// Shows a problem until the user dismisses it. An account that ran
+    /// out of usage is no such problem: the conversation it stopped says
+    /// so, and the tray above its message box says when it goes on.
     pub fn notify(&mut self, text: String) {
-        self.notify_about("", text, 0);
-    }
-
-    /// Shows a problem of the account `account` (empty for none) that is
-    /// over at `lifts` (Unix seconds; 0 for one that is not): the card
-    /// counts down to it and goes by itself then.
-    fn notify_about(&mut self, account: &str, text: String, lifts: u64) {
-        // Said again, it is the same card, with the newer time.
+        // Said again, it is the same card.
         self.notices.retain(|notice| notice.text != text);
-        self.notices.push(Notice { text, lifts, account: account.to_owned() });
+        self.notices.push(Notice { text });
         // Old ones make way: three are plenty to read.
         let extra = self.notices.len().saturating_sub(3);
         self.notices.drain(..extra);
@@ -597,12 +581,7 @@ impl Shell {
     /// once: the sidebar knows them.
     fn open_session(&mut self, session: &str, actions: &mut Vec<Action>) {
         (self.menu, self.renaming) = (None, None);
-        // A Claude Agent process only stays up for the session being looked at, or one at work.
-        if let Some(previous) = self.current.clone().filter(|previous| previous != session)
-            && self.threads.get(&previous).is_some_and(|thread| !thread.at_work())
-        {
-            actions.push(Action::CloseLive(previous));
-        }
+        // The process of the one being left stays up a while (`warm.rs`): coming back answers at once.
         if !self.threads.contains_key(session) {
             let known = self.sessions.iter().find(|known| known.id == session).cloned();
             let known = known.unwrap_or_else(|| SessionSummary { id: session.to_owned(), ..SessionSummary::default() });
@@ -623,7 +602,7 @@ impl Shell {
 
     /// Starts over with the selected agent: the next message begins a
     /// session, in the folder the one being left worked in.
-    fn new_session(&mut self, actions: &mut Vec<Action>) {
+    fn new_session(&mut self) {
         self.renaming = None;
         if let Some(previous) = self.current.take()
             && let Some(thread) = self.threads.get(&previous)
@@ -631,9 +610,6 @@ impl Shell {
             // Where the one being left worked: for one in a worktree, the folder that stands for.
             self.pending_folder = thread.session.origin();
             self.pending_worktree = thread.session.worktree.is_some();
-            if !thread.at_work() {
-                actions.push(Action::CloseLive(previous));
-            }
         }
     }
 
@@ -722,9 +698,18 @@ impl Shell {
     /// Does what a result of the spotlight stands for.
     fn run_target(&mut self, target: Target, actions: &mut Vec<Action>) {
         match target {
-            Target::Session { agent, session } => self.open_found(&agent, &session, actions),
+            Target::Session { agent, session, find } => {
+                self.open_found(&agent, &session, actions);
+                // Found by what was said in it: the conversation opens where that stands.
+                if !find.is_empty()
+                    && let Some(thread) =
+                        self.threads.get_mut(&session).filter(|_| self.current.as_deref() == Some(&session))
+                {
+                    thread.open_find(&find, false, true);
+                }
+            }
             Target::Agent(agent) => self.select_agent(&agent, actions),
-            Target::NewSession => self.new_session(actions),
+            Target::NewSession => self.new_session(),
             Target::NewAgent => self.modal = Some(Modal::Agent(Box::new(AgentForm::new(None)))),
             Target::Stats => self.open_stats(actions),
             Target::Settings => {
@@ -994,15 +979,16 @@ impl Shell {
             thread.session.keep_choice(&chosen);
         }
         thread.sent_on.clone_from(&connection.id);
-        // An account's process thinks with what it was started with: other choices need a new one.
+        // An account's process takes another model or effort as it runs (the app asks it to); whether it
+        // guesses the next message it keeps from its start, so another choice there needs a new one.
         let guesses = connection.kind == ConnectionKind::ClaudeAgent && !self.config.hide_suggestions;
-        let with = (agent.model.clone(), agent.effort.clone(), guesses);
-        if connection.kind.is_account() && thread.sent_with.as_ref().is_some_and(|sent| *sent != with) {
-            // What it runs in the background goes with it (the user chose another model or effort).
+        if connection.kind.is_account() && thread.guessing.is_some_and(|guessing| guessing != guesses) {
+            // What it runs in the background goes with it.
             thread.background_lost();
             actions.push(Action::CloseLive(session.to_owned()));
         }
-        thread.sent_with = Some(with);
+        thread.guessing = Some(guesses);
+        thread.live = connection.kind.is_account();
         if quiet {
             thread.session.updated = unix_now();
         } else {
@@ -1182,21 +1168,11 @@ impl Shell {
             }
             AgentEvent::PermissionGone(id) => thread.asks.retain(|ask| ask.id != id),
             AgentEvent::Limits(limits) => {
-                // The account the turn runs on; one that just ran out is said so, while the session still uses it.
+                // They are those of the account the turn runs on.
                 let account = thread.session.account.clone();
-                let refused = limits.status == "rejected";
-                thread.refused |= refused && thread.busy;
-                let hit = refused && self.limits.get(&account).is_none_or(|known| known.status != "rejected");
-                let used = self.agent_of(session).is_some_and(|agent| agent.connection == account);
-                let resets = limits.resets;
-                merge_limits(self.limits.entry(account.clone()).or_default(), limits);
+                thread.refused |= limits.status == "rejected" && thread.busy;
+                merge_limits(self.limits.entry(account).or_default(), limits);
                 actions.push(Action::SaveLimits(self.limits.clone()));
-                if hit && used {
-                    self.notify_limit(&account, resets);
-                } else if !refused {
-                    // It has usage again: what was said of its limit is over.
-                    self.notices.retain(|notice| notice.account != account);
-                }
                 return;
             }
             // Its usage limit stops the turn: what happens next is decided when it has ended.
@@ -1252,8 +1228,13 @@ impl Shell {
                     }
                 }
             }
-            AgentEvent::Disconnected(_) => {
+            AgentEvent::Disconnected(why) => {
+                // The conversation says it only when a turn was cut short: the log keeps every unexpected end.
+                if let Some(why) = why {
+                    crate::log::error(format!("session {session}: the agent's process ended: {why}"));
+                }
                 actions.push(Action::CloseLive(session.to_owned()));
+                thread.live = false;
                 // Gone while a turn of its queue was to come: it never will.
                 if thread.busy {
                     thread.end_turn(Some("The agent's process stopped unexpectedly.".to_owned()));
@@ -1295,7 +1276,8 @@ impl Shell {
     /// Stores a changed agent; sessions of it that are idle start their
     /// Claude Agent again with the new settings on the next message.
     fn update_agent(&mut self, agent: Agent, actions: &mut Vec<Action>) {
-        for thread in self.threads.values().filter(|t| t.session.agent == agent.id && !t.at_work()) {
+        for thread in self.threads.values_mut().filter(|t| t.session.agent == agent.id && !t.at_work()) {
+            thread.live = false;
             actions.push(Action::CloseLive(thread.session.id.clone()));
         }
         match self.agents.iter_mut().find(|a| a.id == agent.id) {
@@ -1517,6 +1499,11 @@ impl Shell {
             if let Some(picture) = thread.clicked_picture.take() {
                 self.modal = Some(Modal::Picture(picture));
             }
+            // A file a turn changed that was clicked opens to what the turn did to it.
+            let changed = thread.clicked_change.take().and_then(|(reply, path)| thread.run_change(reply, &path));
+            if let Some(file) = changed {
+                self.modal = Some(Modal::Diff(Box::new(panel::DiffView::of_turn(&file))));
+            }
         }
         p.set_clip(clip);
         self.draw_slash(p, ui, actions);
@@ -1704,18 +1691,6 @@ impl Shell {
         }
     }
 
-    /// Which of the notices are news for what is on screen. An account's
-    /// limit shows only while the open session thinks through that account:
-    /// on any other session it waits out of sight, and is back with its own.
-    fn notices_shown(&self) -> Vec<usize> {
-        if self.notices.is_empty() {
-            return Vec::new();
-        }
-        let account = self.agent_in_use().map(|agent| agent.connection).unwrap_or_default();
-        let shown = self.notices.iter().enumerate().filter(|(_, notice)| notice.concerns(&account));
-        shown.map(|(index, _)| index).collect()
-    }
-
     /// Problems, stacked under the header until dismissed.
     fn draw_notices(&mut self, p: &mut Painter, ui: &mut Ui, canvas: Rect) {
         let t = p.theme;
@@ -1723,12 +1698,8 @@ impl Shell {
         let x = canvas.x + ((canvas.w - width) * 0.5).round();
         let mut y = canvas.y + theme::HEADER_HEIGHT + 8.0;
         let mut close = None;
-        // A limit that has lifted is no news any more.
-        let now = unix_now();
-        self.notices.retain(|notice| notice.lifts == 0 || notice.lifts > now);
-        for index in self.notices_shown() {
-            let notice = &self.notices[index];
-            let text = p.layout(&notice.said(now), theme::SMALL, Some(width - 60.0));
+        for (index, notice) in self.notices.iter().enumerate() {
+            let text = p.layout(&notice.text, theme::SMALL, Some(width - 60.0));
             let card = Rect::new(x, y, width, text.height() + 24.0);
             p.shadow(Rect::new(card.x, card.y + 4.0, card.w, card.h), t.shadow, theme::RADIUS, 14.0);
             p.bordered(card, t.surface, theme::RADIUS, 1.0, fade(t.danger, 0.5));
@@ -1799,7 +1770,11 @@ impl Shell {
                     return;
                 }
                 "n" | "N" => {
-                    self.new_session(actions);
+                    self.new_session();
+                    return;
+                }
+                "f" | "F" if self.renaming.is_none() => {
+                    self.find();
                     return;
                 }
                 _ => {}
@@ -1812,6 +1787,8 @@ impl Shell {
             } else {
                 edit_key(editor, event, mods, clipboard);
             }
+        } else if self.find_key(event, mods, clipboard) {
+            // The bar that finds text in the conversation had the keyboard, or Esc put it away.
         } else if escape && self.panel_floats && self.config.panel {
             // The side panel floating over the session goes first.
             self.toggle_panel(actions);
@@ -1823,6 +1800,54 @@ impl Shell {
             }
         } else {
             self.chat_key(event, mods, clipboard, actions);
+        }
+    }
+
+    /// Whether the bar that finds text in the open conversation has the keyboard.
+    pub(super) fn finding(&self) -> bool {
+        self.call.is_none() && self.thread().and_then(|thread| thread.find.as_ref()).is_some_and(|find| find.focused)
+    }
+
+    /// Ctrl+F: opens that bar over the open conversation, or gives it the
+    /// keyboard again. What is marked in the conversation (a line of it at
+    /// most) is what it looks for first.
+    fn find(&mut self) {
+        if self.call.is_some() {
+            return;
+        }
+        let Some(thread) = self.thread_mut().filter(|thread| thread.loaded && !thread.session.entries.is_empty())
+        else {
+            return;
+        };
+        let marked = thread.selected_text().filter(|marked| !marked.contains('\n') && marked.chars().count() <= 80);
+        match (&mut thread.find, marked) {
+            (Some(find), None) => {
+                find.focused = true;
+                find.editor.select_all();
+            }
+            (_, marked) => thread.open_find(&marked.unwrap_or_default(), true, false),
+        }
+    }
+
+    /// A key while that bar is open: its own while it has the keyboard,
+    /// and Esc puts it away either way. Returns whether the key was taken.
+    fn find_key(&mut self, event: &KeyEvent, mods: ModifiersState, clipboard: &mut Option<Clipboard>) -> bool {
+        if self.call.is_some() {
+            return false;
+        }
+        let escape = matches!(event.logical_key, Key::Named(NamedKey::Escape));
+        let Some(thread) = self.thread_mut() else { return false };
+        let Some(find) = &mut thread.find else { return false };
+        if find.focused {
+            if find.key(event, mods, clipboard) == find::Typed::Closed {
+                thread.find = None;
+            }
+            true
+        } else if escape {
+            thread.find = None;
+            true
+        } else {
+            false
         }
     }
 
@@ -1877,9 +1902,12 @@ impl Shell {
                     actions.push(Action::Copy(text));
                 }
             }
+            // In an empty message box the arrows go through what was sent before, as in a terminal.
+            Key::Named(key @ (NamedKey::ArrowUp | NamedKey::ArrowDown))
+                if !primary && !mods.shift_key() && !mods.alt_key() && self.recall(*key == NamedKey::ArrowUp) => {}
             // With nothing typed, Enter and Esc answer a waiting approval.
             Key::Named(NamedKey::Enter) if asking && empty => self.decide(Verdict::Allow, actions),
-            Key::Named(NamedKey::Escape) if asking => self.decide(Verdict::Deny(String::new()), actions),
+            Key::Named(NamedKey::Escape) if asking => self.deny(actions),
             Key::Named(NamedKey::Escape) => self.stop(actions),
             // While the agent works, Enter puts the message in line for its next step,
             // and Ctrl/Cmd+Enter has it read at once.
@@ -1902,7 +1930,7 @@ impl Shell {
     /// Text committed by an input method.
     pub fn ime_commit(&mut self, text: &str, actions: &mut Vec<Action>) {
         self.show_draft();
-        let answering = self.answering();
+        let (answering, finding) = (self.answering(), self.finding());
         match &mut self.modal {
             Some(Modal::Agent(form)) => form.commit(text),
             Some(Modal::Settings(settings)) => settings.commit(text),
@@ -1915,6 +1943,12 @@ impl Shell {
                         form.insert(text);
                     }
                 }
+                None if finding => {
+                    let open = self.current.as_deref().and_then(|id| self.threads.get_mut(id));
+                    if let Some(find) = open.and_then(|thread| thread.find.as_mut()) {
+                        find.editor.insert(text);
+                    }
+                }
                 None => self.composer.commit(text),
             },
         }
@@ -1923,7 +1957,7 @@ impl Shell {
 
     /// Text an input method is composing, with its cursor.
     pub fn ime_preedit(&mut self, text: String, cursor: Option<(usize, usize)>) {
-        if self.modal.is_none() && self.renaming.is_none() {
+        if self.modal.is_none() && self.renaming.is_none() && !self.finding() {
             self.composer.preedit = if text.is_empty() { None } else { Some((text, cursor)) };
         }
     }
@@ -2467,7 +2501,7 @@ mod tests {
         shell.composer.editor.insert("half a thought");
 
         // A second one is set back to the default model; the first keeps its own.
-        shell.new_session(&mut actions);
+        shell.new_session();
         shell.show_draft();
         assert!(shell.composer.editor.text().is_empty(), "a new session starts with an empty message box");
         actions.clear();
@@ -2492,8 +2526,8 @@ mod tests {
         actions.clear();
         shell.send("Four", false, Vec::new(), &mut actions);
         assert_eq!(sent(&actions), Some((String::new(), "low".into())), "Sonnet, at the effort it was left with");
-        // Its process was started with Haiku: the new model needs a new one.
-        assert!(matches!(&actions[0], Action::CloseLive(id) if *id == second));
+        // Its process was started with Haiku: it takes the new model as it runs, and is not closed for it.
+        assert!(!actions.iter().any(|a| matches!(a, Action::CloseLive(_))));
     }
 
     /// A shell whose agent (on a Claude account) is answering "Fix the bug": the session's id.
@@ -2520,7 +2554,7 @@ mod tests {
 
         // Leaving it for a new session, or for another one, leaves its process be.
         actions.clear();
-        shell.new_session(&mut actions);
+        shell.new_session();
         shell.send("Meanwhile", false, Vec::new(), &mut actions);
         let second = shell.current.clone().unwrap();
         shell.agent_event(&second, AgentEvent::TurnEnded { problem: None }, &mut actions);
@@ -2528,10 +2562,12 @@ mod tests {
         shell.open_session(&second, &mut actions);
         assert!(!closes(&actions), "it still runs b2");
 
-        // Once nothing runs, leaving it closes it as before.
+        // Once nothing runs, it is closed like any other left with nothing to do: after a while.
         shell.agent_event(&first, task("b2", true), &mut actions);
         shell.open_session(&first, &mut actions);
         shell.open_session(&second, &mut actions);
+        assert!(!closes(&actions));
+        shell.rest(unix_now() + 24 * 60 * 60, &mut actions);
         assert!(closes(&actions));
 
         // A process that ends with a task running says so in the conversation.
@@ -2543,6 +2579,59 @@ mod tests {
         shell.agent_event(&first, AgentEvent::Disconnected(None), &mut actions);
         assert_eq!(notes(&shell), before + 1);
         assert!(shell.threads[&first].background.is_empty());
+    }
+
+    #[test]
+    fn the_app_wakes_when_the_open_sessions_cache_runs_out() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        shell.start(&mut actions);
+        let session = working(&mut shell, &mut actions);
+        shell.config.panel = true;
+        let ended = AgentEvent::ReplyEnded {
+            raw: Vec::new(),
+            wire: atroxabot_core::Wire::Messages,
+            model: "claude-x".into(),
+            usage: atroxabot_core::Usage { input_tokens: 250_000, output_tokens: 10, ..Default::default() },
+            cost: 0.0,
+            problem: String::new(),
+        };
+        shell.agent_event(&session, AgentEvent::ReplyStarted, &mut actions);
+        shell.agent_event(&session, ended, &mut actions);
+        let until = unix_now() + 3_000;
+        shell.agent_event(&session, AgentEvent::Cached(until), &mut actions);
+        assert_eq!(shell.cache_turns(), None, "at work, every request keeps it");
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        assert_eq!(shell.cache_turns(), Some(until));
+        assert!(shell.next_wake().is_some_and(|at| at <= until));
+        // Nothing to wake for once it ran out, or while the panel that says so is closed.
+        shell.threads.get_mut(&session).expect("open").session.cached_until = 1;
+        assert_eq!(shell.cache_turns(), None);
+        shell.threads.get_mut(&session).expect("open").session.cached_until = until;
+        shell.config.panel = false;
+        assert_eq!(shell.cache_turns(), None);
+    }
+
+    /// Another model goes to the process that runs: it is not closed for it, and what it runs stays.
+    #[test]
+    fn another_model_keeps_the_process_and_what_it_runs() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        shell.start(&mut actions);
+        let session = working(&mut shell, &mut actions);
+        let watch = AgentEvent::Background { id: "b1".into(), what: "Watch the build".into(), ended: false };
+        shell.agent_event(&session, watch, &mut actions);
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        shell.choose(Menu::Model, "haiku", &mut actions);
+        actions.clear();
+        shell.send("And now?", false, Vec::new(), &mut actions);
+        let model = actions.iter().find_map(|a| match a {
+            Action::Send { agent, .. } => Some(agent.model.clone()),
+            _ => None,
+        });
+        assert_eq!(model.as_deref(), Some("haiku"));
+        assert!(!actions.iter().any(|a| matches!(a, Action::CloseLive(_))));
+        assert_eq!(shell.threads[&session].background.len(), 1, "the build is still watched");
     }
 
     #[test]
@@ -2623,6 +2712,75 @@ mod tests {
         shell.thread_mut().expect("open").open_agent(Some("old-agent".into()));
         shell.send("and the tests", false, Vec::new(), &mut actions);
         assert_eq!(shell.thread().expect("open").sub, None, "a follow-up");
+    }
+
+    /// Draws `frames` frames of `shell`, as [`paint`] does: time for the view to ease where it is headed.
+    fn paints(shell: &mut Shell, ui: &mut Ui, frames: usize) {
+        let fonts = crate::text::Fonts::load();
+        let (mut atlas, mut images) = (crate::text::GlyphAtlas::default(), crate::image::ImageAtlas::default());
+        let view = Rect::new(0.0, 0.0, 1440.0, 900.0);
+        for _ in 0..frames {
+            let mut instances = Vec::new();
+            ui.begin(0.016, 1.0);
+            let mut p =
+                Painter::new(&fonts, (&mut atlas, &mut images), &mut instances, 1.0, view, Scheme::Black.palette());
+            shell.draw(&mut p, ui, view, Scheme::Black, &mut Vec::new());
+            ui.end();
+        }
+    }
+
+    #[test]
+    fn words_are_found_in_the_conversation_and_brought_into_view() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        shell.start(&mut actions);
+        shell.find();
+        assert!(!shell.finding(), "nothing is open to look through");
+        let session = working(&mut shell, &mut actions);
+        shell.agent_event(&session, AgentEvent::ReplyStarted, &mut actions);
+        for n in 0..80 {
+            let said = format!("Finding {n}: the **Parser** reads this part well enough.\n\n");
+            shell.agent_event(&session, AgentEvent::Text(said), &mut actions);
+        }
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
+        let mut ui = Ui::default();
+        paints(&mut shell, &mut ui, 2);
+        let progress = |shell: &Shell| shell.thread().and_then(Thread::progress).expect("it scrolls");
+        let found = |shell: &Shell| shell.thread().and_then(|thread| thread.find.as_ref()).map(find::Find::total);
+        assert!((progress(&shell) - 1.0).abs() < 0.001, "it opens at its end");
+
+        // Ctrl+F gives the bar the keyboard; what is typed there is found whatever its case.
+        shell.find();
+        assert!(shell.finding());
+        let typed = |shell: &mut Shell, words: &str| {
+            let find = shell.thread_mut().and_then(|thread| thread.find.as_mut()).expect("open");
+            find.editor.take();
+            find.editor.insert(words);
+        };
+        typed(&mut shell, "FINDING 3:");
+        paints(&mut shell, &mut ui, 60);
+        assert_eq!(found(&shell), Some(1));
+        assert!(progress(&shell) < 0.2, "the view went up to it: {}", progress(&shell));
+        // Every place is counted; the one before the first is the last.
+        typed(&mut shell, "parser");
+        paints(&mut shell, &mut ui, 2);
+        assert_eq!(found(&shell), Some(80));
+        shell.thread_mut().and_then(|thread| thread.find.as_mut()).expect("open").step(true);
+        paints(&mut shell, &mut ui, 60);
+        assert!(progress(&shell) > 0.8, "the last one is near the end: {}", progress(&shell));
+        // The bar stays while the user reads on.
+        assert!(shell.thread().is_some_and(|thread| thread.find.is_some()));
+
+        // Found by the search window in the message as it was written (Markdown's marks are not shown):
+        // the conversation opens at that message, and the keyboard stays with the message box.
+        shell.thread_mut().expect("open").open_find("the **parser** reads", false, true);
+        paints(&mut shell, &mut ui, 60);
+        assert_eq!(found(&shell), Some(0));
+        assert!(!shell.finding());
+        assert!(progress(&shell) < 0.2, "at the message that holds it: {}", progress(&shell));
+        // Another session has no bar of this one's.
+        shell.new_session();
+        assert!(!shell.finding() && shell.thread().is_none());
     }
 
     /// A subagent opened after it finished shows its end, as the conversation does.
@@ -2925,7 +3083,7 @@ mod tests {
         shell.agent_event(&first, AgentEvent::TurnEnded { problem: None }, &mut actions);
 
         // A second session is moved to the other account from its top bar.
-        shell.new_session(&mut actions);
+        shell.new_session();
         shell.choose(Menu::Provider, "work", &mut actions);
         assert_eq!(shell.selected_agent().unwrap().connection, "work", "where its next sessions start");
         shell.send("Two", false, Vec::new(), &mut actions);
@@ -2956,7 +3114,7 @@ mod tests {
         shell.save_agent(edited, &mut actions);
         shell.open_session(&second, &mut actions);
         assert_eq!(shell.agent_in_use().unwrap().connection, "work");
-        shell.new_session(&mut actions);
+        shell.new_session();
         assert_eq!(shell.agent_in_use().unwrap().connection, Connection::CLAUDE_AGENT);
 
         // A session whose provider was deleted thinks as its agent does.
@@ -3089,6 +3247,72 @@ mod tests {
         actions.clear();
         shell.send("More", false, Vec::new(), &mut actions);
         assert!(!actions.iter().any(|a| matches!(a, Action::CloseLive(_))));
+    }
+
+    #[test]
+    fn a_no_takes_what_is_written_as_its_reason() {
+        use atroxabot_core::Ask;
+        let ask = |id: &str| AgentEvent::Permission(Ask { id: id.into(), tool: "Bash".into(), ..Ask::default() });
+        let denied = |actions: &[Action]| {
+            actions.iter().find_map(|a| match a {
+                Action::Decide { ask, verdict: Verdict::Deny(why), .. } => Some((ask.clone(), why.clone())),
+                _ => None,
+            })
+        };
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        let session = working(&mut shell, &mut actions);
+        // Nothing is asked: a no answers nothing, and what is written stays.
+        shell.composer.editor.insert("a thought");
+        actions.clear();
+        shell.deny(&mut actions);
+        assert!(actions.is_empty() && shell.composer.editor.text() == "a thought");
+        shell.composer.editor.take();
+
+        // Nothing written: a bare no.
+        shell.agent_event(&session, ask("a1"), &mut actions);
+        shell.deny(&mut actions);
+        assert_eq!(denied(&actions), Some(("a1".into(), String::new())));
+
+        // What is written goes with it, without the space around it; the files stay for a message.
+        shell.agent_event(&session, ask("a2"), &mut actions);
+        shell.agent_event(&session, ask("a3"), &mut actions);
+        shell.composer.editor.insert("  use pnpm, not npm\n");
+        shell.composer.files.push("notes.md".into());
+        actions.clear();
+        shell.deny(&mut actions);
+        assert_eq!(denied(&actions), Some(("a2".into(), "use pnpm, not npm".into())));
+        assert!(shell.composer.editor.text().is_empty() && shell.composer.files.len() == 1);
+        assert!(sent_texts(&actions).is_empty() && shell.threads[&session].follow_ups.is_empty());
+        // The next one waits for its own answer: the reason went once.
+        actions.clear();
+        shell.deny(&mut actions);
+        assert_eq!(denied(&actions), Some(("a3".into(), String::new())));
+        assert!(shell.threads[&session].asks.is_empty());
+    }
+
+    /// Codex takes no words with a no: they follow it as a message.
+    #[test]
+    fn a_reason_reaches_codex_as_a_message() {
+        use atroxabot_core::Ask;
+        let (mut shell, mut actions) = on_codex();
+        let account = shell.config.connections[0].clone();
+        let CodexAccount::Ready(info) = shell.codex[&account.id].clone() else { panic!("known") };
+        let info = CodexInfo { account: Some(atroxabot_codex_account("me@example.com", "plus")), ..*info };
+        shell.codex_info(&account.id, Ok(info), &mut actions);
+        shell.send("Install it", false, Vec::new(), &mut actions);
+        let session = shell.current.clone().expect("a session");
+        shell.agent_event(&session, AgentEvent::Remote("thread-1".into()), &mut actions);
+        let ask = Ask { id: "a1".into(), tool: "shell".into(), ..Ask::default() };
+        shell.agent_event(&session, AgentEvent::Permission(ask), &mut actions);
+        shell.composer.editor.insert("use pnpm");
+        actions.clear();
+        shell.deny(&mut actions);
+        let bare = |a: &Action| matches!(a, Action::Decide { verdict: Verdict::Deny(why), .. } if why.is_empty());
+        assert!(actions.iter().any(bare));
+        assert!(shell.composer.editor.text().is_empty());
+        let waiting: Vec<_> = shell.threads[&session].follow_ups.iter().map(|m| m.message.text.clone()).collect();
+        assert_eq!(waiting, ["use pnpm"], "read at its next step");
     }
 
     /// A shell whose one agent thinks through a Codex account that is signed in.

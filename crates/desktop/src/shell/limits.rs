@@ -129,23 +129,30 @@ impl Shell {
         model.is_empty() || choices.is_empty() || choices.iter().any(|choice| choice.value == model)
     }
 
-    /// `agent` on the provider `to`. Its model and effort go along where
-    /// `to` offers the same models (from one Claude account to another).
+    /// `agent` on the provider `to`. Its model goes along where `to`
+    /// offers it (from one Claude account to another), and its effort goes
+    /// along always: also one the user never picked, which was its model's
+    /// usual one, and also when `to` gives it another model. A model that
+    /// does not take that effort thinks at its own ([`Shell::effort_in_use`]).
     pub(super) fn moved(&self, mut agent: Agent, to: &str) -> Agent {
+        if agent.effort.is_empty()
+            && let Some(from) = self.config.connection(&agent.connection)
+            && !self.model_choices(&from).is_empty()
+        {
+            let model = self.model_in_use(&from, &agent.model);
+            agent.effort = Self::effort_in_use(from.kind, &model, "");
+        }
         let from = std::mem::replace(&mut agent.connection, to.to_owned());
         if !self.kin(&from, to) || !self.offers(to, &agent.model) {
             // Another provider has other models: its default, until one is picked.
             agent.model.clear();
-            agent.effort.clear();
         }
         agent
     }
 
     /// The provider menu of the top bar: the open session thinks through
     /// `to` from now on, and so do the sessions its agent starts next. The
-    /// agent's other sessions stay where each was left. The notice of the
-    /// account it leaves is no news for it any more ([`Shell::notices_shown`]);
-    /// it stays for the sessions still on that account.
+    /// agent's other sessions stay where each was left.
     pub(super) fn swap_provider(&mut self, to: &str, actions: &mut Vec<Action>) {
         let Some(agent) = self.agent_in_use().filter(|agent| agent.connection != to) else { return };
         if self.loading() {
@@ -160,10 +167,6 @@ impl Shell {
             self.want_models(&connection, actions);
         }
         self.choose_thinking(agent, actions);
-        // The account it goes to may have run out itself.
-        if let Some(lifts) = self.out_until(to) {
-            self.notify_limit(to, lifts);
-        }
     }
 
     /// Moves `session` to the account `to` by itself, the one it ran on
@@ -181,14 +184,6 @@ impl Shell {
             let own = self.moved(own, to);
             self.update_agent(own, actions);
         }
-    }
-
-    /// Says that the account `account` reached its usage limit, which lifts
-    /// at `lifts` (0 when not said).
-    pub(super) fn notify_limit(&mut self, account: &str, lifts: u64) {
-        let name = self.config.connection(account).map(|connection| connection.name).unwrap_or_default();
-        let whose = if name.is_empty() { "This account".to_owned() } else { format!("The account {name}") };
-        self.notify_about(account, format!("{whose} has reached its usage limit."), lifts);
     }
 
     /// Until when the account `account` is out of usage, as far as is known:
@@ -341,11 +336,11 @@ impl Shell {
         }
     }
 
-    /// Does what is due: sessions whose limit lifted go on, and notices of
-    /// limits that lifted go. Call it on every frame and timer.
+    /// Does what is due: sessions whose limit lifted go on, and processes
+    /// left long enough are closed (`warm.rs`). Call it on every frame and timer.
     pub fn tick(&mut self, actions: &mut Vec<Action>) {
         let now = unix_now();
-        self.notices.retain(|notice| notice.lifts == 0 || notice.lifts > now);
+        self.rest(now, actions);
         let mut due: Vec<String> = (self.threads.iter())
             .filter(|(_, thread)| thread.resume.as_ref().is_some_and(|resume| resume.at <= now))
             .map(|(id, _)| id.clone())
@@ -386,12 +381,12 @@ impl Shell {
         }
     }
 
-    /// When something is due next, in Unix seconds: a session going on, or
-    /// a limit's notice going away. The app wakes for it.
+    /// When something is due next, in Unix seconds: a session going on,
+    /// a process left long enough, or the open session's cache running
+    /// out. The app wakes for it.
     pub fn next_wake(&self) -> Option<u64> {
         let resumes = self.threads.values().filter_map(|thread| thread.resume.as_ref().map(|resume| resume.at));
-        let lifts = self.notices.iter().map(|notice| notice.lifts).filter(|lifts| *lifts > 0);
-        resumes.chain(lifts).min()
+        resumes.chain(self.next_rest()).chain(self.cache_turns()).min()
     }
 
     /// The open session's row in the tray above the message box while it
@@ -434,7 +429,7 @@ impl Shell {
                 pick = Some(Pick::Now);
             }
         }
-        // When the limit lifts, as its notice says; it goes on a moment after.
+        // When the limit lifts; it goes on a moment after.
         let when = until(unix_now(), resume.at.saturating_sub(GRACE));
         let said = if resume.all_out {
             format!("No account has usage left · goes on {when}")
@@ -529,7 +524,6 @@ mod tests {
             window.resets = past;
         }
         shell.threads.get_mut(session).and_then(|thread| thread.resume.as_mut()).expect("waiting").at = past;
-        shell.notices.retain(|notice| notice.account != account);
     }
 
     #[test]
@@ -540,10 +534,9 @@ mod tests {
         assert!(sent(&actions).is_empty(), "nothing goes while the account is out");
         let resume = shell.threads[&session].resume.clone().expect("it waits");
         assert_eq!((resume.at, resume.all_out), (resets + GRACE, false));
-        assert!(
-            shell.notices.iter().any(|notice| notice.account == Connection::CLAUDE_AGENT && notice.lifts == resets)
-        );
-        assert_eq!(shell.next_wake(), Some(resets), "the app wakes when the notice goes, then when it goes on");
+        // The conversation and the tray say it: no card is put over the session for it.
+        assert!(shell.notices.is_empty());
+        assert_eq!(shell.next_wake(), Some(resets + GRACE), "the app wakes when it goes on");
         shell.tick(&mut actions);
         assert!(sent(&actions).is_empty(), "not yet");
 
@@ -567,36 +560,64 @@ mod tests {
         assert_eq!(sent(&actions), ["Never mind, look at the tests"]);
         assert!(shell.threads[&session].resume.is_none());
 
-        // Switching the agent's provider by hand takes the session back too, and the notice goes with it.
+        // Switching the agent's provider by hand takes the session back too.
         shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
         run_out(&mut shell, &session, unix_now() + 3_600, &mut actions);
-        assert!(shell.threads[&session].resume.is_some() && !shell.notices.is_empty());
+        assert!(shell.threads[&session].resume.is_some());
         shell.choose(Menu::Provider, "work", &mut actions);
         assert!(shell.threads[&session].resume.is_none(), "the user chose where it goes on");
-        assert!(shell.notices_shown().is_empty(), "the account it left is no news any more");
+        assert!(shell.notices.is_empty(), "no card says what the conversation says");
         // Its model and effort stay: the other account has the same ones.
         let agent = shell.agent_in_use().expect("agent");
         assert_eq!((agent.connection.as_str(), agent.model.as_str(), agent.effort.as_str()), ("work", "opus", "high"));
     }
 
+    /// The models Claude Code lists for an account, by the name each is chosen by.
+    fn lists(shell: &mut Shell, account: &str, models: &[&str]) {
+        let mut info = ClaudeInfo::default();
+        info.account.email = "me@example.com".into();
+        info.models = models
+            .iter()
+            .map(|value| atroxabot_core::ClaudeModel {
+                value: (*value).to_owned(),
+                efforts: vec!["low".into(), "medium".into(), "high".into()],
+                ..atroxabot_core::ClaudeModel::default()
+            })
+            .collect();
+        shell.claude_info(account, Ok(info));
+    }
+
     #[test]
-    fn a_limit_is_only_said_on_the_sessions_of_its_account() {
-        let (mut shell, session, mut actions) = two_accounts(OutOfLimits::Wait);
+    fn the_effort_goes_along_to_another_account() {
+        // The other account does not list the session's model (a smaller plan): it gets that account's
+        // own, at the effort the user picked.
+        let (mut shell, session, mut actions) = two_accounts(OutOfLimits::Switch);
+        lists(&mut shell, Connection::CLAUDE_AGENT, &["default", "opus"]);
+        lists(&mut shell, "work", &["default", "haiku"]);
         run_out(&mut shell, &session, unix_now() + 3_600, &mut actions);
-        assert_eq!(shell.notices_shown().len(), 1, "the open session ran into it");
-        // A new session starts on the same account: it would run into the same limit.
-        shell.new_session(&mut actions);
-        assert_eq!(shell.notices_shown().len(), 1);
-        // On the other account the limit is nobody's business.
+        let agent = shell.agent_in_use().expect("agent");
+        assert_eq!((agent.connection.as_str(), agent.model.as_str(), agent.effort.as_str()), ("work", "", "high"));
+        // By hand it is the same, back to where its model is listed.
+        shell.choose(Menu::Model, "haiku", &mut actions);
+        shell.choose(Menu::Provider, Connection::CLAUDE_AGENT, &mut actions);
+        let agent = shell.agent_in_use().expect("agent");
+        assert_eq!((agent.model.as_str(), agent.effort.as_str()), ("", "high"));
+
+        // An effort never picked is its model's usual one (Sonnet's is high): it stays what it was, also
+        // on a model whose usual one is another.
+        let (mut shell, _, mut actions) = two_accounts(OutOfLimits::Wait);
+        lists(&mut shell, Connection::CLAUDE_AGENT, &["sonnet", "opus"]);
+        lists(&mut shell, "work", &["opus"]);
+        let mut scout = shell.agent_in_use().expect("agent");
+        (scout.model, scout.effort) = ("sonnet".into(), String::new());
+        shell.choose_thinking(scout, &mut actions);
         shell.choose(Menu::Provider, "work", &mut actions);
-        assert!(shell.notices_shown().is_empty());
-        // Any other news shows wherever the user is.
-        shell.notify("The folder is gone.".into());
-        assert_eq!(shell.notices_shown().len(), 1);
-        // Back on the session that waits, its limit is said again.
-        shell.open_session(&session, &mut actions);
-        assert_eq!(shell.notices_shown().len(), 2);
-        assert!(shell.threads[&session].resume.is_some(), "and it still waits for it");
+        let agent = shell.agent_in_use().expect("agent");
+        assert_eq!((agent.connection.as_str(), agent.model.as_str(), agent.effort.as_str()), ("work", "", "high"));
+        // Before an account's models are known nothing is guessed: the effort stays unpicked.
+        let (shell, _, _) = two_accounts(OutOfLimits::Wait);
+        let unpicked = Agent { effort: String::new(), ..shell.agent_in_use().expect("agent") };
+        assert_eq!(shell.moved(unpicked, "work").effort, "");
     }
 
     #[test]
@@ -619,7 +640,6 @@ mod tests {
         run_out(&mut shell, &session, unix_now() + 3_600, &mut actions);
         let agent = shell.agent_in_use().expect("agent");
         assert_eq!((agent.connection.as_str(), agent.model.as_str(), agent.effort.as_str()), ("work", "opus", "high"));
-        assert!(shell.notices_shown().is_empty(), "the notice of the spent account went");
         // The new account gets the gist of the conversation in a process of its own, and is told to go on.
         let closed = actions.iter().position(|a| matches!(a, Action::CloseLive(closed) if *closed == session));
         let send = actions.iter().position(|a| matches!(a, Action::Send { session, .. } if session.account == "work"));
@@ -638,7 +658,7 @@ mod tests {
         let (mut shell, first, mut actions) = two_accounts(OutOfLimits::Switch);
         shell.agent_event(&first, AgentEvent::TurnEnded { problem: None }, &mut actions);
         // A second session of the agent, on the same account, is the one that runs out.
-        shell.new_session(&mut actions);
+        shell.new_session();
         shell.send("Something else", false, Vec::new(), &mut actions);
         let second = shell.current.clone().expect("a session");
         shell.agent_event(&second, AgentEvent::Remote("r2".into()), &mut actions);
@@ -748,9 +768,9 @@ mod tests {
         shell.save_agent(edited, &mut actions);
         let agent = shell.selected_agent().cloned().expect("agent");
         assert_eq!((agent.connection.as_str(), agent.model.as_str(), agent.effort.as_str()), ("work", "opus", "high"));
-        // To another kind of provider they mean nothing.
+        // To another kind of provider the model means nothing; how hard it thinks still does.
         shell.choose(Menu::Provider, "or", &mut actions);
         let agent = shell.selected_agent().cloned().expect("agent");
-        assert_eq!((agent.connection.as_str(), agent.model.as_str(), agent.effort.as_str()), ("or", "", ""));
+        assert_eq!((agent.connection.as_str(), agent.model.as_str(), agent.effort.as_str()), ("or", "", "high"));
     }
 }

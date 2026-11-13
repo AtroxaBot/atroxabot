@@ -1,6 +1,6 @@
 //! A running Claude Code process: its pipes, reader threads and the control protocol.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Map, Value, json};
 
 use crate::cli::{build_args, command};
-use crate::parse::{Parsed, is_refusal, parse_line};
+use crate::parse::{Parsed, answer, is_refusal, parse_line};
 use crate::{Error, Event, Info, McpServerStatus, Options, PermissionMode, PlanUsage, find_cli};
 
 /// Longest line accepted from the binary; a longer one is dropped and reported.
@@ -23,6 +23,8 @@ const GRACE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(20);
 
 type Callback = Box<dyn FnMut(Event) + Send>;
+/// What is done once a control request is answered: with `Err` and the reason when it was refused.
+type Answered = Box<dyn FnOnce(Result<(), String>) + Send>;
 
 /// The answer to an [`Event::Permission`].
 #[derive(Debug, Clone, PartialEq)]
@@ -62,6 +64,10 @@ struct Shared {
     callback: Mutex<Option<Callback>>,
     next_request: AtomicU64,
     ask_permissions: bool,
+    /// The end of what the binary wrote to stderr, to say why it stopped.
+    said: Mutex<VecDeque<String>>,
+    /// What to do once each of these control requests is answered, by request id.
+    waiting: Mutex<HashMap<String, Answered>>,
 }
 
 /// The variable the official SDK sets so that the binary reports its session state.
@@ -148,6 +154,8 @@ impl Session {
             callback: Mutex::new(Some(callback)),
             next_request: AtomicU64::new(1),
             ask_permissions: options.ask_permissions,
+            said: Mutex::new(VecDeque::new()),
+            waiting: Mutex::new(HashMap::new()),
         });
         // From here on an early return drops the session, which stops the process.
         let session = Self { shared };
@@ -266,6 +274,34 @@ impl Session {
     /// [`Error::Closed`] after the session closed, [`Error::Io`] when the write fails.
     pub fn set_model(&self, model: Option<&str>) -> Result<(), Error> {
         self.request(&json!({"subtype": "set_model", "model": model}))
+    }
+
+    /// Changes settings of the running session, as the official SDK's `applyFlagSettings` does: `settings`
+    /// is merged into what `--settings` gave the binary. `{"model": …}` has it answer with another model
+    /// from its next turn on (`null` for the account's default) and `{"effortLevel": …}` at another effort
+    /// (`null` for the model's usual one), with no restart: the conversation, and whatever runs in the
+    /// background, stay.
+    ///
+    /// `done` is called once, on the reader thread, when the binary has answered: `Ok` when the change is
+    /// made, `Err` with its reason when it refused (an [`Event::Error`] says so too) or when the process
+    /// ended first. A message sent before that may still be answered under the old settings.
+    ///
+    /// # Errors
+    /// [`Error::Closed`] after the session closed, [`Error::Io`] when the write fails; `done` is then dropped
+    /// uncalled.
+    pub fn apply_settings(
+        &self,
+        settings: &Value,
+        done: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) -> Result<(), Error> {
+        let id = format!("req_{}", self.shared.next_request.fetch_add(1, Ordering::Relaxed));
+        lock(&self.shared.waiting).insert(id.clone(), Box::new(done));
+        let request = json!({"subtype": "apply_flag_settings", "settings": settings});
+        let sent = self.shared.write(&json!({"type": "control_request", "request_id": id, "request": request}));
+        if sent.is_err() {
+            lock(&self.shared.waiting).remove(&id);
+        }
+        sent
     }
 
     /// Answers the [`Event::Permission`] with this `request_id`.
@@ -510,12 +546,28 @@ impl Shared {
         }
     }
 
+    /// Does what waits for the control request `line` answers, if it is such an answer and something waits.
+    fn answered(&self, line: &str) {
+        if lock(&self.waiting).is_empty() {
+            return;
+        }
+        let Some((id, refused)) = answer(line) else { return };
+        // Not while the lock is held: what is done may send the next request.
+        let done = lock(&self.waiting).remove(&id);
+        if let Some(done) = done {
+            done(refused.map_or(Ok(()), Err));
+        }
+    }
+
     /// Reads the binary's output until it ends. Returns the read error, if that is what ended it.
     fn read_stdout(&self, stdout: impl Read) -> Option<String> {
         let mut reader = BufReader::new(stdout);
         loop {
             match read_line(&mut reader, MAX_LINE) {
-                Ok(Line::Text(line)) => self.handle(parse_line(&line)),
+                Ok(Line::Text(line)) => {
+                    self.answered(&line);
+                    self.handle(parse_line(&line));
+                }
                 Ok(Line::TooLong) => self.emit(Event::Error(format!("dropped a line longer than {MAX_LINE} bytes"))),
                 Ok(Line::End) => return None,
                 Err(error) => return Some(error.to_string()),
@@ -530,6 +582,7 @@ impl Shared {
                 Ok(Line::Text(line)) => {
                     let line = line.trim_end();
                     if !line.is_empty() {
+                        keep_said(&mut lock(&self.said), line);
                         self.emit(Event::Stderr(line.to_owned()));
                     }
                 }
@@ -553,12 +606,20 @@ impl Shared {
             pipe_error.map(|error| format!("reading from the Claude Code binary failed: {error}")).or_else(|| {
                 match exit_code {
                     Some(0) => None,
-                    Some(code) => Some(format!("the Claude Code binary exited with code {code}")),
+                    Some(code) => Some(match explanation(&lock(&self.said)) {
+                        Some(said) => format!("the Claude Code binary exited with code {code} ({said})"),
+                        None => format!("the Claude Code binary exited with code {code}"),
+                    }),
                     None => Some("the Claude Code binary was terminated by a signal".into()),
                 }
             });
         *lock(&self.stdin) = None;
         lock(&self.pending).clear();
+        // What still waited for an answer will get none.
+        let waiting: Vec<Answered> = lock(&self.waiting).drain().map(|(_, done)| done).collect();
+        for done in waiting {
+            done(Err("the Claude Code binary stopped before it answered".into()));
+        }
         let callback = lock(&self.callback).take();
         if let Some(mut callback) = callback {
             callback(Event::Closed { exit_code, error });
@@ -578,6 +639,39 @@ impl Shared {
             thread::sleep(POLL);
         }
     }
+}
+
+/// How many of the binary's last stderr lines are kept to explain an exit.
+const SAID_LINES: usize = 40;
+/// Longest stderr line kept, in bytes; the rest of a longer one is dropped.
+const SAID_LINE: usize = 400;
+
+/// Keeps `line` among the last [`SAID_LINES`] of `said`, cut to [`SAID_LINE`] bytes.
+fn keep_said(said: &mut VecDeque<String>, line: &str) {
+    let mut end = line.len().min(SAID_LINE);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    if said.len() == SAID_LINES {
+        said.pop_front();
+    }
+    said.push_back(line.get(..end).unwrap_or_default().to_owned());
+}
+
+/// What the binary said about why it stopped: the last of its stderr lines that names an error, else its last
+/// line. Stack frames (`at …`) and the runtime's own banner (`Bun v1.2 (…)`, `Node.js v22`) explain nothing.
+fn explanation(said: &VecDeque<String>) -> Option<&str> {
+    let telling = |line: &&String| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with("at ") && !line.starts_with("Bun v") && !line.starts_with("Node.js v")
+    };
+    let names_error = |line: &&String| {
+        let lower = line.to_ascii_lowercase();
+        ["error", "exception", "panic", "fatal"].iter().any(|word| lower.contains(word))
+    };
+    let mut lines = said.iter().rev().filter(telling);
+    let last = lines.clone().next();
+    lines.find(names_error).or(last).map(|line| line.trim())
 }
 
 /// The `control_response` that answers a `can_use_tool` request.
@@ -644,6 +738,37 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn an_exit_is_explained_by_the_error_line_not_the_stack_or_banner() {
+        let mut said = VecDeque::new();
+        for line in [
+            "starting",
+            "TypeError: undefined is not an object",
+            "    at run (main.js:1:2)",
+            "",
+            "Bun v1.3.1 (Windows x64)",
+        ] {
+            keep_said(&mut said, line);
+        }
+        assert_eq!(explanation(&said), Some("TypeError: undefined is not an object"));
+        let mut quiet = VecDeque::new();
+        keep_said(&mut quiet, "shutting down");
+        assert_eq!(explanation(&quiet), Some("shutting down"));
+        assert_eq!(explanation(&VecDeque::new()), None);
+    }
+
+    #[test]
+    fn only_the_end_of_stderr_is_kept_and_long_lines_are_cut_whole_characters() {
+        let mut said = VecDeque::new();
+        for n in 0..SAID_LINES + 5 {
+            keep_said(&mut said, &format!("line {n}"));
+        }
+        assert_eq!(said.len(), SAID_LINES);
+        assert_eq!(said.front().map(String::as_str), Some("line 5"));
+        keep_said(&mut said, &"é".repeat(SAID_LINE));
+        assert_eq!(said.back().map(String::len), Some(SAID_LINE));
+    }
     use crate::{Block, SystemPrompt};
 
     #[test]
@@ -774,6 +899,114 @@ mod tests {
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
         assert!(limits.windows.iter().all(|window| window.resets_at > now), "every window says when it resets");
         assert!(limits.models.is_some(), "a fresh answer says which models have a week of their own");
+    }
+
+    /// Uses the owner's Claude usage (two short replies): run by hand when Claude Code changes, to confirm
+    /// that a running session takes another model and effort, and says so, and refuses what it does not know.
+    #[test]
+    #[ignore = "talks to the real Claude Code binary"]
+    fn live_settings_change() {
+        let (sender, events) = mpsc::channel();
+        let options = Options {
+            cwd: Some(std::env::temp_dir()),
+            system_prompt: SystemPrompt::Custom("Reply with exactly: pong".into()),
+            model: Some("haiku".into()),
+            effort: Some("low".into()),
+            ..Options::default()
+        };
+        let session = Session::connect(&options, move |event| drop(sender.send(event))).unwrap();
+        let answered_by = |session: &Session| {
+            session.send("ping").unwrap();
+            let mut model = String::new();
+            loop {
+                match events.recv_timeout(Duration::from_secs(180)).expect("the turn takes too long") {
+                    Event::Assistant { model: seen, .. } => model = seen,
+                    Event::Result(result) => {
+                        assert!(!result.is_error, "{result:?}");
+                        return model;
+                    }
+                    Event::Closed { exit_code, error } => panic!("closed early: {exit_code:?} {error:?}"),
+                    Event::Error(error) => println!("error: {error}"),
+                    _ => {}
+                }
+            }
+        };
+        let first = answered_by(&session);
+        println!("first reply by {first}");
+        assert!(first.contains("haiku"), "{first}");
+
+        let change = |settings: Value| {
+            let (done, outcome) = mpsc::channel();
+            session.apply_settings(&settings, move |result| drop(done.send(result))).unwrap();
+            outcome.recv_timeout(Duration::from_secs(60)).expect("the change was not answered")
+        };
+        let changed = change(json!({"model": "sonnet", "effortLevel": "medium"}));
+        println!("model and effort: {changed:?}");
+        assert_eq!(changed, Ok(()));
+        let second = answered_by(&session);
+        println!("second reply by {second}");
+        assert!(second.contains("sonnet"), "{second}");
+        // Effort alone, back to the model's usual one, and one it does not know.
+        println!("effort alone: {:?}", change(json!({"effortLevel": "high"})));
+        println!("usual effort: {:?}", change(json!({"effortLevel": null})));
+        // What it does not know, it may take all the same: the turn that follows then says so.
+        println!("unknown effort: {:?}", change(json!({"effortLevel": "no-such-effort"})));
+        println!("unknown model: {:?}", change(json!({"model": "no-such-model-1"})));
+        println!("mistyped: {:?}", change(json!({"effortLevel": 7})));
+    }
+
+    #[test]
+    fn what_waits_for_an_answer_is_done_once_with_how_it_went() {
+        let shared = Shared {
+            stdin: Mutex::new(None),
+            child: Mutex::new(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--list")
+                    .stdout(Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            ),
+            pending: Mutex::new(HashMap::new()),
+            callback: Mutex::new(None),
+            next_request: AtomicU64::new(1),
+            ask_permissions: false,
+            said: Mutex::new(VecDeque::new()),
+            waiting: Mutex::new(HashMap::new()),
+        };
+        let (sender, outcomes) = mpsc::channel();
+        for id in ["req_1", "req_2", "req_3"] {
+            let (sender, id) = (sender.clone(), id.to_owned());
+            let done: Answered = Box::new(move |outcome| drop(sender.send((id, outcome))));
+            lock(&shared.waiting).insert(done_key(&shared), done);
+        }
+        shared.answered(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_2","response":{}}}"#,
+        );
+        shared.answered(
+            r#"{"type":"control_response","response":{"subtype":"error","request_id":"req_1","error":"no"}}"#,
+        );
+        // Another line, an answer to a request nothing waits for, and the same answer again change nothing.
+        shared.answered(r#"{"type":"system","subtype":"status"}"#);
+        shared.answered(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_9","response":{}}}"#,
+        );
+        shared.answered(
+            r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_2","response":{}}}"#,
+        );
+        assert_eq!(outcomes.try_recv(), Ok(("req_2".to_owned(), Ok(()))));
+        assert_eq!(outcomes.try_recv(), Ok(("req_1".to_owned(), Err("no".to_owned()))));
+        assert!(outcomes.try_recv().is_err());
+        // The process ends: what still waits is told so.
+        let (open, closed) = mpsc::channel::<()>();
+        drop(open);
+        shared.finish(None, &closed);
+        let (id, outcome) = outcomes.try_recv().expect("the last one is answered too");
+        assert!(id == "req_3" && outcome.is_err_and(|why| why.contains("stopped")));
+    }
+
+    /// The id the next control request would go under.
+    fn done_key(shared: &Shared) -> String {
+        format!("req_{}", shared.next_request.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Uses the owner's Claude usage: run by hand, once, to confirm the wire format against the real binary.

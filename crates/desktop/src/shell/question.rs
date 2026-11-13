@@ -4,7 +4,7 @@
 //! steps of one card; the answers go back together.
 
 use arboard::Clipboard;
-use atroxabot_core::{Ask, Verdict};
+use atroxabot_core::{Ask, DISMISSED, Verdict};
 use serde_json::{Map, Value, json};
 use winit::event::KeyEvent;
 use winit::keyboard::{Key, ModifiersState, NamedKey};
@@ -20,8 +20,6 @@ use crate::ui::{ButtonStyle, Ui, button, edit_key, icon, id};
 pub(super) const TOOL: &str = "AskUserQuestion";
 /// Most questions of one card, and most options of one question, that are shown.
 const MOST: usize = 8;
-/// What the agent is told when the card is dismissed.
-const DISMISSED: &str = "The user dismissed the question without answering it.";
 
 /// One question.
 struct Question {

@@ -19,6 +19,23 @@ pub(crate) fn is_refusal(error: &str) -> bool {
     error.starts_with(REFUSED)
 }
 
+/// The control request of ours that a line of output answers and, when the binary refused it, why. `None`
+/// for any other line.
+pub(crate) fn answer(line: &str) -> Option<(String, Option<String>)> {
+    let line = line.trim();
+    if !line.starts_with('{') || !line.contains("control_response") {
+        return None;
+    }
+    let data: Value = serde_json::from_str(line).ok()?;
+    if text(&data, "type") != "control_response" {
+        return None;
+    }
+    let response = field(&data, "response");
+    let refused = field(response, "subtype").as_str() == Some("error");
+    let why = refused.then(|| opt_text(response, "error").unwrap_or_else(|| "unknown error".into()));
+    Some((text(response, "request_id"), why))
+}
+
 /// What a line of output amounts to.
 #[derive(Debug, PartialEq)]
 pub(crate) enum Parsed {
@@ -385,6 +402,7 @@ fn system(data: Value) -> Parsed {
                 description: text(&data, "description"),
                 subagent_type: text(&data, "subagent_type"),
                 task_type: text(&data, "task_type"),
+                owned_by_subagent: flag(&data, "owned_by_subagent"),
                 last_tool: text(&data, "last_tool_name"),
                 tool_uses: number(usage, "tool_uses"),
                 total_tokens: number(usage, "total_tokens"),
@@ -464,11 +482,20 @@ fn rate_limit(info: &Value) -> RateLimit {
 }
 
 fn usage(value: &Value) -> Usage {
+    let written = field(value, "cache_creation");
+    let cache_ttl = if number(written, "ephemeral_1h_input_tokens") > 0 {
+        3600
+    } else if number(written, "ephemeral_5m_input_tokens") > 0 {
+        300
+    } else {
+        0
+    };
     Usage {
         input_tokens: number(value, "input_tokens"),
         output_tokens: number(value, "output_tokens"),
         cache_read_input_tokens: number(value, "cache_read_input_tokens"),
         cache_creation_input_tokens: number(value, "cache_creation_input_tokens"),
+        cache_ttl,
     }
 }
 
@@ -701,8 +728,13 @@ mod tests {
         assert_eq!(model, "claude-opus-5-5");
         assert_eq!(parent_tool_use_id.as_deref(), Some("toolu_0"));
         assert_eq!(error, None);
-        let expected =
-            Usage { input_tokens: 3, output_tokens: 5, cache_read_input_tokens: 7, cache_creation_input_tokens: 11 };
+        let expected = Usage {
+            input_tokens: 3,
+            output_tokens: 5,
+            cache_read_input_tokens: 7,
+            cache_creation_input_tokens: 11,
+            cache_ttl: 0,
+        };
         assert_eq!(usage, expected);
         assert_eq!(blocks.len(), 5);
         assert_eq!(blocks[0], Block::Thinking("let me see".into()));
@@ -824,6 +856,22 @@ mod tests {
     }
 
     #[test]
+    fn usage_says_how_long_the_cache_keeps_what_was_written() {
+        // As Claude Code 2.1.322 reports a reply's usage on a subscription: written for an hour.
+        let hour = json!({"input_tokens": 2, "cache_read_input_tokens": 37091, "cache_creation_input_tokens": 2487,
+            "cache_creation": {"ephemeral_1h_input_tokens": 2487, "ephemeral_5m_input_tokens": 0}, "output_tokens": 9});
+        assert_eq!((usage(&hour).cache_ttl, usage(&hour).cache_read_input_tokens), (3600, 37091));
+        let minutes = json!({"cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 12}});
+        assert_eq!(usage(&minutes).cache_ttl, 300);
+        // Nothing written, nothing said, or nonsense: not known.
+        for vague in
+            [json!({"cache_creation": {"ephemeral_1h_input_tokens": 0}}), json!({}), json!({"cache_creation": 7})]
+        {
+            assert_eq!(usage(&vague).cache_ttl, 0);
+        }
+    }
+
+    #[test]
     fn control_responses() {
         let ok = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{}}}"#;
         assert_eq!(parse_line(ok), Parsed::Nothing);
@@ -833,6 +881,12 @@ mod tests {
         let vague = r#"{"type":"control_response","response":{"subtype":"error"}}"#;
         assert_eq!(event(vague), Event::Error("control request  failed: unknown error".into()));
         assert_eq!(parse_line(r#"{"type":"control_response"}"#), Parsed::Nothing);
+        // Which request an answer is to, and why it was refused.
+        assert_eq!(answer(ok), Some(("req_1".into(), None)));
+        assert_eq!(answer(failed), Some(("req_2".into(), Some("nope".into()))));
+        assert_eq!(answer(vague), Some((String::new(), Some("unknown error".into()))));
+        let said = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"control_response"}]}}"#;
+        assert_eq!((answer(said), answer("control_response"), answer("{\"type\":")), (None, None, None));
         let ready = r#"{"type":"control_response","response":{"subtype":"success","request_id":"req_1","response":{
             "models":[{"value":"default","resolvedModel":"claude-opus-5-5","displayName":"Default (recommended)",
             "description":"Opus 5.5 · Best","supportedEffortLevels":["low","high"],"supportsAutoMode":true},{"value":""},7],

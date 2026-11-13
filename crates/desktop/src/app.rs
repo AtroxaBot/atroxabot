@@ -141,6 +141,13 @@ pub enum WorkerEvent {
     Skills(skills::Report),
     /// Something asked about the sessions' worktrees is done.
     Worktree(worktree::Report),
+    /// A session's Claude Code answered a change of model or effort: the message that waited for it goes.
+    Retuned {
+        /// The session.
+        session: String,
+        /// Whether it took the change; why not, otherwise.
+        outcome: Result<(), String>,
+    },
     /// A session's worktree is ready for the message that waited for it (or could not be made).
     WorktreeReady {
         /// The message that waits.
@@ -390,6 +397,8 @@ pub struct App {
     leases: HashMap<String, worktree::Lease>,
     /// The sessions whose message waits for its worktree to be ready.
     preparing: HashSet<String>,
+    /// The message of each session that waits for its Claude Code to take another model or effort.
+    retuning: HashMap<String, Box<Pending>>,
     /// The engine (a Claude process, an API turn) each session hears from,
     /// by a number given to each: what one it replaced still says is dropped.
     generations: HashMap<String, u64>,
@@ -542,6 +551,7 @@ impl App {
             turns: HashMap::new(),
             leases: HashMap::new(),
             preparing: HashSet::new(),
+            retuning: HashMap::new(),
             generations: HashMap::new(),
             next_generation: 1,
             approved: HashMap::new(),
@@ -655,7 +665,7 @@ impl App {
                 self.ui.focused = focused;
             }
             // A file dragged onto the window goes along with the next message.
-            WindowEvent::DroppedFile(path) => self.shell.files_picked(vec![path.display().to_string()]),
+            WindowEvent::DroppedFile(path) => self.spawn(move || WorkerEvent::FilesPicked(attachable(vec![path]))),
             WindowEvent::ModifiersChanged(mods) => self.ui.mods = mods.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui.mouse = (position.x as f32 / scale, position.y as f32 / scale);
@@ -859,6 +869,7 @@ impl App {
             WorkerEvent::Files { folder, files } => self.shell.files_listed(&folder, files),
             WorkerEvent::Skills(report) => self.shell.skills_report(report),
             WorkerEvent::Worktree(report) => self.shell.worktree_report(report, &mut actions),
+            WorkerEvent::Retuned { session, outcome } => self.retuned(&session, &outcome),
             WorkerEvent::WorktreeReady { pending, generation, prepared } => {
                 let Pending { agent, connection, model, mut session, text } = *pending;
                 let id = session.id.clone();
@@ -869,6 +880,10 @@ impl App {
                     Ok(prepared) => {
                         // Made is made: the session keeps it either way, so it is found again and cleaned up.
                         self.shell.worktree_ready(&id, &prepared.worktree, &prepared.workdir, &mut actions);
+                        // Not all the local files its repository names were copied into it.
+                        if let Some(note) = prepared.note {
+                            self.shell.notify(note);
+                        }
                         if wanted {
                             session.worktree = Some(prepared.worktree);
                             session.workdir = prepared.workdir;
@@ -902,8 +917,8 @@ impl App {
             Action::Compact { agent, connection, model, session } => self.compact(&agent, &connection, model, *session),
             Action::StopJobs(session) => self.stop_jobs(&session),
             Action::Stop(session) => {
-                // Not started yet: its worktree is still being made ready.
-                if self.preparing.remove(&session) {
+                // Not started yet: its worktree is still being made ready, or its process is taking another model.
+                if self.preparing.remove(&session) || self.retuning.remove(&session).is_some() {
                     self.emitter(&session)(AgentEvent::TurnEnded { problem: None });
                 }
                 if let Some(turn) = self.turns.get(&session) {
@@ -914,7 +929,7 @@ impl App {
                 }
             }
             Action::Interrupt(session) => {
-                if self.preparing.remove(&session) {
+                if self.preparing.remove(&session) || self.retuning.remove(&session).is_some() {
                     self.emitter(&session)(AgentEvent::TurnEnded { problem: None });
                 }
                 // An API turn ends; the shell sends what it had not read as the next message.
@@ -961,6 +976,7 @@ impl App {
             Action::SaveSession(session) => self.writer.send(Job::SaveSession(session)),
             Action::DeleteSession(session) => {
                 self.preparing.remove(&session);
+                self.retuning.remove(&session);
                 self.approved.remove(&session);
                 self.skill_sets.remove(&session);
                 self.stop_jobs(&session);
@@ -1063,7 +1079,7 @@ impl App {
                 });
             }
             Action::PickFiles => self.spawn(|| match platform::pick_any("Choose files to send along") {
-                Ok(files) => WorkerEvent::FilesPicked(files.iter().map(|path| path.display().to_string()).collect()),
+                Ok(files) => WorkerEvent::FilesPicked(attachable(files)),
                 Err(e) => WorkerEvent::Problem(format!("Could not open the file picker: {e}")),
             }),
             Action::PasteFiles => self.spawn(|| {
@@ -1075,9 +1091,7 @@ impl App {
                         .map_err(|e| e.to_string())
                 });
                 match saved {
-                    Ok(files) => {
-                        WorkerEvent::FilesPicked(files.iter().map(|path| path.display().to_string()).collect())
-                    }
+                    Ok(files) => WorkerEvent::FilesPicked(attachable(files)),
                     Err(e) => WorkerEvent::Problem(format!("Could not read the clipboard: {e}")),
                 }
             }),
@@ -1238,7 +1252,32 @@ impl App {
             }
             let mut emit = self.emitter(&id);
             let codex = connection.kind == ConnectionKind::Codex;
-            // One process serves the session until it is closed or its agent changes.
+            // One process serves the session until it is closed or its agent changes. Another model or
+            // effort is no reason to start one again: Codex takes both with every turn, and a running
+            // Claude Code is asked to change, the message going once it has (`retuned`).
+            match self.live.get(&id) {
+                Some(Live::Codex(live)) => live.retune(&agent.model, &agent.effort),
+                Some(Live::Claude(live)) if !live.runs_with(&agent.model, &agent.effort) => {
+                    let (proxy, changed) = (self.proxy.clone(), id.clone());
+                    let asked = live.retune(&agent.model, &agent.effort, move |outcome| {
+                        let _ = proxy.send_event(WorkerEvent::Retuned { session: changed, outcome });
+                    });
+                    let pending = Box::new(Pending {
+                        agent: agent.clone(),
+                        connection: connection.clone(),
+                        model,
+                        session,
+                        text: text.to_owned(),
+                    });
+                    self.retuning.insert(id.clone(), pending);
+                    if let Err(e) = asked {
+                        // It is gone: one started anew answers.
+                        self.retuned(&id, &Err(e.to_string()));
+                    }
+                    return;
+                }
+                _ => {}
+            }
             let servers = &self.shell.config.mcp;
             let sent = if let Some(live) = self.live.get(&id) {
                 live.send(text, &files)
@@ -1280,6 +1319,27 @@ impl App {
         if let Err(e) = spawned {
             self.turns.remove(&id);
             fail(self.emitter(&id), format!("The turn could not be started: {e}"));
+        }
+    }
+
+    /// A session's Claude Code answered the change of model or effort its
+    /// message waits for. Having taken it, it is sent the message; one
+    /// that did not, or is gone, is closed and one started anew answers,
+    /// with what was chosen. A message stopped meanwhile no longer goes.
+    fn retuned(&mut self, session: &str, outcome: &Result<(), String>) {
+        let Some(pending) = self.retuning.remove(session) else { return };
+        let Pending { agent, connection, model, session: saved, text } = *pending;
+        if let Err(why) = outcome {
+            log::error(format!("session {session}: Claude Code did not take another model or effort: {why}"));
+        }
+        let files = match saved.entries.last() {
+            Some(atroxabot_core::Entry::User { files, .. }) => files.clone(),
+            _ => Vec::new(),
+        };
+        let sent = outcome.is_ok() && self.live.get(session).is_some_and(|live| live.send(&text, &files).is_ok());
+        if !sent {
+            self.run(Action::CloseLive(session.to_owned()));
+            self.send(&agent, &connection, model, saved, &text);
         }
     }
 
@@ -1634,14 +1694,32 @@ impl Live {
     }
 }
 
-/// Lets an agent's process go on another thread: closing it waits for
-/// the process, which the UI must not. The hold on the worktree it worked
-/// in, if any, ends once it has.
+/// The files that go with a message for the ones the user `picked`: each as
+/// it is, but for a picture too large for a model, which goes as a smaller
+/// copy in the app's own folder (`atroxabot_core::picture`). A pasted
+/// picture such a copy stands in for is the app's own file, and goes.
+/// Scaling a large picture takes a moment: not for the UI thread.
+fn attachable(picked: Vec<std::path::PathBuf>) -> Vec<String> {
+    let folder = Config::dir().map(|dir| dir.join("attachments")).ok();
+    let sent = |path: std::path::PathBuf| {
+        let Some(folder) = &folder else { return path };
+        let sent = atroxabot_core::picture::sendable(&path, folder);
+        if sent != path && path.starts_with(folder) {
+            let _ = std::fs::remove_file(&path);
+        }
+        sent
+    };
+    picked.into_iter().map(|path| sent(path).display().to_string()).collect()
+}
+
 /// Runs `command` in a terminal the user sees, its window named `title`.
 fn in_terminal(title: &str, command: &atroxabot_core::TerminalCommand) -> Result<(), String> {
     platform::run_in_terminal(title, &command.program, &command.args, &command.env).map_err(|e| e.to_string())
 }
 
+/// Lets an agent's process go on another thread: closing it waits for
+/// the process, which the UI must not. The hold on the worktree it worked
+/// in, if any, ends once it has.
 fn retire(live: Live, lease: Option<worktree::Lease>) {
     let _ = std::thread::Builder::new().name("atroxabot-retire".into()).spawn(move || {
         live.close();
@@ -1871,7 +1949,7 @@ fn set_icon(window: &Window) {
         window.set_taskbar_icon(load(32.0));
     }
     #[cfg(all(unix, not(target_os = "macos")))]
-    if let Ok((rgba, w, h)) = image::decode_png(include_bytes!("../assets/icon/256.png"))
+    if let Ok((rgba, w, h)) = atroxabot_core::picture::decode_png(include_bytes!("../assets/icon/256.png"))
         && let Ok(icon) = winit::window::Icon::from_rgba(rgba, w, h)
     {
         window.set_window_icon(Some(icon));

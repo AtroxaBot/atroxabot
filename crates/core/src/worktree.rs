@@ -22,6 +22,17 @@
 //! * a branch of the app's that no worktree and no session uses is deleted
 //!   once it is merged.
 //!
+//! A worktree holds what git checks out, which is not all a project needs
+//! to run: a local `.env`, say, is nobody's commit. A repository names such
+//! files in a `.worktreeinclude` at its top (one pattern a line, written as
+//! in a `.gitignore`), and every worktree made of it gets a copy of those of
+//! them that **git ignores**: copied, never linked, so a session cannot
+//! change the user's own; never over a file the checkout has; and only
+//! ignored ones, so a copy is no change of the session's and goes with the
+//! worktree like anything else git ignores. The app runs no command of the
+//! project's for this: installing what a build needs is the agent's, asked
+//! about like any other command.
+//!
 //! Nothing here touches a worktree that is in use: whoever works in one
 //! holds a [`Lease`] on it. Everything goes through the user's own `git`
 //! and blocks; run it off the UI thread.
@@ -48,6 +59,12 @@ const LET_GO: Duration = Duration::from_secs(20);
 const NAME_LIMIT: usize = 24;
 /// Longest part of a branch's name taken from the session's title.
 const SLUG_LIMIT: usize = 32;
+/// The file at a repository's top that names what its worktrees get beside what git checks out.
+const INCLUDE: &str = ".worktreeinclude";
+/// Most files, and most bytes, copied into a worktree for it: it is for a
+/// handful of local settings, not for what a build makes.
+const CARRY_FILES: usize = 2_000;
+const CARRY_BYTES: u64 = 256 * 1024 * 1024;
 
 /// A session's worktree: where it is and what it is of.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -150,6 +167,9 @@ pub struct Prepared {
     pub workdir: String,
     /// The hold on it; keep it for as long as something works there.
     pub lease: Lease,
+    /// What the user should know of the files its repository's
+    /// `.worktreeinclude` names, when not all of them were copied into it.
+    pub note: Option<String>,
 }
 
 /// The folder all worktrees are kept in: `~/.atroxabot/worktrees`.
@@ -175,18 +195,82 @@ pub fn prepare(session: &Session) -> Result<Prepared, String> {
 fn prepare_in(root: &Path, session: &Session) -> Result<Prepared, String> {
     let wanted = session.worktree.as_ref().ok_or("This session has no worktree.")?;
     let _gate = gate();
-    let (worktree, workdir) = if wanted.made() {
-        let worktree = ensure(wanted)?;
+    let (worktree, workdir, note) = if wanted.made() {
+        let (worktree, note) = ensure(wanted)?;
         // The folder in it the session worked in, if the branch still has it.
         let workdir =
             Some(session.workdir.clone()).filter(|dir| Path::new(dir).is_dir()).unwrap_or(worktree.path.clone());
-        (worktree, workdir)
+        (worktree, workdir, note)
     } else {
         create(root, &session.folder(), &session.id, &session.title)?
     };
     leases().push(worktree.path.clone());
     let lease = Lease { path: worktree.path.clone() };
-    Ok(Prepared { worktree, workdir, lease })
+    Ok(Prepared { worktree, workdir, lease, note })
+}
+
+/// The names git printed one after the other with `-z`.
+fn names(listing: &[u8]) -> impl Iterator<Item = &str> {
+    listing.split(|byte| *byte == 0).filter_map(|name| std::str::from_utf8(name).ok()).filter(|name| !name.is_empty())
+}
+
+/// Copies into the new worktree at `to` the files of the checkout `from`
+/// that its `.worktreeinclude` names and git ignores (see the module's
+/// comment). Returns what the user should know when not all of them went:
+/// `None` when they did, or when the repository names none.
+fn carry(from: &Path, to: &Path) -> Option<String> {
+    let list = from.join(INCLUDE);
+    if !list.is_file() {
+        return None;
+    }
+    // What is not git's and matches the list, as git itself reads such patterns.
+    let patterns = format!("--exclude-from={}", list.display());
+    let listed = match git(from, &["ls-files", "-z", "--others", "--ignored", &patterns]) {
+        Ok(listed) => listed,
+        Err(problem) => return Some(format!("{INCLUDE} could not be read: {problem}")),
+    };
+    let listed: Vec<&str> = names(&listed).collect();
+    // Only what git ignores: anything else would be a change of the session's in its worktree.
+    let mut ignored: HashSet<String> = HashSet::new();
+    for some in listed.chunks(100) {
+        // Each name is one file's, whatever characters it holds.
+        let mut args =
+            vec!["--literal-pathspecs", "ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--"];
+        args.extend(some);
+        if let Ok(found) = git(from, &args) {
+            ignored.extend(names(&found).map(str::to_owned));
+        }
+    }
+    let (mut files, mut bytes, mut failed) = (0, 0, 0);
+    for name in listed.into_iter().filter(|name| ignored.contains(*name)) {
+        let inside = Path::new(name);
+        // A name is a place inside the checkout, and so inside the worktree.
+        if !inside.components().all(|part| matches!(part, std::path::Component::Normal(_))) {
+            continue;
+        }
+        let (source, target) = (from.join(inside), to.join(inside));
+        // Files only (a link is not followed), and never over what the checkout put there.
+        let Ok(about) = fs::symlink_metadata(&source) else { continue };
+        if !about.is_file() || fs::symlink_metadata(&target).is_ok() {
+            continue;
+        }
+        if files == CARRY_FILES || bytes + about.len() > CARRY_BYTES {
+            return Some(format!(
+                "{INCLUDE} names more than is copied into a worktree ({CARRY_FILES} files, {} MB): the rest was \
+                 left out.",
+                CARRY_BYTES / (1024 * 1024)
+            ));
+        }
+        let made = target.parent().map_or(Ok(()), fs::create_dir_all);
+        match made.and_then(|()| fs::copy(&source, &target)) {
+            Ok(_) => (files, bytes) = (files + 1, bytes + about.len()),
+            Err(_) => failed += 1,
+        }
+    }
+    (failed > 0).then(|| {
+        let what = if failed == 1 { "1 file".to_owned() } else { format!("{failed} files") };
+        format!("{what} that {INCLUDE} names could not be copied into the worktree.")
+    })
 }
 
 /// What git prints for `args` in `folder`, trimmed; `None` when it fails.
@@ -241,9 +325,9 @@ fn has_branch(repo: &Path, branch: &str) -> bool {
 }
 
 /// Makes the worktree of the session `id` (titled `title`) for the
-/// repository `folder` is in, under `root`. Returns it and the folder in
-/// it that stands for `folder`.
-fn create(root: &Path, folder: &Path, id: &str, title: &str) -> Result<(Worktree, String), String> {
+/// repository `folder` is in, under `root`. Returns it, the folder in it
+/// that stands for `folder`, and what [`carry`] has to say.
+fn create(root: &Path, folder: &Path, id: &str, title: &str) -> Result<(Worktree, String, Option<String>), String> {
     if !crate::session::valid_id(id) {
         return Err("This session cannot have a worktree.".to_owned());
     }
@@ -275,10 +359,12 @@ fn create(root: &Path, folder: &Path, id: &str, title: &str) -> Result<(Worktree
     let place = path.display().to_string();
     git(&repo, &["worktree", "add", "-b", &branch, "--", &place, &start])?;
     remember_base(&repo, &branch, &base);
+    // From the checkout the session was started in: its local files are the ones meant.
+    let note = carry(&native(&top), &path);
     let workdir = Some(path.join(native(inside.trim_end_matches('/')))).filter(|dir| dir.is_dir());
     let workdir = workdir.map_or_else(|| place.clone(), |dir| dir.display().to_string());
     let worktree = Worktree { repo: repo.display().to_string(), path: place, branch, base, start };
-    Ok((worktree, workdir))
+    Ok((worktree, workdir, note))
 }
 
 /// Notes on `branch`, in the repository's own configuration, which branch
@@ -295,11 +381,12 @@ fn is_worktree(path: &Path) -> bool {
 
 /// Has the folder of `worktree` be there: left alone when it is, made again
 /// from its branch (or, when that is gone, from where it came from) when it
-/// was taken away. Returns the worktree as it is now.
-fn ensure(worktree: &Worktree) -> Result<Worktree, String> {
+/// was taken away. Returns the worktree as it is now, and what [`carry`]
+/// has to say when it was made again.
+fn ensure(worktree: &Worktree) -> Result<(Worktree, Option<String>), String> {
     let (repo, path) = (Path::new(&worktree.repo), Path::new(&worktree.path));
     if is_worktree(path) {
-        return Ok(worktree.clone());
+        return Ok((worktree.clone(), None));
     }
     if !repo.is_dir() {
         return Err(format!("The repository {} is no longer there.", worktree.repo));
@@ -329,7 +416,9 @@ fn ensure(worktree: &Worktree) -> Result<Worktree, String> {
         remember_base(repo, &worktree.branch, &worktree.base);
         made.start = out(path, &["rev-parse", "HEAD"]).unwrap_or_default();
     }
-    Ok(made)
+    // What git ignores went with the folder: the repository's local files are copied in again.
+    let note = carry(repo, path);
+    Ok((made, note))
 }
 
 /// What `tip` is compared with to see whether its work is merged: the
@@ -915,6 +1004,72 @@ mod tests {
         assert_eq!(remove(&worktree, true), Err("A session is still working in it.".to_owned()));
         drop(lease);
         done(&root);
+    }
+
+    #[test]
+    fn a_worktree_gets_the_ignored_files_its_repository_names() {
+        let Some((repo, root)) = repository_with_a_commit("carry") else { return };
+        fs::write(repo.join(".gitignore"), "target/\n.env\nsecrets/\n*.local\n").expect("write");
+        // As in a .gitignore: comments, folders, wildcards. It also names what is not for copying.
+        let named = "# local settings\n.env\nsecrets/\n*.local\nnotes.txt\na.txt\nmissing.txt\n";
+        fs::write(repo.join(INCLUDE), named).expect("write");
+        commit(&repo, "ignore the local files");
+        fs::create_dir_all(repo.join("secrets/deep")).expect("dir");
+        fs::create_dir_all(repo.join("target")).expect("dir");
+        fs::write(repo.join(".env"), "KEY=1\n").expect("write");
+        fs::write(repo.join("secrets/deep/key.pem"), "pem").expect("write");
+        fs::write(repo.join("src/db.local"), "local").expect("write");
+        // Not ignored (it would be a change of the session's), not named, and git's own.
+        fs::write(repo.join("notes.txt"), "mine").expect("write");
+        fs::write(repo.join("target/out.bin"), "built").expect("write");
+        fs::write(repo.join("a.txt"), "changed, not committed\n").expect("write");
+
+        let mut session = asking(&repo, "Use the key");
+        let prepared = prepare_in(&root, &session).expect("a worktree");
+        assert_eq!(prepared.note, None);
+        let tree = PathBuf::from(&prepared.worktree.path);
+        let read = |name: &str| fs::read_to_string(tree.join(name)).ok();
+        assert_eq!(read(".env").as_deref(), Some("KEY=1\n"));
+        assert_eq!(read("secrets/deep/key.pem").as_deref(), Some("pem"));
+        assert_eq!(read("src/db.local").as_deref(), Some("local"));
+        assert_eq!((read("notes.txt"), read("target/out.bin")), (None, None));
+        // What git checked out is not written over (git may write its line ends the platform's way).
+        assert_eq!(read("a.txt").as_deref().map(str::trim_end), Some("one"));
+        // The copies are no changes: the worktree is as clean as it was made.
+        assert!(state(&prepared.worktree).clean());
+        // They are copies: the session changing its own leaves the user's alone.
+        fs::write(tree.join(".env"), "KEY=2\n").expect("write");
+        assert_eq!(fs::read_to_string(repo.join(".env")).ok().as_deref(), Some("KEY=1\n"));
+
+        // Taken away and made again, it gets them again, as they are now.
+        session.worktree = Some(prepared.worktree.clone());
+        session.workdir.clone_from(&prepared.workdir);
+        drop(prepared);
+        let worktree = session.worktree.clone().expect("a worktree");
+        assert_eq!(remove(&worktree, false), Ok(false), "clean, with nothing of its own: its branch goes too");
+        assert!(!tree.exists());
+        fs::write(repo.join(".env"), "KEY=3\n").expect("write");
+        let again = prepare_in(&root, &session).expect("made again");
+        assert_eq!((read(".env").as_deref(), again.note.as_deref()), (Some("KEY=3\n"), None));
+        drop(again);
+
+        // A folder of that name is no list: nothing is copied, and nothing is wrong.
+        fs::remove_file(repo.join(INCLUDE)).expect("remove");
+        fs::create_dir_all(repo.join(INCLUDE)).expect("a folder in its place");
+        assert_eq!(carry(&repo, &tree), None, "a folder is no list");
+        done(&root);
+    }
+
+    #[test]
+    fn names_git_prints_are_read_and_nothing_is_copied_outside() {
+        assert_eq!(names(b"a.txt\0dir/b c.txt\0\0\xff\xfe\0").collect::<Vec<_>>(), ["a.txt", "dir/b c.txt"]);
+        assert_eq!(names(b"").count(), 0);
+        // No list, no copies, nothing to say: also where there is no repository at all.
+        let dir = std::env::temp_dir().join(format!("atroxabot-wt-carry-none-{}", crate::new_id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        assert_eq!(carry(&dir, &dir.join("tree")), None);
+        assert!(!dir.join("tree").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

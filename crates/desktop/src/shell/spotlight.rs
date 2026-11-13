@@ -39,6 +39,9 @@ pub(super) enum Target {
         agent: String,
         /// The session's id.
         session: String,
+        /// The words it was found by in its messages, to be shown where
+        /// they stand; empty for one found by its title.
+        find: String,
     },
     /// An agent, by id.
     Agent(String),
@@ -95,8 +98,8 @@ impl Spotlight {
         let needle = self.editor.text().trim().to_lowercase();
         let fits = |text: &str| needle.is_empty() || text.to_lowercase().contains(&needle);
         let name = |agent: &str| shell.agents.iter().find(|a| a.id == agent).map_or("", |a| a.name.as_str());
-        let session = |agent: &str, session: &str, title: &str, said: &str| Entry {
-            target: Target::Session { agent: agent.to_owned(), session: session.to_owned() },
+        let session = |agent: &str, session: &str, title: &str, said: &str, find: &str| Entry {
+            target: Target::Session { agent: agent.to_owned(), session: session.to_owned(), find: find.to_owned() },
             glyph: icon::MESSAGE,
             agent: Some(agent.to_owned()),
             title: if title.is_empty() { "New session".to_owned() } else { title.to_owned() },
@@ -108,11 +111,13 @@ impl Spotlight {
         let mut titled: Vec<_> = shell.sessions.iter().filter(|s| fits(&s.title)).collect();
         titled.sort_by_key(|s| std::cmp::Reverse(s.updated));
         let titled = titled.into_iter().take(most);
-        let mut entries: Vec<Entry> = titled.map(|s| session(&s.agent, &s.id, &s.title, &s.preview)).collect();
+        let mut entries: Vec<Entry> = titled.map(|s| session(&s.agent, &s.id, &s.title, &s.preview, "")).collect();
+        // One found by what was said in it opens where that stands.
+        let typed = self.editor.text().trim();
         for hit in &self.hits {
             let listed = |e: &Entry| matches!(&e.target, Target::Session { session, .. } if *session == hit.session);
             if !entries.iter().any(listed) {
-                entries.push(session(&hit.agent, &hit.session, &hit.title, &hit.snippet));
+                entries.push(session(&hit.agent, &hit.session, &hit.title, &hit.snippet, typed));
             }
         }
         entries.extend(shell.agents.iter().filter(|agent| fits(&agent.name)).map(|agent| Entry {
@@ -325,6 +330,15 @@ mod tests {
         };
         spotlight.found(spotlight.generation, vec![hit(&session.id), hit("other")]);
         assert_eq!(kinds(&spotlight), ["Session", "Session"]);
+        // It opens where the words stand; the one found by its title just opens.
+        let finds = |spotlight: &Spotlight| {
+            let find = |entry: Entry| match entry.target {
+                Target::Session { find, .. } => find,
+                _ => String::new(),
+            };
+            spotlight.entries(&shell).into_iter().map(find).collect::<Vec<_>>()
+        };
+        assert_eq!(finds(&spotlight), ["", "pars"]);
         spotlight.insert("x", &mut actions);
         spotlight.found(spotlight.generation - 1, vec![hit("late")]);
         assert!(spotlight.entries(&shell).is_empty());

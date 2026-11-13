@@ -29,6 +29,27 @@ pub fn inks(t: &Palette, text: Color) -> [Color; 10] {
     [text, t.link, text, s[0], s[1], s[2], s[3], s[4], s[5], t.text_muted]
 }
 
+/// How a line of a diff stands to the file it is of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiffKind {
+    /// In the file before and after.
+    Context,
+    /// New in the file.
+    Added,
+    /// Gone from the file.
+    Removed,
+    /// Not of the file: where a part of it begins, or how much is not shown.
+    Note,
+}
+
+/// The colours of a diff's lines (see [`Doc::diff`]): the lines both have in `text`.
+fn diff_inks(t: &Palette, text: Color) -> [Color; 4] {
+    [text, t.positive, t.danger, t.text_faint]
+}
+
+/// How far the wash behind a changed line reaches past the text at each side.
+const WASH_BLEED: f32 = 10.0;
+
 /// Vertical space between blocks.
 const BLOCK_GAP: f32 = 12.0;
 /// Vertical space between list items.
@@ -114,6 +135,15 @@ pub enum Deco {
         /// Ticked.
         checked: bool,
     },
+    /// The wash behind the added or removed lines of a diff.
+    Wash {
+        /// Width.
+        w: f32,
+        /// Height.
+        h: f32,
+        /// Whether the lines were added (removed otherwise).
+        added: bool,
+    },
 }
 
 /// A decoration at a position inside the document.
@@ -157,6 +187,22 @@ pub struct Doc {
     code_scroll: Vec<f32>,
     /// Code block whose scrollbar is being dragged, and its scroll at the press.
     code_drag: Option<(usize, f32)>,
+    /// The lines of a diff ([`Doc::diff`]): its runs are drawn in the diff's colours.
+    diff: bool,
+    /// What the next draw washes under the text, over frames and other
+    /// decorations (so it shows in a code block too): what is marked and
+    /// what a search found.
+    washes: Vec<Wash>,
+}
+
+/// A stretch of a text piece washed in a colour, under its text.
+struct Wash {
+    /// The piece, and the bytes of its text.
+    piece: usize,
+    range: Range<usize>,
+    /// It runs on into the next piece: the last line gets a small tail.
+    continues: bool,
+    color: Color,
 }
 
 /// Layout state while building.
@@ -190,6 +236,76 @@ impl Doc {
             }],
             height,
             key: (width.to_bits(), scale.to_bits()),
+            ..Self::default()
+        }
+    }
+
+    /// A document of the `lines` of a diff in `style`, each after its sign
+    /// (`+`, `-`, or a blank) and wrapped at `width`: added and removed
+    /// lines in the diff's colours on a faint wash of them, the lines both
+    /// have in the colour it is drawn with, notes fainter.
+    #[must_use]
+    pub fn diff(fonts: &Fonts, lines: &[(DiffKind, String)], style: Style, width: f32, scale: f32) -> Self {
+        let mut text = String::new();
+        let mut spans = Vec::new();
+        // Where each line ends in `text`, to tell which line a wrapped row belongs to.
+        let mut ends = Vec::with_capacity(lines.len());
+        for (kind, line) in lines {
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            let start = text.len();
+            let (sign, ink) = match kind {
+                DiffKind::Context => (" ", 0),
+                DiffKind::Added => ("+", 1),
+                DiffKind::Removed => ("-", 2),
+                DiffKind::Note => ("", 3),
+            };
+            text.push_str(sign);
+            // A tab has no width of its own here; a carriage return is no part of the line.
+            for c in line.chars() {
+                match c {
+                    '\t' => text.push_str("    "),
+                    '\r' => {}
+                    c => text.push(c),
+                }
+            }
+            if ink != 0 && text.len() > start {
+                spans.push((start..text.len(), Run { ink, ..Run::plain(style.font) }));
+            }
+            ends.push((text.len(), *kind));
+        }
+        let layout = TextLayout::rich(fonts, &text, &spans, style, Some(width), scale);
+        let row = layout.line_height();
+        let mut decos: Vec<DecoPiece> = Vec::new();
+        for (start, _, y) in layout.line_spans() {
+            let kind = ends.get(ends.partition_point(|(end, _)| *end < start)).map(|(_, kind)| *kind);
+            let added = match kind {
+                Some(DiffKind::Added) => true,
+                Some(DiffKind::Removed) => false,
+                _ => continue,
+            };
+            // Rows of one kind that follow each other share a wash.
+            match decos.last_mut() {
+                Some(DecoPiece { y: top, deco: Deco::Wash { h, added: same, .. }, .. })
+                    if *same == added && (*top + *h - y).abs() < 0.5 =>
+                {
+                    *h += row;
+                }
+                _ => decos.push(DecoPiece {
+                    x: -WASH_BLEED,
+                    y,
+                    deco: Deco::Wash { w: width + 2.0 * WASH_BLEED, h: row, added },
+                }),
+            }
+        }
+        let height = layout.height();
+        Self {
+            texts: vec![TextPiece { x: 0.0, y: 0.0, layout, text, sep: "", links: Vec::new(), code: None }],
+            decos,
+            height,
+            key: (width.to_bits(), scale.to_bits()),
+            diff: true,
             ..Self::default()
         }
     }
@@ -246,7 +362,18 @@ impl Doc {
             block_ends.push((b.texts.len(), b.decos.len(), b.codes, y));
         }
         code_scroll.resize(b.codes, 0.0);
-        Self { texts: b.texts, decos: b.decos, height: y, blocks, block_ends, key, code_scroll, code_drag }
+        Self {
+            texts: b.texts,
+            decos: b.decos,
+            height: y,
+            blocks,
+            block_ends,
+            key,
+            code_scroll,
+            code_drag,
+            diff: false,
+            washes: Vec::new(),
+        }
     }
 
     /// How far a piece is scrolled sideways (code only).
@@ -317,19 +444,45 @@ impl Doc {
         self.texts.last().map_or((0, 0), |p| (self.texts.len() - 1, p.text.len()))
     }
 
-    /// Draws the selection between two ordered positions.
-    pub fn draw_selection(&self, p: &mut Painter, origin: (f32, f32), from: DocPos, to: DocPos) {
-        let color = p.theme.selection;
+    /// Has the next draw show the selection between two ordered positions, in `color`.
+    pub fn mark_selection(&mut self, from: DocPos, to: DocPos, color: Color) {
         for (index, piece) in self.texts.iter().enumerate().take(to.0 + 1).skip(from.0) {
             let first = if index == from.0 { from.1 } else { 0 };
             let last = if index == to.0 { to.1 } else { piece.text.len() };
-            let continues = index < to.0;
+            self.washes.push(Wash { piece: index, range: first..last, continues: index < to.0, color });
+        }
+    }
+
+    /// Has the next draw wash the bytes `range` of the text piece `piece`
+    /// in `color`: a place a search found. Returns the top and bottom of
+    /// where that is, for a document drawn at `origin`, or `None` when the
+    /// document has no such text.
+    pub fn mark(&mut self, origin: (f32, f32), piece: usize, range: Range<usize>, color: Color) -> Option<(f32, f32)> {
+        let text = self.texts.get(piece)?;
+        text.text.get(range.clone())?;
+        let line_h = text.layout.line_height();
+        let top = origin.1 + text.y;
+        let lines = text.layout.selection_spans(range.start, range.end, false).map(|(_, _, y)| top + y);
+        let ends =
+            lines.fold(None, |ends: Option<(f32, f32)>, y| Some((ends.map_or(y, |(first, _)| first), y + line_h)));
+        self.washes.push(Wash { piece, range, continues: false, color });
+        ends
+    }
+
+    /// Draws what was to be washed under the text, once.
+    fn draw_washes(&mut self, p: &mut Painter, origin: (f32, f32)) {
+        let view = p.clip();
+        for wash in std::mem::take(&mut self.washes) {
+            let Some(piece) = self.texts.get(wash.piece) else { continue };
             let line_h = piece.layout.line_height();
             let left = origin.0 + piece.x - self.scroll_of(piece);
             // Scrolled code stays inside its frame.
             let clip = piece.code.map(|(_, window)| p.push_clip(code_window(origin, piece, window)));
-            for (x0, x1, y) in piece.layout.selection_spans(first, last, continues) {
-                p.rect(Rect::new(left + x0, origin.1 + piece.y + y, x1 - x0, line_h), color, 2.0);
+            for (x0, x1, y) in piece.layout.selection_spans(wash.range.start, wash.range.end, wash.continues) {
+                let top = origin.1 + piece.y + y;
+                if top < view.bottom() && top + line_h > view.y {
+                    p.rect(Rect::new(left + x0, top, x1 - x0, line_h), wash.color, 2.0);
+                }
             }
             if let Some(clip) = clip {
                 p.set_clip(clip);
@@ -398,6 +551,12 @@ impl Doc {
                         p.rect(Rect::new(x + col, y, 1.0, table_h), t.border, 0.0);
                     }
                 }
+                Deco::Wash { w, h, added } => {
+                    if piece.y > bottom || piece.y + h < top {
+                        continue;
+                    }
+                    p.rect(Rect::new(x, y, *w, *h), fade(if *added { t.positive } else { t.danger }, 0.1), 0.0);
+                }
                 Deco::Marker(layout) => p.text(layout, x, y, t.text_faint),
                 Deco::Checkbox { checked } => {
                     let check = Rect::new(x, y + 4.0, 14.0, 14.0);
@@ -411,7 +570,9 @@ impl Doc {
             }
         }
 
-        let inks = inks(&t, text);
+        self.draw_washes(p, origin);
+        let (prose, diff) = (inks(&t, text), diff_inks(&t, text));
+        let inks: &[Color] = if self.diff { &diff } else { &prose };
         let code_bg = fade(t.text, 0.08);
         for piece in &self.texts {
             if piece.y > bottom || piece.y + piece.layout.height() < top {
@@ -419,7 +580,7 @@ impl Doc {
             }
             let (x, y) = (origin.0 + piece.x - self.scroll_of(piece), origin.1 + piece.y);
             let clip = piece.code.map(|(_, window)| p.push_clip(code_window(origin, piece, window)));
-            p.rich(&piece.layout, x, y, &inks, code_bg);
+            p.rich(&piece.layout, x, y, inks, code_bg);
             if let Some(clip) = clip {
                 p.set_clip(clip);
             }
@@ -805,6 +966,41 @@ mod tests {
         assert!(d.texts.windows(2).all(|w| w[0].y <= w[1].y + 0.01));
         assert!(d.height > 200.0);
         assert_eq!(d.code(0), Some("fn main() {}"));
+    }
+
+    #[test]
+    fn a_diff_washes_what_was_added_and_removed() {
+        let fonts = Fonts::load();
+        let style = Style::mono(12.5);
+        let lines = [
+            (DiffKind::Context, "a"),
+            (DiffKind::Removed, "b"),
+            (DiffKind::Removed, "c"),
+            (DiffKind::Added, "d"),
+            (DiffKind::Note, "… 3 more lines"),
+        ];
+        let d = Doc::diff(&fonts, &lines.map(|(kind, line)| (kind, line.to_owned())), style, 400.0, 1.0);
+        assert_eq!(d.texts[0].text, " a\n-b\n-c\n+d\n… 3 more lines");
+        let washes = |doc: &Doc| -> Vec<(bool, f32, f32)> {
+            let wash = |piece: &DecoPiece| match piece.deco {
+                Deco::Wash { h, added, .. } => Some((added, piece.y, h)),
+                _ => None,
+            };
+            doc.decos.iter().filter_map(wash).collect()
+        };
+        // The two removed lines share a wash; the lines both have, and the note, have none.
+        let row = d.texts[0].layout.line_height();
+        assert_eq!(washes(&d), [(false, row, 2.0 * row), (true, 3.0 * row, row)]);
+        assert!((d.height - 5.0 * row).abs() < 0.5 && d.fits(400.0, 1.0));
+        // A line too long for the width wraps, and its wash goes with every row of it.
+        let long = Doc::diff(&fonts, &[(DiffKind::Added, "x".repeat(200))], style, 300.0, 1.0);
+        let rows = long.texts[0].layout.line_count();
+        assert!(rows > 1);
+        assert_eq!(washes(&long), [(true, 0.0, rows as f32 * row)]);
+        // A tab takes four columns, a carriage return none; no lines are no height.
+        let tabbed = Doc::diff(&fonts, &[(DiffKind::Context, "\tx\r".to_owned())], style, 300.0, 1.0);
+        assert_eq!(tabbed.texts[0].text, "     x");
+        assert!(washes(&Doc::diff(&fonts, &[], style, 300.0, 1.0)).is_empty());
     }
 
     #[test]

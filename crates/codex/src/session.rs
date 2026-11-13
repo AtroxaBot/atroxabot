@@ -1,5 +1,6 @@
 //! A running `codex app-server` process: its pipes, its reader threads and what the caller asks of it.
 
+use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,6 +51,8 @@ struct Shared {
     failure: Mutex<Option<String>>,
     /// The session was closed or the process ended: nothing is accepted any more.
     closed: AtomicBool,
+    /// The end of what the binary wrote to stderr, to say why it stopped.
+    said: Mutex<VecDeque<String>>,
 }
 
 /// Locks `mutex`; a panic in the caller's callback must not take the session down with it.
@@ -103,6 +106,7 @@ impl Session {
             callback: Mutex::new(Some(callback)),
             failure: Mutex::new(None),
             closed: AtomicBool::new(false),
+            said: Mutex::new(VecDeque::new()),
         });
         // From here on an early return drops the session, which stops the process.
         let session = Self { shared };
@@ -188,6 +192,12 @@ impl Session {
     /// [`Error::Io`] when the write fails.
     pub fn answer(&self, request_id: &str, answers: &[(String, Vec<String>)]) -> Result<(), Error> {
         self.shared.reply(|machine| machine.answer(request_id, answers))
+    }
+
+    /// Changes the model and the effort the following turns are started with; `None` leaves the choice to
+    /// Codex. A message that already waits for its turn goes with them too.
+    pub fn retune(&self, model: Option<String>, effort: Option<String>) {
+        lock(&self.shared.machine).retune(model, effort);
     }
 
     /// Has the conversation summarised to make room. It happens in a turn of its own, during which messages
@@ -331,6 +341,7 @@ impl Shared {
                 Ok(Line::Text(line)) => {
                     let line = strip_ansi(line.trim_end());
                     if !line.is_empty() {
+                        keep_said(&mut lock(&self.said), &line);
                         self.emit(Event::Stderr(line));
                     }
                 }
@@ -354,7 +365,10 @@ impl Shared {
         let pipe_error = pipe_error.map(|error| format!("reading from the Codex binary failed: {error}"));
         let error = failure.or(pipe_error).or_else(|| match exit_code {
             Some(0) => None,
-            Some(code) => Some(format!("the Codex binary exited with code {code}")),
+            Some(code) => Some(match explanation(&lock(&self.said)) {
+                Some(said) => format!("the Codex binary exited with code {code} ({said})"),
+                None => format!("the Codex binary exited with code {code}"),
+            }),
             None => Some("the Codex binary was terminated by a signal".into()),
         });
         self.closed.store(true, Ordering::Relaxed);
@@ -502,6 +516,39 @@ impl Drop for Probe {
     }
 }
 
+/// How many of the binary's last stderr lines are kept to explain an exit.
+const SAID_LINES: usize = 40;
+/// Longest stderr line kept, in bytes; the rest of a longer one is dropped.
+const SAID_LINE: usize = 400;
+
+/// Keeps `line` among the last [`SAID_LINES`] of `said`, cut to [`SAID_LINE`] bytes.
+fn keep_said(said: &mut VecDeque<String>, line: &str) {
+    let mut end = line.len().min(SAID_LINE);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    if said.len() == SAID_LINES {
+        said.pop_front();
+    }
+    said.push_back(line.get(..end).unwrap_or_default().to_owned());
+}
+
+/// What the binary said about why it stopped: the last of its stderr lines that names an error, else its last
+/// line. Stack frames (`at …`) and the runtime's own banner (`Bun v1.2 (…)`, `Node.js v22`) explain nothing.
+fn explanation(said: &VecDeque<String>) -> Option<&str> {
+    let telling = |line: &&String| {
+        let line = line.trim();
+        !line.is_empty() && !line.starts_with("at ") && !line.starts_with("Bun v") && !line.starts_with("Node.js v")
+    };
+    let names_error = |line: &&String| {
+        let lower = line.to_ascii_lowercase();
+        ["error", "exception", "panic", "fatal"].iter().any(|word| lower.contains(word))
+    };
+    let mut lines = said.iter().rev().filter(telling);
+    let last = lines.clone().next();
+    lines.find(names_error).or(last).map(|line| line.trim())
+}
+
 /// `line` without the escape sequences that colour a terminal, which the binary's log lines carry.
 fn strip_ansi(line: &str) -> String {
     let mut plain = String::with_capacity(line.len());
@@ -557,6 +604,37 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn an_exit_is_explained_by_the_error_line_not_the_stack_or_banner() {
+        let mut said = VecDeque::new();
+        for line in [
+            "starting",
+            "TypeError: undefined is not an object",
+            "    at run (main.js:1:2)",
+            "",
+            "Bun v1.3.1 (Windows x64)",
+        ] {
+            keep_said(&mut said, line);
+        }
+        assert_eq!(explanation(&said), Some("TypeError: undefined is not an object"));
+        let mut quiet = VecDeque::new();
+        keep_said(&mut quiet, "shutting down");
+        assert_eq!(explanation(&quiet), Some("shutting down"));
+        assert_eq!(explanation(&VecDeque::new()), None);
+    }
+
+    #[test]
+    fn only_the_end_of_stderr_is_kept_and_long_lines_are_cut_whole_characters() {
+        let mut said = VecDeque::new();
+        for n in 0..SAID_LINES + 5 {
+            keep_said(&mut said, &format!("line {n}"));
+        }
+        assert_eq!(said.len(), SAID_LINES);
+        assert_eq!(said.front().map(String::as_str), Some("line 5"));
+        keep_said(&mut said, &"é".repeat(SAID_LINE));
+        assert_eq!(said.back().map(String::len), Some(SAID_LINE));
+    }
     use crate::{Approval, Sandbox, TurnStatus};
 
     #[test]

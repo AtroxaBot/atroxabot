@@ -177,6 +177,11 @@ impl Machine {
         out
     }
 
+    /// The turns started from now on think with `model` at `effort`; `None` leaves that to Codex.
+    pub(crate) fn retune(&mut self, model: Option<String>, effort: Option<String>) {
+        (self.options.model, self.options.effort) = (model, effort);
+    }
+
     /// Takes a command of the caller's and returns the lines to write for it: none while it has to wait.
     pub(crate) fn command(&mut self, command: Command) -> Vec<Value> {
         let mut lines = Vec::new();
@@ -792,6 +797,25 @@ mod tests {
             "threadId": THREAD, "expectedTurnId": TURN, "input": input("more"),
         }});
         assert_eq!(out, Output { lines: vec![steer], ..Output::default() });
+    }
+
+    #[test]
+    fn another_model_or_effort_goes_with_the_next_turn() {
+        let options = Options { model: Some("gpt-6.1-sol".into()), effort: Some("low".into()), ..Options::default() };
+        let mut machine = Machine::new(&options);
+        machine.hello();
+        ok(&mut machine, 1, &json!({"userAgent": USER_AGENT}));
+        ok(&mut machine, 2, &thread_result(THREAD));
+        let started = |machine: &mut Machine| {
+            let lines = machine.command(text_message("ping", None));
+            (lines[0]["method"].clone(), lines[0]["params"]["model"].clone(), lines[0]["params"]["effort"].clone())
+        };
+        machine.retune(Some("gpt-6-astra".into()), Some("high".into()));
+        assert_eq!(started(&mut machine), (json!("turn/start"), json!("gpt-6-astra"), json!("high")));
+        // Left to Codex, neither is named.
+        let mut machine = ready();
+        machine.retune(None, None);
+        assert_eq!(started(&mut machine), (json!("turn/start"), Value::Null, Value::Null));
     }
 
     #[test]

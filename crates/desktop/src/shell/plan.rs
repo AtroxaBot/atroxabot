@@ -148,7 +148,7 @@ impl Shell {
     }
 
     /// Takes in what a check said of the limits of `account`. A limit that
-    /// stopped it and is behind it now is over: its notice goes, and the
+    /// stopped it and is behind it now is over: the
     /// sessions waiting to go on with it (on it, or with any account of its
     /// kind when another may take over) are looked at again at once.
     fn take_limits(&mut self, account: &str, limits: Limits, complete: bool, actions: &mut Vec<Action>) {
@@ -158,7 +158,6 @@ impl Shell {
         if !was_out || self.out_until(account).is_some() {
             return;
         }
-        self.notices.retain(|notice| notice.account != account);
         let switching = self.out_of_limits() == OutOfLimits::Switch;
         let waiting: Vec<String> = (self.threads.iter())
             .filter(|(_, thread)| thread.resume.is_some())
@@ -299,17 +298,16 @@ mod tests {
         let fable = LimitWindow { label: "Fable".into(), ..window("seven_day_overage_included", 1.0, resets) };
         let refused = Limits { at: unix_now(), status: "rejected".into(), resets, windows: vec![fable.clone()] };
         shell.agent_event(&session, AgentEvent::Limits(refused), &mut actions);
-        assert!(shell.notices.iter().any(|notice| notice.account == account));
         shell.threads.get_mut(&session).unwrap().resume = Some(Resume { at: resets + 60, all_out: false });
         // Another session waits for the other account's limit.
-        shell.new_session(&mut actions);
+        shell.new_session();
         shell.send("Elsewhere", false, Vec::new(), &mut actions);
         let elsewhere = shell.current.clone().unwrap();
         let other = shell.threads.get_mut(&elsewhere).unwrap();
         other.session.provider = "work".into();
         other.resume = Some(Resume { at: resets + 60, all_out: false });
 
-        // The user reset it on claude.ai; the check says so: the notice goes and the session looks at once.
+        // The user reset it on claude.ai; the check says so: the session looks at once.
         let now = unix_now();
         let windows = vec![window("five_hour", 0.1, now + 600), LimitWindow { used: 0.0, ..fable }];
         let check = PlanCheck::Limits { limits: Limits { at: now, windows, ..Limits::default() }, complete: true };
@@ -317,7 +315,6 @@ mod tests {
         shell.limits_checked(account, Ok(check), &mut actions);
         assert!(!shell.checking(account) && actions.iter().any(|a| matches!(a, Action::SaveLimits(_))));
         assert_eq!(shell.out_until(account), None);
-        assert!(!shell.notices.iter().any(|notice| notice.account == account), "its notice is gone");
         assert!(shell.threads[&session].resume.as_ref().is_some_and(|resume| resume.at <= unix_now()));
         let theirs = shell.threads[&elsewhere].resume.as_ref().map(|resume| resume.at);
         assert_eq!(theirs, Some(resets + 60), "a wait for another account's limit stays as it was");

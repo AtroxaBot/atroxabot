@@ -11,6 +11,7 @@ use atroxabot_core::stats::Ledger;
 use atroxabot_core::{ContextPart, LimitWindow, Limits, Todo, TodoState};
 use winit::window::CursorIcon;
 
+use super::change::Touched;
 use super::menu::Menu;
 use super::plan;
 use super::thread::{Thread, agent_mark};
@@ -38,6 +39,53 @@ const AGENTS_SHOWN: usize = 8;
 const FRESH: u64 = 10 * 60;
 /// The diff's text.
 const MONO: Style = Style::mono(12.5);
+/// From how full a context on, its place in the provider's prompt cache is worth a line: a smaller one
+/// costs little to read anew.
+const CACHE_MATTERS: u64 = 100_000;
+
+/// What the panel says, under a context of `context` tokens, of its place in the provider's prompt cache,
+/// kept until `until` (Unix seconds, 0 when not known), and whether that is over at `now`. `None` when
+/// there is nothing worth saying.
+fn cache_note(context: u64, until: u64, now: u64) -> Option<(String, bool)> {
+    if until == 0 || context < CACHE_MATTERS {
+        return None;
+    }
+    if until <= now {
+        return Some(("No longer cached".to_owned(), true));
+    }
+    Some((format!("Cached for {} more min", (until - now).div_ceil(60)), false))
+}
+
+/// What resting the mouse on that line explains.
+fn cache_tip(context: u64, over: bool) -> Tip {
+    let size = compact(context);
+    Tip::text(if over {
+        format!(
+            "The provider no longer keeps this conversation cached: the next message counts all {size} tokens \
+             in full, once. Compacting first costs about the same and leaves a small context for what follows."
+        )
+    } else {
+        format!(
+            "Until then a message reads this conversation from the provider's cache, at about a tenth of the \
+             usage. Later, all {size} tokens count in full, once. Compacting before that is cheap."
+        )
+    })
+}
+
+/// Words that act, ending at `right`: brighter under the mouse. Returns whether they were clicked.
+fn link(p: &mut Painter, ui: &mut Ui, words: &str, (right, y): (f32, f32)) -> bool {
+    let t = p.theme;
+    let text = p.layout(words, theme::TINY, None);
+    let rect = Rect::new(right - text.width() - 6.0, y - 3.0, text.width() + 12.0, text.height() + 6.0);
+    let hovered = ui.hovered(rect);
+    let hover = ui.anim(id(("link", words)), f32::from(u8::from(hovered)));
+    p.rect(rect, fade(t.hover, hover), theme::RADIUS_SM);
+    p.text(&text, right - text.width(), y, mix(t.text_muted, t.text, hover));
+    if hovered {
+        ui.cursor = CursorIcon::Pointer;
+    }
+    hovered && ui.clicked(rect)
+}
 
 /// The repository of the folder the open session works in.
 #[derive(Default)]
@@ -56,6 +104,10 @@ pub(super) struct DiffView {
     file: GitFile,
     /// `None` while git is asked.
     text: Option<Result<String, String>>,
+    /// The text is the app's own (what a turn did to the file, see
+    /// `change.rs`), not git's: every line of it is a line of the file's,
+    /// and nothing git answers replaces it.
+    own: bool,
     scroll: Scroll,
     /// How far its long lines are scrolled sideways.
     across: Scroll,
@@ -145,7 +197,7 @@ fn change_ink(t: &Palette, change: Change) -> Color {
 }
 
 /// "+12" and "−3" ending at `right`, in the diff's colours. Returns where they start.
-fn counts(p: &mut Painter, (added, removed): (u32, u32), right: f32, y: f32) -> f32 {
+pub(super) fn counts(p: &mut Painter, (added, removed): (u32, u32), right: f32, y: f32) -> f32 {
     let t = p.theme;
     let mut x = right;
     for (count, sign, ink) in [(removed, '−', t.danger), (added, '+', t.positive)] {
@@ -162,7 +214,14 @@ fn counts(p: &mut Painter, (added, removed): (u32, u32), right: f32, y: f32) -> 
 impl DiffView {
     /// The diff of `file`, still to be read.
     pub fn new(file: GitFile) -> Self {
-        Self { file, text: None, scroll: Scroll::default(), across: Scroll::default() }
+        Self { file, text: None, own: false, scroll: Scroll::default(), across: Scroll::default() }
+    }
+
+    /// What a turn did to a file, as its own edits say.
+    pub fn of_turn(file: &Touched) -> Self {
+        let named =
+            GitFile { path: file.path.clone(), change: Change::Modified, added: file.added, removed: file.removed };
+        Self { text: Some(Ok(file.text())), own: true, ..Self::new(named) }
     }
 
     /// Draws the diff over `view`. Returns whether it was closed.
@@ -212,14 +271,21 @@ impl DiffView {
         let clip = p.push_clip(body);
         let first = (offset / LINE_H) as usize;
         let visible = (body.h / LINE_H) as usize + 2;
+        // The lines that name a file come before its first part ("@@"): within a part a line is what its
+        // first character says, so a removed "-- note" is no "---" header.
+        let mut part = self.own;
         // Only the lines in view are laid out.
-        for (index, line) in text.lines().enumerate().skip(first).take(visible) {
+        for (index, line) in text.lines().enumerate().take(first + visible) {
+            if line.starts_with("diff ") {
+                part = false;
+            }
+            let names = !part && ["+++", "---", "diff ", "index "].iter().any(|start| line.starts_with(start));
+            part |= line.starts_with("@@");
+            if index < first {
+                continue;
+            }
             let y = body.y + 8.0 + index as f32 * LINE_H - offset;
-            let (ink, wash) = if line.starts_with("+++")
-                || line.starts_with("---")
-                || line.starts_with("diff ")
-                || line.starts_with("index ")
-            {
+            let (ink, wash) = if names {
                 (t.text_faint, None)
             } else if line.starts_with('+') {
                 (t.positive, Some(fade(t.positive, 0.1)))
@@ -290,6 +356,7 @@ impl Shell {
             Report::Diff { path, text } => {
                 if let Some(Modal::Diff(view)) = &mut self.modal
                     && view.file.path == path
+                    && !view.own
                 {
                     view.text = Some(text);
                 }
@@ -313,14 +380,26 @@ impl Shell {
         }
     }
 
+    /// When the open session's line about the provider's cache changes
+    /// next (it runs out), in Unix seconds, while the panel shows one: the
+    /// app wakes for it.
+    pub(super) fn cache_turns(&self) -> Option<u64> {
+        let thread = self.thread().filter(|thread| self.config.panel && !thread.busy)?;
+        let (until, now) = (thread.session.cached_until, atroxabot_core::unix_now());
+        cache_note(thread.session.context_tokens(), until, now).filter(|(_, over)| !over).map(|_| until)
+    }
+
     /// What the open session used, as rows of a name and a number; resting
-    /// the mouse on the context shows what it holds. Returns where they end.
-    fn draw_usage(&self, p: &mut Painter, ui: &mut Ui, (x, mut y, w): (f32, f32, f32)) -> f32 {
+    /// the mouse on the context shows what it holds. Under a large context
+    /// a line says how long the provider keeps it cached, with *Compact*
+    /// beside it. Returns where they end, and whether that was clicked.
+    fn draw_usage(&self, p: &mut Painter, ui: &mut Ui, (x, mut y, w): (f32, f32, f32)) -> (f32, bool) {
         let t = p.theme;
         let Some(thread) = self.thread().filter(|thread| thread.session.tokens() > 0) else {
             p.label("Nothing used yet", theme::SMALL, x, y, t.text_faint);
-            return y + 26.0;
+            return (y + 26.0, false);
         };
+        let mut compacting = false;
         let total = Ledger::collect(std::slice::from_ref(&thread.session)).summary(0).total;
         let context = thread.session.context_tokens();
         // How much the model takes: what its engine said, or what its provider lists.
@@ -359,8 +438,16 @@ impl Shell {
                 );
                 y += 14.0;
             }
+            // While it works, every request keeps the cache: there is nothing to say.
+            let note = cache_note(context, thread.session.cached_until, atroxabot_core::unix_now());
+            if let Some((note, over)) = note.filter(|_| index == 0 && !thread.busy) {
+                p.label(&note, theme::TINY, x, y - 2.0, t.text_faint);
+                ui.tip(id("cache"), Rect::new(x - 8.0, y - 6.0, w + 16.0, 22.0), || cache_tip(context, over));
+                compacting = link(p, ui, "Compact", (x + w, y - 2.0));
+                y += 22.0;
+            }
         }
-        y
+        (y, compacting)
     }
 
     /// The agent's task list, when it keeps one: what is done, what it is
@@ -583,7 +670,11 @@ impl Shell {
         let clip = p.push_clip(rect);
         let (x, w) = (rect.x + 16.0, rect.w - 32.0);
         field_label(p, icon::LAYERS, "SESSION", x, rect.y + 20.0);
-        let mut y = self.draw_usage(p, ui, (x, rect.y + 48.0, w)) + 8.0;
+        let (used, compacting) = self.draw_usage(p, ui, (x, rect.y + 48.0, w));
+        if compacting {
+            self.send("/compact", false, Vec::new(), actions);
+        }
+        let mut y = used + 8.0;
         y = self.draw_todos(p, ui, (x, y, w));
         y = self.draw_subagents(p, ui, (x, y, w));
         y = self.draw_background(p, ui, (x, y, w));
@@ -760,6 +851,18 @@ In the parser"
         assert_eq!(rows, [("System prompt", "3.0k"), ("Messages", "7.0k"), ("Free space", "190.0k")]);
         assert!(context_tip(&parts, 0).rows.iter().all(|(name, _)| name != "Free space"), "no window, no free space");
         assert!(context_tip(&[], 200_000).rows.is_empty(), "not known yet: a line says when it will be");
+    }
+
+    #[test]
+    fn a_large_context_says_how_long_it_stays_cached() {
+        // Small, or not known: nothing to say.
+        assert_eq!(cache_note(CACHE_MATTERS - 1, 5_000, 1_000), None);
+        assert_eq!(cache_note(400_000, 0, 1_000), None);
+        // Minutes left are rounded up, so the last one reads "1", never "0".
+        assert_eq!(cache_note(400_000, 4_600, 1_000), Some(("Cached for 60 more min".into(), false)));
+        assert_eq!(cache_note(400_000, 1_001, 1_000), Some(("Cached for 1 more min".into(), false)));
+        assert_eq!(cache_note(400_000, 1_000, 1_000), Some(("No longer cached".into(), true)));
+        assert!(cache_tip(412_300, true).text.contains("412.3k") && cache_tip(412_300, false).text.contains("tenth"));
     }
 
     #[test]

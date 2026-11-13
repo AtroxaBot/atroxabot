@@ -271,7 +271,7 @@ impl Shell {
         } else if let Some(session) = open {
             self.open_session(&session, actions);
         } else if fresh {
-            self.new_session(actions);
+            self.new_session();
         }
     }
 }

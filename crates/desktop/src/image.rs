@@ -10,19 +10,21 @@
 //! A picture opened to be looked at is a thumbnail too, a large one: the
 //! whole image, as large as fits a box ([`ImageKey::whole`]).
 //!
-//! PNG, JPEG and WebP are decoded: the formats portraits are accepted in.
+//! PNG, JPEG and WebP are decoded (by `atroxabot_core::picture`): the
+//! formats portraits are accepted in.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
+
+pub use atroxabot_core::picture::Pixels;
+use atroxabot_core::picture::{cover, decode, fit, orient};
 
 use crate::atlas::Shelves;
 use crate::text::{ATLAS_SIZE, Upload, pad};
 
 /// Largest file read for a thumbnail.
 const MAX_FILE: u64 = 32 << 20;
-/// Largest image decoded, in pixels (about 190 MB of RGBA).
-const MAX_PIXELS: usize = 48_000_000;
 /// Largest thumbnail side, in pixels.
 const MAX_THUMB: u32 = 1024;
 /// Largest whole picture, in pixels: as wide as the atlas takes, and short
@@ -42,9 +44,6 @@ pub struct ImageKey {
     /// instead of one that covers `w`×`h` and is cropped to it.
     pub whole: bool,
 }
-
-/// Straight-alpha RGBA pixels, with their width and height.
-pub type Pixels = (Vec<u8>, u32, u32);
 
 /// What [`ImageAtlas::lookup`] found.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -177,217 +176,6 @@ pub fn thumbnail(key: &ImageKey) -> Result<Pixels, String> {
     Ok(if swap { (upright, th, tw) } else { (upright, tw, th) })
 }
 
-/// The size of an image of `size` made as large as fits `within`, its
-/// proportions kept, and never larger than it is.
-fn fit(size: (u32, u32), within: (u32, u32)) -> (u32, u32) {
-    let scale = (f64::from(within.0) / f64::from(size.0.max(1))).min(f64::from(within.1) / f64::from(size.1.max(1)));
-    let scale = scale.min(1.0);
-    let scaled = |length: u32, most: u32| ((f64::from(length) * scale).round() as u32).clamp(1, most.max(1));
-    (scaled(size.0, within.0), scaled(size.1, within.1))
-}
-
-/// Decodes a PNG, JPEG or WebP to straight-alpha RGBA, with its EXIF
-/// orientation (1 when absent; only JPEG's is read).
-fn decode(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, u8), String> {
-    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
-        let (rgba, w, h) = decode_png(bytes)?;
-        Ok((rgba, w, h, 1))
-    } else if bytes.starts_with(&[0xFF, 0xD8]) {
-        decode_jpeg(bytes)
-    } else if bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP") {
-        let (rgba, w, h) = decode_webp(bytes)?;
-        Ok((rgba, w, h, 1))
-    } else {
-        Err("not a PNG, JPEG or WebP image".into())
-    }
-}
-
-/// Decodes a WebP (the first frame, if animated) to straight-alpha RGBA.
-fn decode_webp(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
-    let mut decoder = image_webp::WebPDecoder::new(std::io::Cursor::new(bytes)).map_err(|e| e.to_string())?;
-    decoder.set_memory_limit(MAX_PIXELS * 4);
-    let (w, h) = decoder.dimensions();
-    // Checked before allocating: a WebP header may claim 16383² pixels.
-    if w as usize * h as usize > MAX_PIXELS {
-        return Err("the image is too large".into());
-    }
-    let mut buf = vec![0; decoder.output_buffer_size().ok_or("the image is too large")?];
-    decoder.read_image(&mut buf).map_err(|e| e.to_string())?;
-    if decoder.has_alpha() {
-        return Ok((buf, w, h));
-    }
-    Ok((buf.as_chunks::<3>().0.iter().flat_map(|p| [p[0], p[1], p[2], 255]).collect(), w, h))
-}
-
-/// Decodes a PNG to straight-alpha RGBA.
-pub fn decode_png(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
-    let mut decoder = png::Decoder::new_with_limits(std::io::Cursor::new(bytes), png::Limits { bytes: MAX_PIXELS * 4 });
-    decoder.set_transformations(png::Transformations::normalize_to_color8());
-    let mut reader = decoder.read_info().map_err(|e| e.to_string())?;
-    let size = reader.output_buffer_size().ok_or("the image is too large")?;
-    let mut buf = vec![0; size];
-    let info = reader.next_frame(&mut buf).map_err(|e| e.to_string())?;
-    let (w, h) = (info.width, info.height);
-    if w as usize * h as usize > MAX_PIXELS {
-        return Err("the image is too large".into());
-    }
-    let rows = buf.chunks_exact(info.line_size).take(h as usize);
-    let mut rgba = Vec::with_capacity(w as usize * h as usize * 4);
-    for row in rows {
-        let row = &row[..(w as usize * info.color_type.samples()).min(row.len())];
-        match info.color_type {
-            png::ColorType::Rgba => rgba.extend_from_slice(row),
-            png::ColorType::Rgb => {
-                row.as_chunks::<3>().0.iter().for_each(|p| rgba.extend_from_slice(&[p[0], p[1], p[2], 255]));
-            }
-            png::ColorType::GrayscaleAlpha => {
-                row.as_chunks::<2>().0.iter().for_each(|p| rgba.extend_from_slice(&[p[0], p[0], p[0], p[1]]));
-            }
-            png::ColorType::Grayscale => row.iter().for_each(|&g| rgba.extend_from_slice(&[g, g, g, 255])),
-            png::ColorType::Indexed => return Err("unexpanded palette image".into()),
-        }
-    }
-    if rgba.len() != w as usize * h as usize * 4 {
-        return Err("truncated image data".into());
-    }
-    Ok((rgba, w, h))
-}
-
-/// Decodes a JPEG to RGBA, with its EXIF orientation (1 when absent).
-fn decode_jpeg(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, u8), String> {
-    use zune_jpeg::zune_core::bytestream::ZCursor;
-    use zune_jpeg::zune_core::colorspace::ColorSpace;
-    use zune_jpeg::zune_core::options::DecoderOptions;
-
-    let side = (MAX_PIXELS as f64).sqrt() as usize * 2;
-    let options =
-        DecoderOptions::default().jpeg_set_out_colorspace(ColorSpace::RGBA).set_max_width(side).set_max_height(side);
-    let mut decoder = zune_jpeg::JpegDecoder::new_with_options(ZCursor::new(bytes), options);
-    decoder.decode_headers().map_err(|e| e.to_string())?;
-    let info = decoder.info().ok_or("missing image header")?;
-    let (w, h) = (u32::from(info.width), u32::from(info.height));
-    if w as usize * h as usize > MAX_PIXELS {
-        return Err("the image is too large".into());
-    }
-    let orientation = decoder.exif().map_or(1, |exif| exif_orientation(exif));
-    let len = w as usize * h as usize * 4;
-    let mut rgba = vec![0; decoder.output_buffer_size().ok_or("missing image header")?.max(len)];
-    decoder.decode_into(&mut rgba).map_err(|e| e.to_string())?;
-    rgba.truncate(len);
-    Ok((rgba, w, h, orientation))
-}
-
-/// The orientation tag (1–8) of EXIF data starting at its TIFF header; 1 if
-/// absent or malformed.
-fn exif_orientation(exif: &[u8]) -> u8 {
-    let big = match exif.get(..4) {
-        Some(b"MM\0*") => true,
-        Some(b"II*\0") => false,
-        _ => return 1,
-    };
-    let u16_at = |at: usize| {
-        exif.get(at..at + 2)
-            .map(|b| if big { u16::from_be_bytes([b[0], b[1]]) } else { u16::from_le_bytes([b[0], b[1]]) })
-    };
-    let u32_at = |at: usize| {
-        exif.get(at..at + 4).map(|b| {
-            if big {
-                u32::from_be_bytes([b[0], b[1], b[2], b[3]])
-            } else {
-                u32::from_le_bytes([b[0], b[1], b[2], b[3]])
-            }
-        })
-    };
-    let Some(ifd) = u32_at(4).map(|o| o as usize) else {
-        return 1;
-    };
-    let count = u16_at(ifd).unwrap_or(0);
-    for i in 0..usize::from(count) {
-        let entry = ifd + 2 + i * 12;
-        if u16_at(entry) == Some(0x0112) {
-            return u16_at(entry + 8).filter(|o| (1..=8).contains(o)).map_or(1, |o| o as u8);
-        }
-    }
-    1
-}
-
-/// Scales `src` (`sw`×`sh` RGBA) to cover `dw`×`dh`, cropping the overflow
-/// evenly, by averaging every source pixel under each target pixel (with
-/// alpha weighting, so transparent edges do not darken).
-fn cover(src: &[u8], sw: u32, sh: u32, dw: u32, dh: u32) -> Vec<u8> {
-    let mut out = vec![0; dw as usize * dh as usize * 4];
-    if sw == 0 || sh == 0 || dw == 0 || dh == 0 {
-        return out;
-    }
-    // Source pixels per target pixel, the same on both axes.
-    let step = f64::from(sw) / f64::from(dw);
-    let step = step.min(f64::from(sh) / f64::from(dh));
-    let x0 = (f64::from(sw) - step * f64::from(dw)) * 0.5;
-    let y0 = (f64::from(sh) - step * f64::from(dh)) * 0.5;
-    let span = |start: f64, i: u32, limit: u32| {
-        let a = ((start + step * f64::from(i)) as u32).min(limit - 1);
-        let b = ((start + step * f64::from(i + 1)) as u32).clamp(a + 1, limit);
-        a..b
-    };
-    for ty in 0..dh {
-        let rows = span(y0, ty, sh);
-        for tx in 0..dw {
-            let cols = span(x0, tx, sw);
-            let mut sum = [0u64; 4];
-            for y in rows.clone() {
-                let row = y as usize * sw as usize;
-                for x in cols.clone() {
-                    let p = &src[(row + x as usize) * 4..][..4];
-                    let a = u64::from(p[3]);
-                    sum[0] += u64::from(p[0]) * a;
-                    sum[1] += u64::from(p[1]) * a;
-                    sum[2] += u64::from(p[2]) * a;
-                    sum[3] += a;
-                }
-            }
-            let n = u64::from(rows.end - rows.start) * u64::from(cols.end - cols.start);
-            let o = &mut out[(ty as usize * dw as usize + tx as usize) * 4..][..4];
-            for c in 0..3 {
-                if let Some(v) = sum[c].checked_div(sum[3]) {
-                    o[c] = v as u8;
-                }
-            }
-            o[3] = (sum[3] / n) as u8;
-        }
-    }
-    out
-}
-
-/// Applies EXIF `orientation` to `src` (`w`×`h` RGBA). Orientations 5–8
-/// return an `h`×`w` image.
-fn orient(src: &[u8], w: u32, h: u32, orientation: u8) -> Vec<u8> {
-    if !(2..=8).contains(&orientation) {
-        return src.to_vec();
-    }
-    let (w, h) = (w as usize, h as usize);
-    let swap = orientation >= 5;
-    let out_w = if swap { h } else { w };
-    let mut out = vec![0; src.len()];
-    for y in 0..h {
-        for x in 0..w {
-            // Where source pixel (x, y) lands in the output.
-            let (ox, oy) = match orientation {
-                2 => (w - 1 - x, y),
-                3 => (w - 1 - x, h - 1 - y),
-                4 => (x, h - 1 - y),
-                5 => (y, x),
-                6 => (h - 1 - y, x),
-                7 => (h - 1 - y, w - 1 - x),
-                _ => (y, w - 1 - x),
-            };
-            let from = (y * w + x) * 4;
-            let to = (oy * out_w + ox) * 4;
-            out[to..to + 4].copy_from_slice(&src[from..from + 4]);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -432,47 +220,7 @@ mod tests {
         assert!(thumbnail(&key(2, 2)).is_err());
         fs::write(&path, b"RIFF\0\0\0\0WEBPgarbage").unwrap();
         assert!(thumbnail(&key(2, 2)).is_err());
-
-        // A lossless WebP decodes like the PNG.
-        let mut webp = Vec::new();
-        image_webp::WebPEncoder::new(&mut webp).encode(&red_blue, 4, 2, image_webp::ColorType::Rgb8).unwrap();
-        fs::write(&path, &webp).unwrap();
-        let (square, ..) = thumbnail(&key(2, 2)).unwrap();
-        assert_eq!(&square[..8], [255, 0, 0, 255, 0, 0, 255, 255]);
         fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn a_whole_picture_fits_its_box_and_is_never_enlarged() {
-        assert_eq!(fit((4000, 2000), (1000, 1000)), (1000, 500));
-        assert_eq!(fit((2000, 4000), (1000, 1000)), (500, 1000));
-        assert_eq!(fit((300, 200), (1000, 1000)), (300, 200));
-        assert_eq!(fit((10_000, 1), (100, 100)), (100, 1), "a sliver keeps a pixel");
-        assert_eq!(fit((0, 0), (100, 100)), (1, 1));
-    }
-
-    #[test]
-    fn transparent_pixels_do_not_darken() {
-        // Top row opaque white, bottom row transparent black.
-        let src = [[255u8; 8], [0; 8]].concat();
-        assert_eq!(cover(&src, 2, 2, 1, 1), [255, 255, 255, 127]);
-    }
-
-    #[test]
-    fn exif_orientation_is_bounded_and_applied() {
-        // Little-endian TIFF header, IFD at 8 with one orientation entry = 6.
-        let mut exif = b"II*\0\x08\0\0\0\x01\0".to_vec();
-        exif.extend_from_slice(&[0x12, 0x01, 3, 0, 1, 0, 0, 0, 6, 0, 0, 0]);
-        assert_eq!(exif_orientation(&exif), 6);
-        assert_eq!(exif_orientation(&exif[..12]), 1, "truncated data is ignored");
-        assert_eq!(exif_orientation(b"MM\0*\xFF\xFF\xFF\xFF"), 1);
-
-        // A 2×1 image (A, B) rotated by 6 (90° clockwise) becomes 1×2: A over B.
-        let (a, b) = ([1, 1, 1, 1], [2, 2, 2, 2]);
-        let rotated = orient(&[a, b].concat(), 2, 1, 6);
-        assert_eq!(rotated, [a, b].concat());
-        // Orientation 8 (90° counter-clockwise): B over A.
-        assert_eq!(orient(&[a, b].concat(), 2, 1, 8), [b, a].concat());
     }
 
     #[test]

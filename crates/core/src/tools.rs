@@ -101,6 +101,10 @@ pub struct Workspace {
     /// The files it read or wrote, as they were on disk then: what tells
     /// `edit` and `write` that one was changed since by something else.
     seen: Arc<Mutex<HashMap<PathBuf, Stamp>>>,
+    /// The picture the latest `read` made ready for the model, and the
+    /// file it is of: [`picture`] takes it, so one that had to be scaled
+    /// down is only scaled once.
+    shown: Arc<Mutex<Option<(PathBuf, Picture)>>>,
 }
 
 /// What tells one state of a file on disk from another: when it was last
@@ -397,17 +401,15 @@ fn read(path: &Path, offset: Option<usize>, limit: Option<usize>, workspace: &Wo
         if workspace.blind {
             return Err(format!("{} is a picture, and this model cannot look at pictures", path.display()));
         }
-        if size > attach::MAX_IMAGE {
-            return Err(format!(
-                "{} is a picture of {} KB, larger than the {} KB a model is shown",
-                path.display(),
-                size / 1000,
-                attach::MAX_IMAGE / 1000
-            ));
-        }
+        let (bytes, media_type, scaled) = shown(path, kind)?;
         workspace.saw(path);
+        if let Ok(mut ready) = workspace.shown.lock() {
+            let picture = Picture { media_type: media_type.to_owned(), data: atroxabot_mcp::base64(&bytes) };
+            *ready = Some((path.to_owned(), picture));
+        }
         let kind = kind.trim_start_matches("image/").to_uppercase();
-        return Ok(format!("{}: a {kind} picture of {} KB.", path.display(), size.div_ceil(1000)));
+        let note = if scaled { " It is shown to you scaled down." } else { "" };
+        return Ok(format!("{}: a {kind} picture of {} KB.{note}", path.display(), size.div_ceil(1000)));
     }
     let text = load(path)?;
     workspace.saw(path);
@@ -432,17 +434,48 @@ fn read(path: &Path, offset: Option<usize>, limit: Option<usize>, workspace: &Wo
     Ok(out)
 }
 
+/// The largest picture file read to be shown, scaled down if need be.
+const MAX_PICTURE: u64 = 64 << 20;
+
+/// The picture at `path` (of the kind `media_type`, by its name) as a
+/// model is shown it: its bytes and their kind, and whether they are a
+/// copy scaled down from one too large ([`crate::picture::shrink`]).
+fn shown(path: &Path, media_type: &'static str) -> Result<(Vec<u8>, &'static str, bool), String> {
+    let size = fs::metadata(path).map_err(|e| format!("cannot open {}: {e}", path.display()))?.len();
+    let too_large = || {
+        format!(
+            "{} is a picture of {} KB, larger than the {} KB a model is shown, and it could not be scaled down",
+            path.display(),
+            size / 1000,
+            attach::MAX_IMAGE / 1000
+        )
+    };
+    if size > MAX_PICTURE {
+        return Err(too_large());
+    }
+    let bytes = fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    match crate::picture::shrink(&bytes) {
+        Some((copy, kind)) => Ok((copy, kind, true)),
+        None if bytes.len() as u64 <= attach::MAX_IMAGE => Ok((bytes, media_type, false)),
+        None => Err(too_large()),
+    }
+}
+
 /// The picture a `read` with `input` shows the model, when it reads one it
 /// may look at; what [`run`] said of it is the result's text.
 #[must_use]
 pub fn picture(input: &Value, workspace: &Workspace) -> Option<Picture> {
     let path = resolve(input.get("path").and_then(Value::as_str)?, workspace);
     let media_type = attach::media_type(&path.to_string_lossy())?;
-    let small = fs::metadata(&path).is_ok_and(|meta| meta.is_file() && meta.len() <= attach::MAX_IMAGE);
-    if workspace.blind || !small {
+    if workspace.blind {
         return None;
     }
-    let bytes = fs::read(&path).ok()?;
+    // What the `read` that came before made ready, when it is of this file.
+    let ready = workspace.shown.lock().ok().and_then(|mut ready| ready.take());
+    if let Some((_, picture)) = ready.filter(|(of, _)| *of == path) {
+        return Some(picture);
+    }
+    let (bytes, media_type, _) = shown(&path, media_type).ok()?;
     Some(Picture { media_type: media_type.to_owned(), data: atroxabot_mcp::base64(&bytes) })
 }
 
@@ -1737,6 +1770,17 @@ mod tests {
         let shown = picture(&input, &ws).unwrap();
         assert_eq!((shown.media_type.as_str(), shown.data.as_str()), ("image/png", "iVBORw=="));
         assert!(picture(&json!({ "path": "src" }), &ws).is_none());
+        assert_eq!(picture(&input, &ws).map(|shown| shown.data), Some("iVBORw==".into()), "asked alone, it is read");
+        // One with more pixels than a model is shown is scaled down, once, and the agent is told.
+        let side = crate::picture::MAX_SIDE + 40;
+        let wide = crate::picture::encode_jpeg(&vec![90; (side * 8 * 4) as usize], side, 8, 80);
+        fs::write(ws.dir.join("wide.jpg"), wide).unwrap();
+        let input = json!({ "path": "wide.jpg" });
+        let said = call("read", &input, &ws).unwrap();
+        assert!(said.contains("JPEG picture") && said.ends_with("scaled down."), "{said}");
+        let shown = picture(&input, &ws).unwrap();
+        assert_eq!(shown.media_type, "image/jpeg");
+        assert!(ws.shown.lock().unwrap().is_none(), "taken");
         ws.blind = true;
         assert!(call("read", &input, &ws).unwrap_err().contains("cannot look at pictures"));
         assert!(picture(&input, &ws).is_none());

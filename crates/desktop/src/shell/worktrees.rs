@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(shell.config.recent_folders, ["/code/parser"], "the folder it stands for, never the worktree's");
 
         // The next session starts in the same folder of the repository, in a worktree again.
-        shell.new_session(&mut actions);
+        shell.new_session();
         assert!(shell.pending_folder.ends_with("src") && shell.pending_folder.starts_with("/code/parser"));
         assert!(shell.wants_worktree() && shell.worktree_open());
         shell.toggle_worktree(&mut actions);

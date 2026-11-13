@@ -29,6 +29,7 @@ mod mcp;
 mod messages;
 mod openai;
 mod pattern;
+pub mod picture;
 mod responses;
 mod session;
 pub mod skills;
@@ -55,7 +56,7 @@ pub use codex::{
     CODEX_INSTALL, CodexAgent, codex_info, codex_install, codex_limits, codex_login, codex_mcp_config, find_codex,
 };
 pub use config::{Config, Connection, ConnectionKind, McpServer, VoiceSettings, lock_instance};
-pub use engine::{AgentEvent, ApiEngine, Ask, Control, FollowUp, Inbox, LimitWindow, Limits, Verdict};
+pub use engine::{AgentEvent, ApiEngine, Ask, Control, DISMISSED, FollowUp, Inbox, LimitWindow, Limits, Verdict};
 pub use error::{Error, Result};
 pub use mcp::{McpHub, claude_mcp_config};
 pub use responses::{

@@ -226,6 +226,9 @@ pub struct ClaudeAgent {
     suggestions: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     /// The follow-ups sent and not taken in yet, by the id they were sent under.
     follow_ups: Arc<Mutex<HashMap<String, FollowUp>>>,
+    /// The model and effort it answers with: what it was started with, or
+    /// took since ([`ClaudeAgent::retune`]).
+    tuned: Arc<Mutex<(String, String)>>,
 }
 
 impl std::fmt::Debug for ClaudeAgent {
@@ -257,9 +260,14 @@ impl ClaudeAgent {
         // The binary's running total includes what a resumed session cost before.
         let mut mapper = Mapper { total: session.cost(), ..Mapper::default() };
         let follow_ups = Arc::clone(&mapper.follow_ups);
-        let mut options = options(agent, connection, session);
+        let (prompt, memory) = session.account_prompt(agent);
+        let mut options = options(agent, connection, session, &prompt);
         options.mcp_config = mcp;
         options.prompt_suggestions = suggest;
+        // What it is told of the agent's notes stays with the session: a later start says the same.
+        if let Some(memory) = memory {
+            emit(AgentEvent::Memory(memory));
+        }
         let session = sdk::Session::connect(&options, move |event| {
             if let sdk::Event::Permission(request) = &event
                 && let Ok(mut pending) = pending.lock()
@@ -270,7 +278,44 @@ impl ClaudeAgent {
                 emit(event);
             }
         })?;
-        Ok(Self { session, suggestions, follow_ups })
+        let tuned = Arc::new(Mutex::new(tuning(&agent.model, &agent.effort)));
+        Ok(Self { session, suggestions, follow_ups, tuned })
+    }
+
+    /// Whether it answers with `model` at `effort` as it runs now.
+    #[must_use]
+    pub fn runs_with(&self, model: &str, effort: &str) -> bool {
+        self.tuned.lock().is_ok_and(|tuned| *tuned == tuning(model, effort))
+    }
+
+    /// Has the running process answer with `model` at `effort` from its
+    /// next turn on (empty for the account's default model, or the model's
+    /// usual effort), without starting it again: it keeps its conversation
+    /// in memory and whatever it runs in the background. `done` is called
+    /// once, on a reader thread, when Claude Code has answered: `Err` with
+    /// its reason when it did not take the change, or ended first. Send
+    /// the message the change is for after that.
+    ///
+    /// # Errors
+    /// The process has ended; `done` is then not called.
+    pub fn retune(
+        &self,
+        model: &str,
+        effort: &str,
+        done: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) -> Result<(), sdk::Error> {
+        let want = tuning(model, effort);
+        let some = |text: &str| Some(text.to_owned()).filter(|text| !text.is_empty());
+        let settings = serde_json::json!({ "model": some(&want.0), "effortLevel": some(&want.1) });
+        let tuned = Arc::clone(&self.tuned);
+        self.session.apply_settings(&settings, move |outcome| {
+            if outcome.is_ok()
+                && let Ok(mut tuned) = tuned.lock()
+            {
+                *tuned = want;
+            }
+            done(outcome);
+        })
     }
 
     /// Sends the user's message with the `files` that go with it (pictures
@@ -320,7 +365,13 @@ impl ClaudeAgent {
             Verdict::Deny(why) if why.trim().is_empty() => {
                 sdk::Decision::Deny { message: "The user declined this.".to_owned(), interrupt: false }
             }
-            Verdict::Deny(why) => sdk::Decision::Deny { message: why, interrupt: false },
+            // A dismissed question says so itself; a reason is the user's own words.
+            Verdict::Deny(why) if why == crate::engine::DISMISSED => {
+                sdk::Decision::Deny { message: why, interrupt: false }
+            }
+            Verdict::Deny(why) => {
+                sdk::Decision::Deny { message: format!("The user declined this: {}", why.trim()), interrupt: false }
+            }
         };
         // Fails if the request was withdrawn or the process is gone.
         let _ = self.session.respond(id, decision);
@@ -337,6 +388,11 @@ impl ClaudeAgent {
     pub fn close(&self) {
         self.session.close();
     }
+}
+
+/// A model and an effort as they are compared: without the blanks around them.
+fn tuning(model: &str, effort: &str) -> (String, String) {
+    (model.trim().to_owned(), effort.trim().to_owned())
 }
 
 /// A message's content: pictures as blocks, then the words with the paths
@@ -367,8 +423,9 @@ fn wire_uuid(id: &str) -> String {
     format!("{}-{}-4{}-8{}-{}", &d[..8], &d[8..12], &d[12..15], &d[15..18], &d[18..])
 }
 
-/// How the binary is started for `agent` on `connection` in `session`.
-fn options(agent: &Agent, connection: &Connection, session: &Session) -> sdk::Options {
+/// How the binary is started for `agent` on `connection` in `session`, with `prompt` for the agent's own
+/// ([`Session::account_prompt`]).
+fn options(agent: &Agent, connection: &Connection, session: &Session, prompt: &str) -> sdk::Options {
     let some = |text: &str| Some(text.trim().to_owned()).filter(|text| !text.is_empty());
     let (permission_mode, ask_permissions) = match agent.autonomy {
         Autonomy::Ask => (sdk::PermissionMode::Default, true),
@@ -388,11 +445,7 @@ fn options(agent: &Agent, connection: &Connection, session: &Session) -> sdk::Op
         // The agent's own prompt, not Claude Code's: its identity and how it
         // works here. Claude Code still adds the project's CLAUDE.md, the
         // skills and the environment (date, system, folder) to the conversation.
-        system_prompt: sdk::SystemPrompt::Custom(format!(
-            "{}{}{CLAUDE_TOOLS}",
-            agent.system_prompt(&folder),
-            session.worktree_note()
-        )),
+        system_prompt: sdk::SystemPrompt::Custom(format!("{prompt}{CLAUDE_TOOLS}")),
         cwd: Some(folder).filter(|folder| !folder.as_os_str().is_empty()),
         model: some(&agent.model),
         effort: some(&agent.effort),
@@ -496,6 +549,12 @@ struct Mapper {
     /// What each task (a subagent, a command sent to the background) was
     /// started for, by the call that started it.
     tasks: HashMap<String, String>,
+    /// How long the account's prompt cache keeps what a request used, in
+    /// seconds, as a reply that wrote to it last said; 0 until one did.
+    cache_kept: u64,
+    /// The tasks a subagent started, by their call: Claude Code tells that
+    /// subagent when one ends, not the session, so the conversation does not.
+    owned: HashSet<String>,
 }
 
 impl Mapper {
@@ -549,6 +608,14 @@ impl Mapper {
                 self.begin(&mut out);
                 self.model = model;
                 self.context = usage;
+                if usage.cache_ttl > 0 {
+                    self.cache_kept = usage.cache_ttl;
+                }
+                // A request that read or wrote the cache keeps the conversation there that much longer.
+                let cached = usage.cache_read_input_tokens.saturating_add(usage.cache_creation_input_tokens) > 0;
+                if cached && self.cache_kept > 0 {
+                    out.push(AgentEvent::Cached(crate::session::unix_now() + self.cache_kept));
+                }
                 for block in blocks {
                     match block {
                         sdk::Block::Text(text) if !self.streamed => out.push(AgentEvent::Text(text)),
@@ -605,7 +672,15 @@ impl Mapper {
                 if task.state == sdk::TaskState::Started && !task.description.is_empty() {
                     self.tasks.insert(task.tool_use_id.clone(), task.description.clone());
                 }
-                if let Some(note) = self.woken_by(&task) {
+                if task.owned_by_subagent {
+                    self.owned.insert(task.tool_use_id.clone());
+                }
+                let owned = if matches!(task.state, sdk::TaskState::Started | sdk::TaskState::Running) {
+                    self.owned.contains(&task.tool_use_id)
+                } else {
+                    self.owned.remove(&task.tool_use_id)
+                };
+                if let Some(note) = self.woken_by(&task).filter(|_| !owned) {
                     out.push(AgentEvent::Note(note));
                 }
                 if self.agents.contains(&task.tool_use_id) {
@@ -961,6 +1036,27 @@ mod tests {
     }
 
     #[test]
+    fn a_subagents_own_task_ending_between_turns_says_nothing() {
+        // Claude Code 2.1.322 reports a subagent's own commands as tasks too, with `owned_by_subagent`; their
+        // end goes to the subagent, so no turn of the session follows it.
+        let mut mapper = Mapper::default();
+        let task = |state: sdk::TaskState, owned_by_subagent: bool| {
+            sdk::Event::Task(sdk::Task {
+                tool_use_id: "s1".into(),
+                task_type: "local_bash".into(),
+                state,
+                description: if owned_by_subagent { "List the releases".into() } else { String::new() },
+                owned_by_subagent,
+                ..sdk::Task::default()
+            })
+        };
+        mapper.map(task(sdk::TaskState::Started, true));
+        let ended = mapper.map(task(sdk::TaskState::Completed, false));
+        assert!(!ended.iter().any(|event| matches!(event, AgentEvent::Note(_))), "{ended:?}");
+        assert!(mapper.owned.is_empty());
+    }
+
+    #[test]
     fn a_turn_claude_code_starts_by_itself_shows_at_once() {
         // As Claude Code 2.1.322 does it: a command sent to the background ends after the turn did; a new turn
         // starts, the model thinks a while, and its summarised reasoning arrives whole.
@@ -1137,8 +1233,37 @@ mod tests {
             output_tokens: 1,
             cache_read_input_tokens: 30,
             cache_creation_input_tokens: 4,
+            cache_ttl: 0,
         };
         sdk::Event::Assistant { blocks, model: "claude-x".into(), parent_tool_use_id: None, usage, error: None }
+    }
+
+    #[test]
+    fn a_reply_says_until_when_the_conversation_stays_cached() {
+        let mut mapper = Mapper::default();
+        let reply = |read: u64, cache_ttl: u64, parent: Option<&str>| sdk::Event::Assistant {
+            blocks: Vec::new(),
+            model: "claude-x".into(),
+            parent_tool_use_id: parent.map(str::to_owned),
+            usage: sdk::Usage { cache_read_input_tokens: read, cache_ttl, ..sdk::Usage::default() },
+            error: None,
+        };
+        let until = |events: Vec<AgentEvent>| {
+            events.iter().find_map(|event| if let AgentEvent::Cached(until) = event { Some(*until) } else { None })
+        };
+        let now = crate::session::unix_now();
+        // Until a reply says how long the account's cache keeps things, nothing is claimed.
+        assert_eq!(until(mapper.map(reply(500, 0, None))), None);
+        // One that wrote to it says so: an hour here.
+        let hour = until(mapper.map(reply(500, 3600, None))).expect("an hour from now");
+        assert!((now + 3600..=now + 3605).contains(&hour), "{hour}");
+        // A later one that only read it keeps it as long again.
+        assert!(until(mapper.map(reply(900, 0, None))).is_some_and(|until| until >= hour));
+        // A request that touched no cache (one refused, say) keeps nothing; a subagent's is its own.
+        assert_eq!(until(mapper.map(reply(0, 0, None))), None);
+        assert_eq!(until(mapper.map(reply(900, 300, Some("agent-1")))), None);
+        let minutes = until(mapper.map(reply(900, 300, None))).expect("five minutes from now");
+        assert!(minutes < hour);
     }
 
     #[test]
@@ -1283,7 +1408,7 @@ mod tests {
             account: own.id.clone(),
             ..Session::new(&agent.id)
         };
-        let options = options(&agent, &own, &session);
+        let options = options(&agent, &own, &session, &session.account_prompt(&agent).0);
         assert_eq!(
             (options.model.as_deref(), options.resume.as_deref(), options.effort),
             (Some("opus"), Some("abc"), None)
@@ -1298,7 +1423,7 @@ mod tests {
 
         // Another account runs in its own folder and cannot resume the first one's session.
         let work = Connection { id: "w".into(), config_dir: "/accounts/w".into(), ..Connection::claude_agent() };
-        let other = super::options(&Agent { autonomy: Autonomy::Auto, ..agent }, &work, &session);
+        let other = super::options(&Agent { autonomy: Autonomy::Auto, ..agent }, &work, &session, "");
         assert_eq!(other.env, [("CLAUDE_CONFIG_DIR".to_owned(), "/accounts/w".to_owned())]);
         assert_eq!(
             (other.resume, other.permission_mode, other.ask_permissions),

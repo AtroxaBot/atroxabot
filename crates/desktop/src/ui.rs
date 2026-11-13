@@ -274,6 +274,8 @@ pub mod icon {
     pub const CHEVRON_DOWN: char = '\u{e06d}';
     /// Chevron pointing left: back.
     pub const CHEVRON_LEFT: char = '\u{e06e}';
+    /// Chevron pointing up: the one before.
+    pub const CHEVRON_UP: char = '\u{e070}';
     /// Chevron pointing right.
     pub const CHEVRON_RIGHT: char = '\u{e06f}';
     /// A pen on a square: edit.
@@ -529,6 +531,7 @@ mod tests {
             icon::CHECK,
             icon::CHEVRON_DOWN,
             icon::CHEVRON_LEFT,
+            icon::CHEVRON_UP,
             icon::CHEVRON_RIGHT,
             icon::PEN,
             icon::TRASH,

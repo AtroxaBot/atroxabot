@@ -210,7 +210,22 @@ impl Agent {
     /// serving it.
     #[must_use]
     pub fn system_prompt(&self, folder: &Path) -> String {
-        self.system_prompt_with(folder, "")
+        self.system_prompt_seeing(folder, &self.memory_section().unwrap_or_default())
+    }
+
+    /// The same with `memory` for what it is told of its notes: [`Agent::memory_section`] as a session kept
+    /// it ([`crate::Session::memory`]), so the prompt a session is resumed with is the one it began with.
+    #[must_use]
+    pub fn system_prompt_seeing(&self, folder: &Path, memory: &str) -> String {
+        self.system_prompt_with(folder, "", memory)
+    }
+
+    /// What an agent that keeps notes is told of them, as they are now: where they are, how to keep them,
+    /// and the newest [`MEMORY_BUDGET`] of them. `None` for one that keeps none.
+    #[must_use]
+    pub fn memory_section(&self) -> Option<String> {
+        let path = self.memory_path()?;
+        Some(memory_section(&path, &fs::read_to_string(&path).unwrap_or_default()))
     }
 
     /// The system prompt of an API session working in `folder`, at its
@@ -222,12 +237,12 @@ impl Agent {
     #[must_use]
     pub fn api_system_prompt(&self, folder: &Path, worktree: &str) -> String {
         let extra = format!("{worktree}{API_TOOLS}{}", project_instructions(folder));
-        self.system_prompt_with(folder, &extra)
+        self.system_prompt_with(folder, &extra, &self.memory_section().unwrap_or_default())
     }
 
     /// The system prompt with `extra` after where the agent works and
-    /// before its notes, which come last.
-    fn system_prompt_with(&self, folder: &Path, extra: &str) -> String {
+    /// before `memory` (what it is told of its notes), which comes last.
+    fn system_prompt_with(&self, folder: &Path, extra: &str, memory: &str) -> String {
         let mut prompt =
             format!("You are {}.", if self.name.trim().is_empty() { "an assistant" } else { self.name.trim() });
         if !self.tagline.trim().is_empty() {
@@ -241,32 +256,36 @@ impl Agent {
             let _ = write!(prompt, "\n\nYou work in the folder `{}`.", folder.display());
         }
         prompt.push_str(extra);
-        if let Some(path) = self.memory_path() {
-            let _ = write!(
-                prompt,
-                "\n\nYou keep notes across sessions in `{}`. Keep them short and current, under {} KB: add what \
-                 will matter next time (the user's preferences, decisions, where things are), and correct or \
-                 remove what is no longer true.",
-                path.display(),
-                MEMORY_BUDGET / 1000
-            );
-            let notes = fs::read_to_string(&path).unwrap_or_default();
-            let notes = notes.trim();
-            let shown = tail(notes, MEMORY_BUDGET);
-            if shown.len() < notes.len() {
-                let _ = write!(
-                    prompt,
-                    " Your notes have grown to {} KB, so only their newest part is below: read the file when the \
-                     older part matters, and condense it to fit (merge, shorten, drop what no longer holds).",
-                    notes.len().div_ceil(1000)
-                );
-            }
-            if !shown.is_empty() {
-                let _ = write!(prompt, "{NOTES_HEADING}{shown}");
-            }
+        if self.memory_path().is_some() {
+            prompt.push_str(memory);
         }
         prompt
     }
+}
+
+/// What an agent is told of the notes it keeps in the file at `path`, which holds `notes`.
+fn memory_section(path: &Path, notes: &str) -> String {
+    let mut section = format!(
+        "\n\nYou keep notes across sessions in `{}`. Keep them short and current, under {} KB: add what will \
+         matter next time (the user's preferences, decisions, where things are), and correct or remove what is no \
+         longer true.",
+        path.display(),
+        MEMORY_BUDGET / 1000
+    );
+    let notes = notes.trim();
+    let shown = tail(notes, MEMORY_BUDGET);
+    if shown.len() < notes.len() {
+        let _ = write!(
+            section,
+            " Your notes have grown to {} KB, so only their newest part is below: read the file when the older \
+             part matters, and condense it to fit (merge, shorten, drop what no longer holds).",
+            notes.len().div_ceil(1000)
+        );
+    }
+    if !shown.is_empty() {
+        let _ = write!(section, "{NOTES_HEADING}{shown}");
+    }
+    section
 }
 
 /// What comes before an agent's notes at the end of its system prompt.
@@ -535,6 +554,22 @@ mod tests {
         assert!(alone.contains("Core rules.") && !alone.contains("Top rules."));
         assert!(project_instructions(&dir.join("missing")).is_empty());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn the_notes_part_says_where_they_are_and_shows_the_newest() {
+        let path = Path::new("/home/notes.md");
+        let none = memory_section(path, "  \n");
+        assert!(none.contains("`/home/notes.md`") && !none.contains(NOTES_HEADING.trim()));
+        let some = memory_section(path, "\nLikes tabs.\n");
+        assert!(some.ends_with(&format!("{NOTES_HEADING}Likes tabs.")), "{some}");
+        assert!(!some.contains("have grown"));
+        let long = format!("old line\n{}", "x".repeat(MEMORY_BUDGET));
+        let grown = memory_section(path, &long);
+        assert!(
+            grown.contains("have grown to 13 KB") && !grown.contains("old line"),
+            "only the newest part rides along"
+        );
     }
 
     #[test]

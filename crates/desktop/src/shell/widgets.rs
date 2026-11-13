@@ -157,6 +157,11 @@ impl Scroll {
         self.target = self.target.max((bottom - view).max(0.0)).min(top.max(0.0));
     }
 
+    /// Puts the view where it is headed at once, without easing there.
+    pub fn settle(&mut self) {
+        self.pos = self.target;
+    }
+
     /// Back to the top, at once.
     pub fn reset(&mut self) {
         (self.pos, self.target) = (0.0, 0.0);

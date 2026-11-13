@@ -49,7 +49,10 @@ cargo fmt --all --check
 - **Code quality:** every public item has doc comments, `clippy::pedantic` stays clean, no `unwrap`s on
   fallible runtime paths, non-trivial logic gets a small unit test. Parsers survive hostile input.
 - **Token discipline:** within a session the system prompt and tool list do not change and history is only
-  appended to (this keeps the prompt cache and Claude's thinking blocks valid). Never edit or reorder
+  appended to (this keeps the prompt cache and Claude's thinking blocks valid). That goes for an account's
+  process too: it is started again under the prompt the session began with (`Session::account_prompt`),
+  takes another model or effort as it runs (`ClaudeAgent::retune`), and is kept a while after the user
+  looks elsewhere (`shell/warm.rs`) rather than closed and resumed. Never edit or reorder
   earlier turns of a request; add a note to the newest user message instead (see `CALL_STARTED`).
 - **Secrets:** never log an API key. Config files are written atomically, `0600` on Unix. A key is only
   sent to the address it was saved for. Agents' file tools never reach `~/.atroxabot` (`tools::risk`),
@@ -96,6 +99,12 @@ which platform a provider is. Never use one as the app's own branding.
   and statistics at its foot. Under the message box: the paperclip at the left, the model at the right.
 - Whether a session works in a worktree of its own is a switch in the folder menu of the top bar, the
   session's until its worktree is made; what is on disk is listed in the settings (`shell/worktrees.rs`).
+- A tool call that changes a file shows as the lines of a diff (`shell/change.rs`), and a turn that
+  changed files lists them under its last reply. Text is found in the conversation with a bar that floats
+  at its top (`shell/find.rs`); what is marked or found is washed under the text by the document itself
+  (`Doc::mark`, `Doc::mark_selection`), so it shows in a code block too.
+- An account that ran out of usage is said in the conversation and in the tray over the message box,
+  never as a notice over the session. Notices (`Shell::notify`) are for problems nothing else shows.
 - An agent has no model or effort in its editor: both are chosen under the message box. There is no
   "auto" effort; `Shell::effort_in_use` gives every model a level of its own.
 - The provider, model and effort are the session's (`Session::provider`, read through

@@ -157,13 +157,11 @@ dependencies = [
  "atroxabot-core",
  "atroxabot-voice",
  "bytemuck",
- "image-webp",
  "png",
  "serde_json",
  "ttf-parser",
  "wgpu",
  "winit",
- "zune-jpeg",
 ]
 
 [[package]]
@@ -188,10 +186,13 @@ dependencies = [
  "atroxabot-codex",
  "atroxabot-mcp",
  "flate2",
+ "image-webp",
+ "png",
  "ring",
  "serde",
  "serde_json",
  "ureq",
+ "zune-jpeg",
 ]
 
 [[package]]

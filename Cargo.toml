@@ -23,7 +23,7 @@ wgpu = { version = "30.0.1", default-features = false, features = ["std", "wgsl"
 ttf-parser = { version = "0.25.1", default-features = false, features = ["std", "opentype-layout"] }
 bytemuck = "1.25.2"
 arboard = { version = "3.7.0", default-features = false }
-# Agent portraits. Hand-written decoders for hostile input are not worth
+# Agent portraits and pictures sent along. Hand-written decoders for hostile input are not worth
 # the risk; these three are fuzzed and pure Rust. zune-jpeg's features are SIMD only.
 png = "0.18.1"
 zune-jpeg = { version = "0.5.15", default-features = false, features = ["std", "x86", "neon"] }

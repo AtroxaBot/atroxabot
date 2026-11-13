@@ -686,7 +686,7 @@ mod tests {
         let files = clipboard_native(&out).unwrap();
         let took = started.elapsed();
         assert_eq!(files, Some(vec![out.clone()]), "copy a picture first");
-        let decoded = crate::image::decode_png(&std::fs::read(&out).unwrap());
+        let decoded = atroxabot_core::picture::decode_png(&std::fs::read(&out).unwrap());
         let _ = std::fs::remove_file(&out);
         let (rgba, width, height) = decoded.unwrap();
         assert!(width > 0 && height > 0 && rgba.len() == (width * height * 4) as usize);

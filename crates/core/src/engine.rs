@@ -200,6 +200,13 @@ pub enum AgentEvent {
     /// The system prompt the session's API engine was started with, kept
     /// with the session from its first turn ([`Session::system`]).
     System(String),
+    /// What the session's account engine was told of the agent's notes at
+    /// its first start, kept with the session ([`Session::memory`]).
+    Memory(String),
+    /// Until when the provider keeps the conversation in its prompt cache,
+    /// in Unix seconds, as far as the engine can tell: every request that
+    /// reads it keeps it that much longer ([`Session::cached_until`]).
+    Cached(u64),
     /// Anthropic refused the reasoning kept with the replies (the
     /// conversation changed under it): they go back as plain text and calls
     /// from now on.
@@ -267,6 +274,9 @@ pub struct Ask {
     pub reason: String,
 }
 
+/// What a question the user put away without answering it tells the model.
+pub const DISMISSED: &str = "The user dismissed the question without answering it.";
+
 /// The user's answer to an [`Ask`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Verdict {
@@ -276,7 +286,7 @@ pub enum Verdict {
     AllowAlways,
     /// Run it with this input instead (JSON text): the user's answers to a question.
     Answer(String),
-    /// Do not run it; the text tells the model why.
+    /// Do not run it; the text is why, in the user's words (or [`DISMISSED`]), for the model to read.
     Deny(String),
 }
 
@@ -329,6 +339,10 @@ impl Session {
                 self.context.clone_from(parts);
                 return;
             }
+            AgentEvent::Cached(until) => {
+                self.cached_until = *until;
+                return;
+            }
             AgentEvent::ReplyEnded { raw, wire, model, usage, cost, problem } => self.with_reply(|reply| {
                 reply.raw.clone_from(raw);
                 reply.wire = *wire;
@@ -349,6 +363,7 @@ impl Session {
                 self.entries.insert(at, Entry::Summary { text: text.clone() });
             }
             AgentEvent::System(text) => self.system.clone_from(text),
+            AgentEvent::Memory(text) => self.memory = Some(text.clone()),
             AgentEvent::ForgetReplays => {
                 for entry in &mut self.entries {
                     if let Entry::Reply(reply) = entry
@@ -768,6 +783,10 @@ impl ApiEngine {
                     problem: problem.clone(),
                 },
             );
+            // Anthropic keeps what a request wrote to or read from its cache for five minutes more.
+            if self.web && completion.usage.cached_tokens.saturating_add(completion.usage.cache_write_tokens) > 0 {
+                emit(session, AgentEvent::Cached(crate::session::unix_now() + API_CACHE_KEPT));
+            }
             if let Some(fixed) = fixed {
                 emit(session, AgentEvent::Context(context_parts(fixed, session.context_tokens())));
             }
@@ -1224,9 +1243,7 @@ impl ApiEngine {
         match verdict {
             Some(Verdict::Answer(updated)) => Ok(answers(&asked, &updated)),
             Some(Verdict::Deny(why)) if !why.trim().is_empty() => Err(why.trim().to_owned()),
-            Some(Verdict::Deny(_) | Verdict::Allow | Verdict::AllowAlways) => {
-                Err("The user dismissed the question without answering it.".to_owned())
-            }
+            Some(Verdict::Deny(_) | Verdict::Allow | Verdict::AllowAlways) => Err(DISMISSED.to_owned()),
             None => Err("Stopped by the user before they answered.".to_owned()),
         }
     }
@@ -1448,6 +1465,10 @@ fn shows_pictures(session: &Session) -> bool {
     }
     session.entries.iter().any(|entry| matches!(entry, Entry::Reply(reply) if shown(&reply.blocks)))
 }
+
+/// How long Anthropic's API keeps a prompt cached after a request used it, in seconds (the cache this
+/// engine asks for, see `messages.rs`).
+const API_CACHE_KEPT: u64 = 5 * 60;
 
 /// Whether any of `session`'s replies goes back to Anthropic as it arrived.
 fn replays_kept(session: &Session) -> bool {

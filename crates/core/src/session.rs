@@ -91,6 +91,21 @@ pub struct Session {
     /// over without it. Empty until then, and for the account engines.
     #[serde(skip_serializing_if = "String::is_empty")]
     pub system: String,
+    /// What an account engine (Claude Code, Codex) was told of the agent's
+    /// notes when it first started the session ([`Agent::memory_section`]):
+    /// every later start says the same, whatever the notes hold by then,
+    /// so the engine resumes the conversation under the system prompt it
+    /// has cached. `/clear` starts over without it. `None` until then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory: Option<String>,
+    /// Until when the provider keeps the conversation in its prompt
+    /// cache, in Unix seconds, as its engine last worked out
+    /// ([`crate::AgentEvent::Cached`]): a message sent by then reads the
+    /// context at a fraction of its price, one sent later all of it anew.
+    /// 0 when not known (Codex, other APIs, another provider or model
+    /// chosen since).
+    #[serde(skip_serializing_if = "is_zero")]
+    pub cached_until: u64,
     /// Whether its model turned out to take no pictures (its provider
     /// refused one): a `read` of one shows it no more.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -101,6 +116,12 @@ pub struct Session {
     pub worktree: Option<Worktree>,
     /// What was said and done, oldest first.
     pub entries: Vec<Entry>,
+}
+
+/// Whether a number is 0: such a field is left out of the file.
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde calls it with a reference")]
+fn is_zero(number: &u64) -> bool {
+    *number == 0
 }
 
 /// One kind of thing a context holds, and the tokens it takes.
@@ -363,6 +384,10 @@ impl Session {
 
     /// Makes `agent`'s provider, model and effort this session's own.
     pub fn keep_choice(&mut self, agent: &Agent) {
+        // Another provider or model has nothing of this conversation cached.
+        if agent.connection != self.provider || agent.model != self.model {
+            self.cached_until = 0;
+        }
         agent.connection.clone_into(&mut self.provider);
         agent.model.clone_into(&mut self.model);
         agent.effort.clone_into(&mut self.effort);
@@ -407,6 +432,22 @@ impl Session {
              nothing in it uncommitted that should be kept.",
             worktree.repo, worktree.branch, worktree.base, worktree.repo
         )
+    }
+
+    /// The agent's own prompt for an account engine (Claude Code, Codex)
+    /// that starts or resumes this session: its instructions as they are
+    /// now, where it works, and its notes as the session first saw them.
+    /// The second value is what it says of the notes when that was made
+    /// just now: to be kept as [`Session::memory`].
+    #[must_use]
+    pub fn account_prompt(&self, agent: &Agent) -> (String, Option<String>) {
+        let (memory, made) = match (&self.memory, agent.memory_section()) {
+            // An agent that keeps no notes (any more) is told nothing of them.
+            (_, None) => (String::new(), None),
+            (Some(kept), Some(_)) => (kept.clone(), None),
+            (None, Some(now)) => (now.clone(), Some(now)),
+        };
+        (format!("{}{}", agent.system_prompt_seeing(&self.folder(), &memory), self.worktree_note()), made)
     }
 
     /// What was said so far, as plain text of at most about `budget` bytes
@@ -904,6 +945,51 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("atroxabot-{name}-{}", std::process::id())).join("sessions");
         let _ = fs::remove_dir_all(&dir);
         SessionStore::at(dir)
+    }
+
+    #[test]
+    fn an_account_engine_is_resumed_under_the_prompt_it_began_with() {
+        // The agent's notes change while it works: what a session was first told of them is what it is told
+        // again, so the engine's cached conversation still follows the same system prompt.
+        let agent = Agent { instructions: "Be brief.".into(), ..Agent::new("Scout") };
+        let mut session = Session { workdir: "/work".into(), ..Session::new(&agent.id) };
+        let (first, made) = session.account_prompt(&agent);
+        let made = made.expect("made at the first start");
+        assert!(first.contains("You keep notes across sessions") && first.ends_with(&made), "{first}");
+        session.apply(&crate::AgentEvent::Memory(format!("{made}{}old notes", crate::agent::NOTES_HEADING)));
+        let (again, kept) = session.account_prompt(&agent);
+        assert!(kept.is_none(), "nothing new to keep");
+        assert!(again.ends_with("old notes") && again.starts_with("You are Scout."), "{again}");
+        assert_eq!(session.account_prompt(&agent).0, again, "the same at every start");
+        // The agent's own instructions are the user's to change: that reaches the session.
+        let edited = Agent { instructions: "Be thorough.".into(), ..agent.clone() };
+        assert!(session.account_prompt(&edited).0.contains("Be thorough.") && again.contains("Be brief."));
+        // One that no longer keeps notes is told nothing of them.
+        let (plain, kept) = session.account_prompt(&Agent { memory: false, ..agent });
+        assert!(kept.is_none() && !plain.contains("notes"), "{plain}");
+    }
+
+    #[test]
+    fn what_is_known_of_the_cache_goes_with_the_provider_and_model() {
+        let mut agent = Agent::new("Scout");
+        (agent.connection, agent.model) = ("claude".into(), "opus".into());
+        let mut session = Session::new(&agent.id);
+        session.keep_choice(&agent);
+        session.apply(&crate::AgentEvent::Cached(5_000));
+        assert_eq!(session.cached_until, 5_000);
+        // Another effort thinks with the same model: still cached. Another model or provider: not known.
+        agent.effort = "high".into();
+        session.keep_choice(&agent);
+        assert_eq!(session.cached_until, 5_000);
+        agent.model = "haiku".into();
+        session.keep_choice(&agent);
+        assert_eq!(session.cached_until, 0);
+        session.apply(&crate::AgentEvent::Cached(6_000));
+        agent.connection = "work".into();
+        session.keep_choice(&agent);
+        assert_eq!(session.cached_until, 0);
+        // Left out of the file while it is not known.
+        assert!(!serde_json::to_string(&session).unwrap().contains("cached_until"));
     }
 
     #[test]

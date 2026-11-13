@@ -243,6 +243,9 @@ pub struct Task {
     /// What sort of task it is, from `task_started` only: `local_agent` (a subagent), but also
     /// `local_bash` (a command sent to the background), `monitor_mcp` and others that are no subagent.
     pub task_type: String,
+    /// A subagent started it (a command it sent to the background, say), from `task_started` only: its end
+    /// is the subagent's news, not the session's.
+    pub owned_by_subagent: bool,
     /// The tool it called last.
     pub last_tool: String,
     /// Tool calls it made so far.
@@ -579,6 +582,9 @@ pub struct Usage {
     pub cache_read_input_tokens: u64,
     /// Input tokens written to the prompt cache.
     pub cache_creation_input_tokens: u64,
+    /// How long what was written to the prompt cache is kept, in seconds: 3600 or 300, as the usage's
+    /// `cache_creation` says; 0 when nothing was written, or it does not say.
+    pub cache_ttl: u64,
 }
 
 /// Why a call into this crate failed.

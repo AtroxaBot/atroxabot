@@ -28,6 +28,8 @@ const ROW: f32 = 38.0;
 const SHOWN: usize = 7;
 /// The composer grows up to this many lines, then scrolls.
 const MAX_LINES: usize = 8;
+/// How many of a session's earlier messages the up arrow goes back through.
+const RECALLED: usize = 50;
 
 /// The message being written.
 #[derive(Default)]
@@ -64,6 +66,10 @@ pub(super) struct Composer {
     owner: String,
     /// What was written for the others and not sent, by owner.
     drafts: HashMap<String, Draft>,
+    /// The earlier message the up arrow brought back: how far back it is
+    /// (0 for the last one sent) and its words. It counts only while the
+    /// box still holds exactly those words.
+    recalled: Option<(usize, String)>,
 }
 
 /// A message written for one session (or an agent's next one) and not
@@ -121,6 +127,43 @@ impl Composer {
         (self.editor, self.files) = (editor, files);
         (self.preedit, self.layout, self.scroll, self.selecting) = (None, None, 0.0, false);
         (self.slash, self.slash_off, self.mention, self.mention_off, self.listed_at) = (0, false, 0, false, None);
+        self.recalled = None;
+    }
+
+    /// The up or down arrow in the message box, as a terminal takes them:
+    /// in an empty box, up brings back the last of `sent` (the session's
+    /// earlier messages, the newest first); while the box shows one of them
+    /// unchanged, up goes further back and down comes forward again, to the
+    /// empty box in the end. Returns whether the key was taken: once the
+    /// user changes what was brought back, or writes something of their own,
+    /// the arrows move the caret as ever.
+    pub fn recall(&mut self, older: bool, sent: &[&str]) -> bool {
+        let at = self.recalled.as_ref().filter(|(_, shown)| shown == self.editor.text()).map(|(at, _)| *at);
+        let blank = self.editor.text().is_empty() && self.preedit.is_none();
+        let next = match (at, older) {
+            (Some(at), true) => at + 1,
+            (Some(0), false) => {
+                self.editor.take();
+                self.recalled = None;
+                return true;
+            }
+            (Some(at), false) => at - 1,
+            (None, true) if blank => 0,
+            (None, _) => {
+                self.recalled = None;
+                return false;
+            }
+        };
+        match sent.get(next) {
+            Some(message) => {
+                self.editor.take();
+                self.editor.insert(message);
+                self.recalled = Some((next, (*message).to_owned()));
+                true
+            }
+            // Nothing older: the oldest stays. In an empty box with nothing sent, the key is the caret's.
+            None => at.is_some(),
+        }
     }
 
     /// Drops what was written for `owner`, a session that is gone.
@@ -173,7 +216,7 @@ impl Shell {
 
     /// Turns the guessing on or off. Off, what was guessed goes at once; a
     /// running process goes on guessing until the session's next message,
-    /// which starts one without it (`sent_with`), and is not shown meanwhile.
+    /// which starts one without it (`Thread::guessing`), and is not shown meanwhile.
     pub(super) fn set_suggesting(&mut self, on: bool) {
         self.config.hide_suggestions = !on;
         if !on {
@@ -229,7 +272,7 @@ impl Shell {
         let x = canvas.x + ((canvas.w - width) * 0.5).round();
         let (pad, top_pad, toolbar_h) = (16.0, 14.0, 48.0);
         let text_w = width - 2.0 * pad;
-        let elsewhere = self.renaming.is_some() || self.answering();
+        let elsewhere = self.renaming.is_some() || self.answering() || self.finding();
         let typing = ui.focused && self.menu.is_none() && self.modal.is_none() && !elsewhere;
         let guess = self.suggestion_shown().map(str::to_owned);
         let composer = &mut self.composer;
@@ -303,7 +346,14 @@ impl Shell {
         if let Some(guess) = guess.as_deref().filter(|_| shown.is_empty()) {
             draw_suggestion(p, ui, guess, (origin.0, origin.1, text_w), line_h);
         } else if shown.is_empty() {
-            p.label(&format!("Message {}", agent.name), theme::BODY, origin.0, origin.1, t.text_faint);
+            // While an approval waits, what is written here is the reason of a no.
+            let approving = self.thread().is_some_and(|thread| !thread.asks.is_empty()) && !elsewhere;
+            let invite = if approving {
+                format!("Message {}, or write why you deny this", agent.name)
+            } else {
+                format!("Message {}", agent.name)
+            };
+            p.label(&invite, theme::BODY, origin.0, origin.1, t.text_faint);
         } else {
             p.text(&layout, origin.0, origin.1, t.text);
         }
@@ -440,6 +490,26 @@ impl Shell {
                 self.composer.files.push(file);
             }
         }
+    }
+
+    /// The up or down arrow in the message box: goes through what the
+    /// user sent in the open session before ([`Composer::recall`]). Returns
+    /// whether the key was taken.
+    pub(super) fn recall(&mut self, older: bool) -> bool {
+        let Some(thread) = self.current.as_deref().and_then(|id| self.threads.get(id)) else { return false };
+        let mut sent: Vec<&str> = Vec::new();
+        for entry in thread.session.entries.iter().rev() {
+            if let atroxabot_core::Entry::User { text, .. } = entry
+                && !text.trim().is_empty()
+                && sent.last() != Some(&text.as_str())
+            {
+                sent.push(text);
+                if sent.len() == RECALLED {
+                    break;
+                }
+            }
+        }
+        self.composer.recall(older, &sent)
     }
 
     /// Takes what was written and the files that go with it.
@@ -806,7 +876,6 @@ impl Shell {
         for (label, w, style, answer) in [
             ("Allow  ↵", 92.0, ButtonStyle::Primary, Verdict::Allow),
             ("Always allow", 112.0, ButtonStyle::Secondary, Verdict::AllowAlways),
-            ("Deny  esc", 92.0, ButtonStyle::Ghost, Verdict::Deny(String::new())),
         ] {
             right -= w;
             if button(p, ui, Rect::new(right, y, w, 30.0), label, style, true) {
@@ -814,10 +883,46 @@ impl Shell {
             }
             right -= 8.0;
         }
+        // What is written in the message box goes with a no, as the reason.
+        let (label, wide) =
+            if self.reason().is_empty() { ("Deny  esc", 92.0) } else { ("Deny with reason  esc", 164.0) };
+        if button(p, ui, Rect::new(right - wide, y, wide, 30.0), label, ButtonStyle::Ghost, true) {
+            self.deny(actions);
+        }
         if let Some(verdict) = verdict {
             self.decide(verdict, actions);
         }
         card.y - 6.0
+    }
+
+    /// What is written in the message box while an approval waits: why the
+    /// user says no to it, if they do.
+    fn reason(&self) -> &str {
+        self.composer.editor.text().trim()
+    }
+
+    /// Says no to the waiting approval. What is written in the message box
+    /// goes to the agent as the reason, so it knows what to do instead, and
+    /// is taken out of the box. Codex takes no reason with a no: there it
+    /// is sent as a message, which the agent reads at its next step.
+    pub(super) fn deny(&mut self, actions: &mut Vec<Action>) {
+        if self.thread().is_none_or(|thread| thread.asks.is_empty()) {
+            return;
+        }
+        let why = self.reason().to_owned();
+        let codex = self.agent_in_use().is_some_and(|agent| {
+            self.config.connection(&agent.connection).is_some_and(|c| c.kind == ConnectionKind::Codex)
+        });
+        if why.is_empty() || !codex {
+            if !why.is_empty() {
+                self.composer.editor.take();
+            }
+            self.decide(Verdict::Deny(why), actions);
+        } else {
+            self.decide(Verdict::Deny(String::new()), actions);
+            let (text, files) = self.take_draft();
+            self.send(&text, false, files, actions);
+        }
     }
 }
 
@@ -874,6 +979,64 @@ mod tests {
         composer.files.clear();
         composer.show("c");
         assert!(!composer.drafts.contains_key("a"));
+    }
+
+    #[test]
+    fn the_up_arrow_brings_back_earlier_messages() {
+        let sent = ["third", "second\nline", "first"];
+        let mut composer = Composer::default();
+        // Down in an empty box, and either arrow with nothing sent, is the caret's.
+        assert!(!composer.recall(false, &sent) && !composer.recall(true, &[]));
+        assert!(composer.recall(true, &sent));
+        assert_eq!(composer.editor.text(), "third");
+        assert!(composer.recall(true, &sent) && composer.recall(true, &sent));
+        assert_eq!(composer.editor.text(), "first");
+        // The oldest stays, and down comes forward again, to the empty box.
+        assert!(composer.recall(true, &sent));
+        assert_eq!(composer.editor.text(), "first");
+        assert!(composer.recall(false, &sent));
+        assert_eq!(composer.editor.text(), "second\nline");
+        assert!(composer.recall(false, &sent) && composer.recall(false, &sent));
+        assert!(composer.editor.text().is_empty());
+        assert!(!composer.recall(false, &sent), "back at the empty box");
+
+        // Changed, it is the user's own: the arrows move the caret in it.
+        assert!(composer.recall(true, &sent));
+        composer.editor.insert(" time");
+        assert!(!composer.recall(true, &sent) && !composer.recall(false, &sent));
+        assert_eq!(composer.editor.text(), "third time");
+        // Their own words are never replaced, also not ones that match an old message by chance.
+        composer.editor.take();
+        composer.editor.insert("first");
+        assert!(!composer.recall(true, &sent));
+        // Emptied, it starts from the newest again; another session's box starts fresh.
+        composer.editor.take();
+        assert!(composer.recall(true, &sent) && composer.recall(true, &sent));
+        composer.show("a");
+        composer.show("b");
+        composer.show("a");
+        assert_eq!(composer.editor.text(), "second\nline", "kept as a draft");
+        assert!(!composer.recall(true, &sent), "but no longer one being gone through");
+    }
+
+    #[test]
+    fn the_arrows_go_through_what_the_session_was_sent() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        assert!(!shell.recall(true), "no session: nothing was sent");
+        let mut info = atroxabot_core::ClaudeInfo::default();
+        info.account.email = "me@example.com".into();
+        shell.claude_info(atroxabot_core::Connection::CLAUDE_AGENT, Ok(info));
+        let mut actions = Vec::new();
+        for text in ["Fix the bug", "Run the tests", "Run the tests"] {
+            shell.send(text, false, Vec::new(), &mut actions);
+            let session = shell.current.clone().expect("a session");
+            shell.agent_event(&session, atroxabot_core::AgentEvent::TurnEnded { problem: None }, &mut actions);
+        }
+        // The same message twice in a row is one step back.
+        assert!(shell.recall(true));
+        assert_eq!(shell.composer.editor.text(), "Run the tests");
+        assert!(shell.recall(true));
+        assert_eq!(shell.composer.editor.text(), "Fix the bug");
     }
 
     #[test]

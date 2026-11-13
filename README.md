@@ -192,6 +192,21 @@ in Settings, Providers.
   that opens to its input and output. Text can be selected with the mouse, across messages too.
   Sessions are saved as they go and reopen where they were. Click the title in the top bar to rename a
   session (Enter keeps the new name, Esc the old one).
+- **Edits as a diff.** A call that changes a file (Claude Code's `Edit`, `MultiEdit` and `Write`, an API
+  agent's `edit` and `write`, a Codex file change) says on its row how many lines it added and removed,
+  and opens to those lines: what went in red, what came in green, the lines it only quoted to find its
+  place between them. An edit that failed opens to what it tried and why it failed. Under a turn that
+  changed files, a line lists them with their counts (a subagent's included); a click on one shows all
+  the turn did to that file. This is read from the agent's own edits: what a command it ran changed is in
+  the side panel's git view.
+- **Find in a session** (Ctrl/Cmd+F). A bar at the top of the conversation finds what you type in
+  everything the conversation shows, whatever its case: every place is washed, the one in hand more
+  strongly, with how many there are. Enter or the down arrow goes to the next, Shift+Enter or the up arrow
+  to the one before, around the ends; Esc closes it. Text marked in the conversation is looked for
+  straight away. Reasoning and a tool's details are searched once they are open.
+- **Earlier messages.** In an empty message box the up arrow brings back the last message you sent in the
+  session, and again the one before; the down arrow comes forward again. Once you change what came back,
+  the arrows move the caret as ever.
 - **Sidebar order.** A session stays where it is, however busy it gets: a new one starts on top, and you
   drag one up or down to put it where you want it. That order is remembered.
 - **A folder per session.** Click the folder chip for the folders used lately, or to choose another. A new
@@ -200,9 +215,11 @@ in Settings, Providers.
   included.
 - **Files and pictures.** Add files with the paperclip, by dropping them on the window, or by pasting
   (Ctrl/Cmd+V) a copied picture or copied files. They ride under the message as pills (a click takes one
-  off) and show in the conversation with it. A picture (PNG, JPEG, GIF or WebP, up to 3.5 MB) goes to the
-  model, so it sees it; any other file is named to the agent by its path, and the agent reads it with its
-  own tools. A click on a picture in the conversation opens it over the screen, as large as fits but never
+  off) and show in the conversation with it. A picture (PNG, JPEG, GIF or WebP) goes to the model, so it
+  sees it; any other file is named to the agent by its path, and the agent reads it with its own tools. A
+  picture larger than a model is shown anyway (over 2000 pixels a side, or 3.5 MB) is sent as a smaller
+  copy, made once and kept in the app's folder: a screenshot stays a PNG, a photo becomes a JPEG. That
+  costs fewer tokens and no detail the model would have seen. A click on a picture in the conversation opens it over the screen, as large as fits but never
   larger than it is; a click beside it, the cross or Esc puts it away.
 - **`@` for files.** Typing `@` lists the files of the session's folder (what git tracks or would;
   without a repository, what is there, short of hidden and dependency folders). Type on to narrow it,
@@ -229,6 +246,13 @@ so several sessions can change one repository without touching each other or you
   session starts the way its last one did.
 - The agent is told where it is and to commit there. The top bar shows the folder the worktree stands
   for, with a branch icon; the side panel says what it came from and how many commits are still to merge.
+- **Local files** (`.worktreeinclude`). A worktree holds what git checks out, so a local `.env` would be
+  missing. Name such files in a `.worktreeinclude` at the top of the repository, one pattern a line as in
+  a `.gitignore` (`.env`, `config/*.local`, `certs/`): every worktree made of the repository gets a copy
+  of those of them that git ignores, from the checkout the session was started in, and gets them again
+  when it is made again. They are copies, so a session cannot change yours; a file git tracks is never
+  written over; and at most 2,000 files and 256 MB are copied (a notice says when more was named). The
+  app runs no setup command by itself: the agent installs what a build needs, asked as for any command.
 
 Worktrees clean up after themselves (Settings, Worktrees):
 
@@ -262,7 +286,9 @@ page lists every worktree on disk, with what it holds and how much room it takes
     ended, and the agent shows it is working from the moment Claude Code runs again ("Thinking…" while it
     reasons, since summarised reasoning only arrives once it is done).
 - **Approvals.** A call that needs your approval waits on a card above the message box: Enter allows it,
-  Esc denies it, *Always allow* stops asking for the session.
+  Esc denies it, *Always allow* stops asking for the session. To say why not, write it in the message box
+  first: *Deny with reason* (or Esc) then gives the agent your words with the no, so it knows what to do
+  instead, and the box is empty again. Codex takes no words with a no; there they follow it as a message.
 - **Autonomy**, set in the agent's editor:
 
   | Level | Claude account and API | Codex account |
@@ -322,9 +348,9 @@ Each session has its own provider, model and effort.
   keeps the provider it was left on, so swapping in one leaves the agent's other sessions where they are,
   and going back to a session goes back to its account and the conversation that account holds. A Claude
   or Codex account that never saw the conversation is handed what was said so far. Moving to another
-  account of the same kind (one Claude account for another) keeps the model and effort and takes away the
-  notice of the account that was left. A message after the switch goes to a Claude Code started for the
-  new account, even if the old one was still answering.
+  account of the same kind (one Claude account for another) keeps the model where that account offers it
+  too. The effort always goes along, also one you never picked yourself. A message after the switch goes
+  to a Claude Code started for the new account, even if the old one was still answering.
 - **Models from the provider.** The model menu under the message box lists what the provider offers: a
   Claude account's list comes from Claude Code (so it is always current; of a family in several versions
   only the newest shows), a Codex account's from Codex (each with its efforts and the effort Codex gives
@@ -335,7 +361,9 @@ Each session has its own provider, model and effort.
   uses its usual level until you are on one that has it again. A model that takes no effort shows none.
   Picking an effort closes the menu. A session shows its own model and effort as it opens, before its
   messages are read, and a new session starts with the last ones picked. A session moved to another kind
-  of provider takes that provider's default.
+  of provider takes that provider's default model, at the effort it had where that model takes it. On a
+  Claude account another model or effort goes to the Claude Code that is already running (as its own
+  `/model` does), so nothing is started again and what it runs in the background stays.
 - **When an account runs out** (Settings, Providers). When a Claude or Codex account's usage limit stops
   a turn, the session can:
   - *Wait for limit refill* (the default): it goes on by itself a minute after the limit lifts, so you can
@@ -364,9 +392,9 @@ Each session has its own provider, model and effort.
   request experimental: should Claude Code stop answering it as the app expects, the panel says *Not
   checked: Claude Code's /usage has changed* (its answer on the line's tooltip, and in the log), the
   numbers come with replies only, and the app needs an update; the app does not ask again by itself until
-  it starts again. A used-up window says *Limit reached* and when it starts over. Reaching a limit is said
-  in a notice that names the account, counts down to when it lifts, and goes away by itself then; it shows
-  only on the sessions that use that account. A Codex account's limits show the same way, as Codex reports
+  it starts again. A used-up window says *Limit reached* and when it starts over. A session that runs
+  into a limit says so in its conversation, and in the row above its message box when it waits; no notice
+  is put over the session for it. A Codex account's limits show the same way, as Codex reports
   them (when the app starts, with each turn, and when they are asked about as above).
 - **Provider marks.** A provider wears its platform's logo (Claude, Anthropic, OpenAI, OpenRouter, Meta,
   Gemini, Mistral, Ollama), in the platform's colour where it has one; others get an icon. The marks are
@@ -424,7 +452,13 @@ Anthropic's web search and fetch.
   the nearest last; the same text under two names is given once.
 
 **Token discipline**, on every provider: a session's system prompt and tool list do not change and its
-history is only added to, so every request reuses the provider's prompt cache. Tool outputs are bounded
+history is only added to, so every request reuses the provider's prompt cache. That holds for accounts
+too: what a Claude or Codex session is told of the agent's notes is what they said when the session
+began, kept with the session, so a process started again later (after the app restarted, or after it
+was closed for idling) takes up the conversation under the same prompt and the cache still serves it.
+An account's process is not closed the moment you look at another session: it stays for 15 minutes
+after you left a session with nothing to do (the three left last, at most), so coming back answers at
+once. Tool outputs are bounded
 (long files read in pages, long outputs cut in the middle, both saying so). Claude's thinking is replayed
 unchanged, so it keeps its reasoning between tool calls. Long conversations are summarised: by Anthropic's
 server-side compaction on its own API, by a request of the app's elsewhere.
@@ -465,7 +499,11 @@ server-side compaction on its own API, by a request of the app's elsewhere.
 
 - **The side panel** (the last icon of the top bar). Where the window is too narrow to set it beside the
   session, it floats over the session under the top bar; Esc or a click outside it puts it away.
-  - What the session used and how full its context is. Rest the mouse on the context to see what it
+  - What the session used and how full its context is. Under a context of 100,000 tokens or more, a
+    line says how long the provider still keeps it cached (*Cached for 38 more min*, then *No longer
+    cached*), with *Compact* beside it: a message sent in time reads the conversation at about a tenth of
+    the usage, a later one counts all of it once, and compacting before that is cheap. It is a line to
+    glance at, never a question. Known for Claude accounts and Anthropic's API. Rest the mouse on the context to see what it
     holds: the system prompt, the tools (the app's or Claude Code's, and those of MCP servers), the
     skills, memory files, the messages and the free space. A Claude account reports this after each turn
     (`get_context_usage`, as `/context` shows it, which uses nothing); for an API provider the app sizes
@@ -475,8 +513,9 @@ server-side compaction on its own API, by a request of the app's elsewhere.
   - What Claude Code runs in the background (a command, a monitor), while it runs. The session's
     Claude Code process stays up for it when you open another session (the sidebar shows a still dot by
     the session), so it can finish and the agent can answer it. Should the process end anyway (it
-    stopped, or the session's next message goes with another account, model or effort), a line in the
-    conversation says which task was stopped with it. Nothing of it outlives the app.
+    stopped, or the session's next message goes with another account), a line in the conversation says
+    which task was stopped with it. What a subagent runs in the background is the subagent's: it shows in
+    the subagent, not as lines in your conversation. Nothing of it outlives the app.
   - The git repository of the session's folder: the branch (a click switches it), how far it is from what
     it tracks, and the changed files with their added and removed lines (a click opens the diff).
     Committing and pushing are the agent's: the panel only shows. It uses your installed `git` and reads
@@ -484,7 +523,8 @@ server-side compaction on its own API, by a request of the app's elsewhere.
 - **Spotlight** (Ctrl/Cmd+K, or the magnifier over the agents). One field over everything: it finds
   sessions by title at once and by what was said in them a moment later, agents by name, and things to do
   (a new session, a new agent, the statistics, the settings, the side panel). Arrows move, Enter opens,
-  Esc closes.
+  Esc closes. A session found by what was said in it opens at that place, with the words washed and the
+  find bar open on them.
 - **Statistics** (the chart at the foot of the sidebar). Tokens, cost, sessions, tool calls, cache hits,
   active days, streaks and the busiest day, over the last 7, 30 or 90 days, a year or all time; a year of
   days as a grid that is brighter the more was used (by tokens, cost or tool calls); the period day by
@@ -528,13 +568,15 @@ Ctrl on Windows and Linux, Cmd on macOS.
 | Ctrl+N | New session |
 | Ctrl+Shift+N | New agent |
 | Ctrl+K | Spotlight |
+| Ctrl+F | Find in the session (Enter / Shift+Enter: next / previous) |
+| ↑ / ↓ in an empty message box | Earlier messages you sent |
 | Enter | Send (while the agent works: put in line for its next step) |
 | Ctrl+Enter | *Send now*: stop the step in progress and send what waits |
 | Esc | Stop the turn; close a menu, list, card or picture |
 | Tab | Take the suggested next message |
 | `@` / `/` | List the folder's files / the commands and skills |
 | Ctrl+V | Paste a picture or copied files |
-| Enter / Esc on an approval | Allow / deny |
+| Enter / Esc on an approval | Allow / deny (with what is written in the message box as the reason) |
 | 1, 2, 3 … on a question | Pick that option |
 | Ctrl + / Ctrl - | Zoom |
 | M / Esc on a call | Mute / hang up |
@@ -664,7 +706,7 @@ To look at the design without opening the app, draw every screen offscreen in ev
 | `crates/claude-agent` (`atroxabot-claude-agent`) | Rust port of the Claude Agent SDK's transport and control protocol. Only dependency: `serde_json`. |
 | `crates/codex` (`atroxabot-codex`) | Drives the installed Codex CLI through `codex app-server`: the handshake, threads and turns as a state machine without I/O (`machine.rs`), its messages (`parse.rs`), the process (`session.rs`), finding the binary (`cli.rs`). Only dependency: `serde_json`. |
 | `crates/mcp` (`atroxabot-mcp`) | A small MCP client (stdio and Streamable HTTP): lists a server's tools and calls them. |
-| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Anthropic's Messages in `messages.rs`, OpenAI's Responses in `openai.rs`, Chat Completions in `completions.rs`); the agent loop and its tools (`engine.rs`, `tools.rs`, and `pattern.rs`, the regular expressions `search` reads); the Claude Agent and Codex engines (`claude.rs`, `codex.rs`); usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the sessions' worktrees and their cleaning up (`worktree.rs`); updating the app from a signed release (`update.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
+| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Anthropic's Messages in `messages.rs`, OpenAI's Responses in `openai.rs`, Chat Completions in `completions.rs`); the agent loop and its tools (`engine.rs`, `tools.rs`, and `pattern.rs`, the regular expressions `search` reads); the Claude Agent and Codex engines (`claude.rs`, `codex.rs`); usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the sessions' worktrees and their cleaning up (`worktree.rs`); pictures read and made small enough for a model (`picture.rs`); updating the app from a signed release (`update.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
 | `crates/voice` (`atroxabot-voice`) | Fish Audio and ElevenLabs speech-to-text and text-to-speech, voice-activity detection, the call loop, and audio devices (`cpal`). |
 | `crates/desktop` | The app (`atroxabot`): winit window, wgpu renderer, text engine, immediate-mode UI. |
 
@@ -680,8 +722,10 @@ same way.
 - `logo.rs`: the app's own mark (three bodies in a line) and the platforms' marks, from the outlines in
   `assets/logos/`.
 - `tray.rs`: what closing the window does, and the Windows tray icon, through Win32 directly.
-- `shell/`: the screen. `sidebar.rs`, `thread.rs`, `composer.rs`, `queue.rs`, `limits.rs` (what a session
-  does when its account runs out), `plan.rs` (when an account is asked where its limits stand),
+- `shell/`: the screen. `sidebar.rs`, `thread.rs`, `change.rs` (an edit call as the lines of a diff),
+  `find.rs` (finding text in the conversation), `composer.rs`, `queue.rs`, `limits.rs` (what a session
+  does when its account runs out), `plan.rs` (when an account is asked where its limits stand), `warm.rs`
+  (how long an account's process outlives the look at its session),
   `question.rs`, `menu.rs`, `panel.rs`, `picture.rs`, `spotlight.rs`,
   `stats.rs`, `agent_form.rs`, `settings.rs`, `skills.rs`, `worktrees.rs`, `update.rs` (the app's version
   and its update button), `call.rs`, `widgets.rs`.
@@ -718,7 +762,7 @@ Everything lives in `~/.atroxabot/`:
 | `worktrees/<repository>-<session id>/` | The git worktree of each session that works in one. The app makes and removes them; agents' file tools may work in them as in any folder. |
 | `claude/<id>/` | The Claude Code configuration folder of each extra Claude account. Claude Code owns what is in it. Removing an account in Settings leaves the folder, and so its sign-in, where it is. |
 | `codex/<id>/` | The Codex home of each extra Codex account. Codex owns what is in it. Removing an account in Settings leaves the folder, and so its sign-in, where it is. |
-| `desktop.log`, `desktop-crash.log`, `desktop.lock` | The app's log, crash reports, and what keeps it to one running copy. |
+| `desktop.log`, `desktop-crash.log`, `desktop.lock` | The app's log (every time an agent's process ended unexpectedly is in it, with the last thing it said about why), crash reports, and what keeps it to one running copy. |
 
 Files the app writes are written atomically, `0600` on Unix. An API key is only sent to the address it was
 saved for.
@@ -784,7 +828,8 @@ Deliberate, for now.
 - **Worktrees**: merged work is recognised from what your repository knows, so a pull request merged on
   the server counts once you have fetched or pulled (the app does not fetch); until then the
   unused-worktree rule cleans it up. What git ignores in a worktree (build output, a local `.env`) goes
-  with it. A session that has started cannot move into or out of a worktree; start a new one.
+  with it; what `.worktreeinclude` names is copied in again when the worktree is made again, anything else
+  is not. Nothing is installed in a new worktree by the app: the agent does that. A session that has started cannot move into or out of a worktree; start a new one.
 - **Agents**: no agent-to-agent handoff and no scheduled jobs.
 - **API agents**: their subagents share their agent's model and cannot ask you anything, keep a task list
   or start subagents of their own; what they use is in the statistics but not in their session's total.
@@ -795,7 +840,12 @@ Deliberate, for now.
 - **`search`** reads the usual regular expressions (classes, groups, `|`, repetition, `\b`) but no
   look-around or back-references: such a pattern is looked for as plain text, and the answer says so. It
   matches within a line.
-- **Selection** does not reach into reasoning or a tool's details.
+- **Selection** does not reach into reasoning or a tool's details (finding with Ctrl+F does). Find looks
+  through what the conversation shows, so not through reasoning or details that are folded away, and not
+  through a subagent's conversation unless that is the one open.
+- **Edits as a diff** show what the agent's own edit calls say: a file a command changed (a formatter, a
+  script) is not in a turn's list, and the lines of an edit are compared within what the call quoted, not
+  with the file on disk.
 - **Pictures**: an agent's reply shows none (Markdown images are not drawn), so only the pictures you send
   appear in the conversation. An opened picture is not zoomed past the window; a GIF is not decoded, so it
   shows as a placeholder.

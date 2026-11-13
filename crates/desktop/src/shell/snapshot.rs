@@ -60,17 +60,22 @@ fn snapshots() {
         let mut welcome = shell();
         welcome.current = None;
         welcome.files_picked(vec!["C:\\shots\\error.png".into(), "C:\\code\\parser\\notes.md".into()]);
-        let mut asking = shell();
-        if let Some(thread) = asking.thread_mut() {
-            thread.busy = true;
-            thread.asks.push(Ask {
-                id: "a".into(),
-                tool: "Bash".into(),
-                input: "{}".into(),
-                summary: "cargo test --workspace".into(),
-                reason: "This command is not on the allowed list.".into(),
-            });
-        }
+        // An approval waits; with something written in the message box, a no takes it as its reason.
+        let approval = |written: &str| {
+            let mut asking = shell();
+            if let Some(thread) = asking.thread_mut() {
+                thread.busy = true;
+                thread.asks.push(Ask {
+                    id: "a".into(),
+                    tool: "Bash".into(),
+                    input: "{}".into(),
+                    summary: "cargo test --workspace".into(),
+                    reason: "This command is not on the allowed list.".into(),
+                });
+            }
+            asking.composer.editor.insert(written);
+            asking
+        };
         let mut model = shell();
         model.open_menu(Menu::Model, Rect::new(474.0, 836.0, 150.0, 30.0));
         let mut folder = shell();
@@ -571,11 +576,87 @@ fn snapshots() {
             hold: false,
             muted: false,
         });
+        // Edits in the conversation: how many lines each changed on its row, one opened to its lines and
+        // one that failed opened to why. Its context is large: the side panel says how long it stays cached.
+        let edits = |cached: bool| {
+            let mut edits = panel();
+            let turn = edits.current.clone().unwrap_or_default();
+            edits.send("Fix the escape handling and cover it with a test", false, Vec::new(), &mut Vec::new());
+            let file = "C:\\code\\parser\\src\\tokenizer.rs";
+            let edit = serde_json::json!({
+                "file_path": file,
+                "old_string": "            '\\\\' => {\n                self.advance();\n                self.push(Token::Escape);\n            }",
+                "new_string": "            '\\\\' => {\n                // Keep the character the backslash escapes: it is part of the string.\n                let escaped = self.advance();\n                self.push(Token::Escape(escaped));\n            }",
+            });
+            let test = serde_json::json!({
+                "file_path": "C:\\code\\parser\\tests\\escapes.rs",
+                "content": "use parser::tokenize;\n\n#[test]\nfn a_backslash_keeps_what_it_escapes() {\n    assert_eq!(tokenize(r#\"\\\"\"#).len(), 1);\n}\n",
+            });
+            let missing =
+                serde_json::json!({ "file_path": file, "old_string": "fn skip_escape(", "new_string": "fn escape(" });
+            let call = |id: &str, name: &str, input: &serde_json::Value| {
+                AgentEvent::ToolCall(ToolUse {
+                    id: id.into(),
+                    name: name.into(),
+                    input: input.to_string(),
+                    ..ToolUse::default()
+                })
+            };
+            let done = |id: &str, output: &str, is_error: bool| AgentEvent::ToolResult {
+                id: id.into(),
+                output: output.into(),
+                is_error,
+            };
+            let ended = AgentEvent::ReplyEnded {
+                raw: Vec::new(),
+                wire: atroxabot_core::Wire::Messages,
+                model: "claude-opus-5-5".into(),
+                usage: Usage { input_tokens: 412_300, output_tokens: 900, cached_tokens: 400_000, ..Usage::default() },
+                cost: 0.0,
+                problem: String::new(),
+            };
+            for event in [
+                AgentEvent::ReplyStarted,
+                AgentEvent::Text(
+                    "The escape branch drops the character after the backslash. I'll keep it, and add a test.".into(),
+                ),
+                call("e1", "Edit", &edit),
+                done("e1", "The file C:\\code\\parser\\src\\tokenizer.rs has been updated successfully.", false),
+                call("w1", "Write", &test),
+                done("w1", "File created successfully.", false),
+                call("e2", "Edit", &missing),
+                done("e2", "String to replace not found in file.\nString: fn skip_escape(", true),
+                AgentEvent::Text(
+                    "The helper I meant to rename is gone already, so there is nothing more to change.".into(),
+                ),
+                ended,
+                AgentEvent::Window(1_000_000),
+                AgentEvent::Cached(if cached { unix_now() + 38 * 60 - 5 } else { unix_now() - 60 }),
+                AgentEvent::TurnEnded { problem: None },
+            ] {
+                edits.agent_event(&turn, event, &mut Vec::new());
+            }
+            if let Some(thread) = edits.thread_mut() {
+                let reply = thread.session.entries.len() - 1;
+                thread.open_block(reply, 1);
+                thread.open_block(reply, 3);
+            }
+            edits
+        };
         let screens = vec![
             ("first-run", Shell::new(Config::default(), Vec::new(), Vec::new())),
             ("session", shell()),
             ("welcome", welcome),
-            ("approval", asking),
+            ("find", {
+                // The bar that finds text in the conversation, at its second match.
+                let mut finding = shell();
+                if let Some(thread) = finding.thread_mut() {
+                    thread.open_find("escape", true, false);
+                }
+                finding
+            }),
+            ("approval", approval("")),
+            ("approval-reason", approval("Only the parser crate: the rest takes ten minutes")),
             ("menu-model", model),
             ("menu-folder", folder),
             ("menu-provider", provider),
@@ -629,6 +710,8 @@ fn snapshots() {
             ("add-mcp", adding(Tab::Integrations, Adding::Mcp(false))),
             ("agent", editor),
             ("call", call),
+            ("edits", edits(true)),
+            ("edits-cache-cold", edits(false)),
         ];
         // Tooltips: the mouse rests on a row of the side panel (which starts at x 1112).
         let hovered = [("tip-task", tasks(), (1200.0, 313.0)), ("tip-context", context, (1180.0, 90.0))];
