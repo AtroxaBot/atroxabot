@@ -121,16 +121,50 @@ impl Shell {
         Some(agent)
     }
 
-    /// Whether the provider `connection` offers `model`, as far as is known:
-    /// the default always, and any while its list is not in.
-    fn offers(&self, connection: &str, model: &str) -> bool {
-        let Some(connection) = self.config.connection(connection) else { return false };
-        let choices = self.model_choices(&connection);
-        model.is_empty() || choices.is_empty() || choices.iter().any(|choice| choice.value == model)
+    /// The model `chosen` stands for on `from`, by its full name, as the
+    /// value `to` lists it by: an account's default is its own (one plan's
+    /// is Opus, another's Sonnet, or what `/model` set in it), and Claude
+    /// Code lists a model by an alias (`default`, `opus`). Empty for `to`'s
+    /// default when that is the same model, and when `to` does not offer it.
+    fn same_model(&self, from: &str, chosen: &str, to: &str) -> String {
+        let (Some(from), Some(to)) = (self.config.connection(from), self.config.connection(to)) else {
+            return String::new();
+        };
+        let offered = self.model_choices(&to);
+        if self.model_choices(&from).is_empty() {
+            // What `from` stood for is not known: a model picked by name goes along by it.
+            let listed = offered.is_empty() || offered.iter().any(|choice| choice.value == chosen);
+            return if listed { chosen.to_owned() } else { String::new() };
+        }
+        let wanted = self.full_name(&from, &self.model_in_use(&from, chosen).value);
+        if offered.is_empty() {
+            // `to`'s list is not in: its default may be another model, so it is named in full.
+            return if chosen.is_empty() { wanted } else { chosen.to_owned() };
+        }
+        match offered.iter().position(|choice| self.full_name(&to, &choice.value) == wanted) {
+            Some(0) => String::new(),
+            Some(at) => offered[at].value.clone(),
+            // Not by its full name: by the name it was picked by, or else `to`'s default.
+            None if offered.iter().skip(1).any(|choice| choice.value == chosen) => chosen.to_owned(),
+            None => String::new(),
+        }
+    }
+
+    /// The full name of the model `value` on `connection`: what Claude Code
+    /// resolves an alias to, the value itself elsewhere.
+    pub(super) fn full_name(&self, connection: &Connection, value: &str) -> String {
+        if connection.kind == ConnectionKind::ClaudeAgent
+            && let Some(Account::Ready(info)) = self.claude.get(&connection.id)
+            && let Some(model) = info.models.iter().find(|model| model.value == value && !model.resolved.is_empty())
+        {
+            return model.resolved.clone();
+        }
+        value.to_owned()
     }
 
     /// `agent` on the provider `to`. Its model goes along where `to`
-    /// offers it (from one Claude account to another), and its effort goes
+    /// offers it (from one Claude account to another), also when it was
+    /// its provider's default ([`Shell::same_model`]), and its effort goes
     /// along always: also one the user never picked, which was its model's
     /// usual one, and also when `to` gives it another model. A model that
     /// does not take that effort thinks at its own ([`Shell::effort_in_use`]).
@@ -143,10 +177,12 @@ impl Shell {
             agent.effort = Self::effort_in_use(from.kind, &model, "");
         }
         let from = std::mem::replace(&mut agent.connection, to.to_owned());
-        if !self.kin(&from, to) || !self.offers(to, &agent.model) {
+        agent.model = if self.kin(&from, to) {
+            self.same_model(&from, &agent.model, to)
+        } else {
             // Another provider has other models: its default, until one is picked.
-            agent.model.clear();
-        }
+            String::new()
+        };
         agent
     }
 
@@ -618,6 +654,68 @@ mod tests {
         let (shell, _, _) = two_accounts(OutOfLimits::Wait);
         let unpicked = Agent { effort: String::new(), ..shell.agent_in_use().expect("agent") };
         assert_eq!(shell.moved(unpicked, "work").effort, "");
+    }
+
+    /// Claude Code's list for an account: each value with the model it stands for.
+    fn resolves(shell: &mut Shell, account: &str, models: &[(&str, &str)]) {
+        let mut info = ClaudeInfo::default();
+        info.account.email = "me@example.com".into();
+        info.models = models
+            .iter()
+            .map(|(value, resolved)| atroxabot_core::ClaudeModel {
+                value: (*value).to_owned(),
+                resolved: (*resolved).to_owned(),
+                efforts: vec!["low".into(), "medium".into(), "high".into()],
+                ..atroxabot_core::ClaudeModel::default()
+            })
+            .collect();
+        shell.claude_info(account, Ok(info));
+    }
+
+    #[test]
+    fn a_session_on_its_accounts_default_keeps_that_model_on_another() {
+        const OPUS: &str = "claude-opus-5-5";
+        const SONNET: &str = "claude-sonnet-5-5";
+        // The first account's default is Opus, the other's Sonnet; the session never picked a model.
+        let (mut shell, session, mut actions) = two_accounts(OutOfLimits::Switch);
+        resolves(&mut shell, Connection::CLAUDE_AGENT, &[("default", OPUS), ("sonnet", SONNET)]);
+        resolves(&mut shell, "work", &[("default", SONNET), ("opus", OPUS)]);
+        let mut scout = shell.agent_in_use().expect("agent");
+        scout.model.clear();
+        shell.choose_thinking(scout, &mut actions);
+        let in_use = |shell: &Shell| {
+            let agent = shell.agent_of(&session).expect("agent");
+            (agent.connection, agent.model, agent.effort)
+        };
+
+        // Out of usage, it goes on with Opus on the other account, as it does when moved by hand.
+        run_out(&mut shell, &session, unix_now() + 3_600, &mut actions);
+        assert_eq!(in_use(&shell), ("work".into(), "opus".into(), "high".into()));
+        shell.choose(Menu::Provider, Connection::CLAUDE_AGENT, &mut actions);
+        assert_eq!(
+            in_use(&shell),
+            (Connection::CLAUDE_AGENT.into(), String::new(), "high".into()),
+            "the default again"
+        );
+        // Sonnet, picked here, is the other's default: it goes there as that.
+        shell.choose(Menu::Model, "sonnet", &mut actions);
+        shell.choose(Menu::Provider, "work", &mut actions);
+        assert_eq!(in_use(&shell), ("work".into(), String::new(), "high".into()));
+
+        // Before the other account's models are in, the model goes by its full name, and the menu
+        // shows it under its own once they are.
+        let (mut shell, session, mut actions) = two_accounts(OutOfLimits::Wait);
+        resolves(&mut shell, Connection::CLAUDE_AGENT, &[("default", OPUS), ("sonnet", SONNET)]);
+        let mut scout = shell.agent_in_use().expect("agent");
+        scout.model.clear();
+        shell.choose_thinking(scout, &mut actions);
+        shell.claude.insert("work".into(), Account::Checking);
+        shell.choose(Menu::Provider, "work", &mut actions);
+        assert_eq!(shell.agent_of(&session).expect("agent").model, OPUS);
+        resolves(&mut shell, "work", &[("default", SONNET), ("opus", OPUS)]);
+        let work = shell.config.connection("work").expect("work");
+        // The menu marks what `model_in_use` says.
+        assert_eq!(shell.model_in_use(&work, OPUS).value, "opus");
     }
 
     #[test]

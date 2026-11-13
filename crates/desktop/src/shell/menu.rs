@@ -390,14 +390,18 @@ impl Shell {
         choices
     }
 
-    /// The model `chosen` stands for on `connection`: the one named, or the
-    /// provider's default when none is.
+    /// The model `chosen` stands for on `connection`: the one named (by its
+    /// value, or by the full name it stands for, as a session moved from
+    /// another account names it), or the provider's default when none is.
     pub(super) fn model_in_use(&self, connection: &Connection, chosen: &str) -> ModelChoice {
-        let choices = self.model_choices(connection);
+        let mut choices = self.model_choices(connection);
         let found = if chosen.is_empty() {
             choices.into_iter().next()
         } else {
-            choices.into_iter().find(|choice| choice.value == chosen)
+            let at = choices.iter().position(|choice| choice.value == chosen);
+            let at =
+                at.or_else(|| choices.iter().position(|choice| self.full_name(connection, &choice.value) == chosen));
+            at.map(|at| choices.swap_remove(at))
         };
         found.unwrap_or_else(|| ModelChoice {
             value: chosen.to_owned(),
@@ -437,7 +441,7 @@ impl Shell {
     fn model_items(&self, connection: &Connection, chosen: &str, query: &str) -> Vec<Item> {
         let needle = query.trim().to_lowercase();
         let choices = self.model_choices(connection);
-        let in_use = if chosen.is_empty() { choices.first().map(|c| c.value.clone()) } else { Some(chosen.to_owned()) };
+        let in_use = self.model_in_use(connection, chosen).value;
         let fits = |c: &ModelChoice| {
             needle.is_empty() || c.label.to_lowercase().contains(&needle) || c.value.to_lowercase().contains(&needle)
         };
@@ -445,7 +449,7 @@ impl Shell {
             .into_iter()
             .filter(fits)
             .map(|choice| Item {
-                selected: in_use.as_deref() == Some(choice.value.as_str()),
+                selected: in_use == choice.value,
                 value: choice.value,
                 label: choice.label,
                 detail: choice.detail,

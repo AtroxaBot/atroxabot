@@ -349,7 +349,8 @@ Each session has its own provider, model and effort.
   and going back to a session goes back to its account and the conversation that account holds. A Claude
   or Codex account that never saw the conversation is handed what was said so far. Moving to another
   account of the same kind (one Claude account for another) keeps the model where that account offers it
-  too. The effort always goes along, also one you never picked yourself. A message after the switch goes
+  too, also when it was the old account's default (each account's default is its own, from its plan or
+  what `/model` set in it). The effort always goes along, also one you never picked yourself. A message after the switch goes
   to a Claude Code started for the new account, even if the old one was still answering.
 - **Models from the provider.** The model menu under the message box lists what the provider offers: a
   Claude account's list comes from Claude Code (so it is always current; of a family in several versions
