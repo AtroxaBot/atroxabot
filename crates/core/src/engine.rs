@@ -186,6 +186,9 @@ pub enum AgentEvent {
     /// answered, in turns of their own that follow at once. Comes just
     /// before [`AgentEvent::TurnEnded`], and only when there are some.
     Queued(u64),
+    /// Something went wrong outside the conversation that nothing else shows (a plugin that did not load):
+    /// told to the user, not kept in the session.
+    Warning(String),
     /// What the user may write next, as Claude Code guesses it. Comes a
     /// moment after [`AgentEvent::TurnEnded`], and not after every turn;
     /// nothing of it is kept in the session.
@@ -272,6 +275,11 @@ pub struct Ask {
     pub summary: String,
     /// Why it needs approval, when the engine says.
     pub reason: String,
+    /// The tool call it is about, when the engine says: a no marks it as not run ([`ToolUse::denied`]).
+    pub call: String,
+    /// Whether "always allow" can stop the engine asking about this kind of call again. Claude Code says
+    /// so by offering a rule to save, and offers none where saving one would not allow the call again.
+    pub always: bool,
 }
 
 /// What a question the user put away without answering it tells the model.
@@ -400,6 +408,7 @@ impl Session {
             AgentEvent::Queued(_)
             | AgentEvent::Background { .. }
             | AgentEvent::Suggestion(_)
+            | AgentEvent::Warning(_)
             | AgentEvent::Working
             | AgentEvent::Permission(_)
             | AgentEvent::PermissionGone(_)
@@ -1236,6 +1245,8 @@ impl ApiEngine {
             input: call.arguments.clone(),
             summary: asked.first().cloned().unwrap_or_default(),
             reason: String::new(),
+            call: String::new(),
+            always: false,
         };
         emit(session, AgentEvent::Permission(ask));
         let verdict = inbox.verdict(&call.call_id);
@@ -1264,6 +1275,8 @@ impl ApiEngine {
             input: call.arguments.clone(),
             summary: tools::summary(input),
             reason: String::new(),
+            call: call.call_id.clone(),
+            always: true,
         };
         emit(session, AgentEvent::Permission(ask));
         let verdict = inbox.verdict(&call.call_id);

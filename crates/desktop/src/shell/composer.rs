@@ -873,10 +873,11 @@ impl Shell {
         let y = card.bottom() - 42.0;
         let mut right = card.right() - 16.0;
         let mut verdict = None;
-        for (label, w, style, answer) in [
-            ("Allow  ↵", 92.0, ButtonStyle::Primary, Verdict::Allow),
-            ("Always allow", 112.0, ButtonStyle::Secondary, Verdict::AllowAlways),
-        ] {
+        // "Always allow" only where it can stop the asking; elsewhere it would be a second "Allow".
+        let always = ask.always.then_some(("Always allow", 112.0, ButtonStyle::Secondary, Verdict::AllowAlways));
+        for (label, w, style, answer) in
+            std::iter::once(("Allow  ↵", 92.0, ButtonStyle::Primary, Verdict::Allow)).chain(always)
+        {
             right -= w;
             if button(p, ui, Rect::new(right, y, w, 30.0), label, style, true) {
                 verdict = Some(answer);

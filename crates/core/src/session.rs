@@ -228,6 +228,9 @@ pub struct ToolUse {
     pub output: Option<String>,
     /// Whether the tool failed or was refused.
     pub is_error: bool,
+    /// The user said no when it asked to run: it never ran.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub denied: bool,
     /// What the subagent this call started said and did, in order.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub sub: Vec<Block>,

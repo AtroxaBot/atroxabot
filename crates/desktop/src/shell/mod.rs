@@ -191,6 +191,8 @@ pub struct Shell {
     installing: HashSet<Cli>,
     /// Problems to tell the user about, oldest first.
     notices: Vec<Notice>,
+    /// Warnings from the agents' processes already told this run: each process says them again as it starts.
+    warned: HashSet<String>,
     call: Option<CallView>,
     sidebar_scroll: Scroll,
     /// The repository of the folder the open session works in, for the side panel.
@@ -265,6 +267,7 @@ impl Shell {
             codex: HashMap::new(),
             installing: HashSet::new(),
             notices: Vec::new(),
+            warned: HashSet::new(),
             call: None,
             sidebar_scroll: Scroll::default(),
             git: GitView::default(),
@@ -1109,11 +1112,26 @@ impl Shell {
             return;
         }
         let ask = thread.asks.remove(0);
+        // A no to a tool call means it never ran: it says so, rather than that it failed. (A question
+        // put away is no tool call refused.)
+        if matches!(verdict, Verdict::Deny(_))
+            && ask.tool != question::TOOL
+            && let Some(call) = thread.session.find_tool(&ask.call)
+        {
+            call.denied = true;
+        }
         actions.push(Action::Decide { session: thread.session.id.clone(), ask: ask.id, verdict });
     }
 
     /// Something happened in the turn of `session`.
     pub fn agent_event(&mut self, session: &str, event: AgentEvent, actions: &mut Vec<Action>) {
+        // Nothing of the conversation: told once a run, as every process that starts says it again.
+        if let AgentEvent::Warning(text) = event {
+            if self.warned.insert(text.clone()) {
+                self.notify(text);
+            }
+            return;
+        }
         let on_call = self.call.as_ref().is_some_and(|call| call.session == session);
         let speaking = on_call && self.call.as_ref().is_some_and(|call| !call.hold);
         let suggesting = self.suggesting();
@@ -3251,8 +3269,13 @@ mod tests {
 
     #[test]
     fn a_no_takes_what_is_written_as_its_reason() {
-        use atroxabot_core::Ask;
+        use atroxabot_core::{Ask, ToolUse};
         let ask = |id: &str| AgentEvent::Permission(Ask { id: id.into(), tool: "Bash".into(), ..Ask::default() });
+        let call =
+            |id: &str| AgentEvent::ToolCall(ToolUse { id: id.into(), name: "Bash".into(), ..ToolUse::default() });
+        let marked = |shell: &mut Shell, session: &str, id: &str| {
+            shell.threads.get_mut(session).and_then(|t| t.session.find_tool(id)).is_some_and(|c| c.denied)
+        };
         let denied = |actions: &[Action]| {
             actions.iter().find_map(|a| match a {
                 Action::Decide { ask, verdict: Verdict::Deny(why), .. } => Some((ask.clone(), why.clone())),
@@ -3269,10 +3292,13 @@ mod tests {
         assert!(actions.is_empty() && shell.composer.editor.text() == "a thought");
         shell.composer.editor.take();
 
-        // Nothing written: a bare no.
-        shell.agent_event(&session, ask("a1"), &mut actions);
+        // Nothing written: a bare no. The call it was about never ran, and says so.
+        shell.agent_event(&session, call("t1"), &mut actions);
+        let about = Ask { id: "a1".into(), tool: "Bash".into(), call: "t1".into(), ..Ask::default() };
+        shell.agent_event(&session, AgentEvent::Permission(about), &mut actions);
         shell.deny(&mut actions);
         assert_eq!(denied(&actions), Some(("a1".into(), String::new())));
+        assert!(marked(&mut shell, &session, "t1"), "not run");
 
         // What is written goes with it, without the space around it; the files stay for a message.
         shell.agent_event(&session, ask("a2"), &mut actions);
@@ -3289,6 +3315,21 @@ mod tests {
         shell.deny(&mut actions);
         assert_eq!(denied(&actions), Some(("a3".into(), String::new())));
         assert!(shell.threads[&session].asks.is_empty());
+    }
+
+    /// A warning from an agent's process is told once a run, however many processes start and say it.
+    #[test]
+    fn a_warning_is_told_once() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        let session = working(&mut shell, &mut actions);
+        let warning = || AgentEvent::Warning("Claude Code could not load the plugin lint@team.".into());
+        shell.agent_event(&session, warning(), &mut actions);
+        assert_eq!(shell.notices.len(), 1);
+        shell.notices.clear();
+        shell.agent_event(&session, warning(), &mut actions);
+        assert!(shell.notices.is_empty(), "already told");
+        assert!(shell.threads[&session].session.entries.iter().all(|e| !format!("{e:?}").contains("lint@team")));
     }
 
     /// Codex takes no words with a no: they follow it as a message.

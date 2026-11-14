@@ -795,6 +795,9 @@ impl Mapper {
                     input: input.to_string(),
                     summary,
                     reason,
+                    call: request.item_id,
+                    // Codex takes any approval for the rest of the session.
+                    always: true,
                 }));
             }
             // A question, in the shape the app's question card reads.
@@ -822,6 +825,8 @@ impl Mapper {
                     input: json!({ "questions": questions }).to_string(),
                     summary,
                     reason: String::new(),
+                    call: String::new(),
+                    always: false,
                 }));
             }
             sdk::Event::RequestResolved { request_id } => {

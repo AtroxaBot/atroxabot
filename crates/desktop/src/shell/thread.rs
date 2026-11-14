@@ -1423,12 +1423,19 @@ impl Thread {
             let right = x + width - 24.0;
             right - super::panel::counts(p, lines, right, y + 5.0) + 8.0
         });
+        // One the user said no to never ran: it says so, where a failure would show its warning.
+        let refused = call.denied.then(|| p.layout("Not run", theme::TINY, None));
+        let refused_w = refused.as_ref().map_or(0.0, |note| note.width() + 10.0);
         let mut about = p.layout(&tools::summary(&input), Style::mono(12.5), None);
-        about.truncate(p.fonts, (width - name_w - 76.0 - counted).max(0.0));
+        about.truncate(p.fonts, (width - name_w - 76.0 - counted - refused_w).max(0.0));
         p.text(&about, x + 22.0 + name_w + 10.0, y + 3.0, t.text_faint);
         // How it went, at the row's right.
         let state = (x + width - 8.0, mid);
+        if let Some(note) = &refused {
+            p.text(note, state.0 - 12.0 - note.width(), mid - note.height() * 0.5, t.text_faint);
+        }
         match (&call.output, call.is_error) {
+            _ if call.denied => icon::draw(p, icon::X, state, 13.0, t.text_faint),
             (None, _) if live => spinner(p, ui, state, color),
             (None, _) => icon::draw(p, icon::X, state, 13.0, t.text_faint),
             (Some(_), true) => icon::draw(p, icon::ALERT, state, 14.0, t.danger),

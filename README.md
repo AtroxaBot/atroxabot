@@ -162,7 +162,7 @@ Codex by hand: `irm https://chatgpt.com/codex/install.ps1 | iex` on Windows,
 
 Your first Claude account in AtroxaBot, "Claude", is the Claude Code you already use: whoever `claude` is
 signed in as in your terminal, with your skills, plugins and settings. Add more accounts (work, personal)
-in Settings, Providers.
+in Settings, Providers. A plugin Claude Code could not load is said once in a notice, with why.
 
 ### Optional
 
@@ -286,9 +286,12 @@ page lists every worktree on disk, with what it holds and how much room it takes
     ended, and the agent shows it is working from the moment Claude Code runs again ("Thinking…" while it
     reasons, since summarised reasoning only arrives once it is done).
 - **Approvals.** A call that needs your approval waits on a card above the message box: Enter allows it,
-  Esc denies it, *Always allow* stops asking for the session. To say why not, write it in the message box
-  first: *Deny with reason* (or Esc) then gives the agent your words with the no, so it knows what to do
-  instead, and the box is empty again. Codex takes no words with a no; there they follow it as a message.
+  Esc denies it, *Always allow* stops asking for the session. *Always allow* shows only where it can: Claude
+  Code offers a rule to save only when that rule would allow the call again, and without one it would be a
+  second *Allow*. To say why not, write it in the message box first: *Deny with reason* (or Esc) then gives
+  the agent your words with the no, so it knows what to do instead, and the box is empty again. Codex takes
+  no words with a no; there they follow it as a message. A call you denied says *Not run* in the
+  conversation, not that it failed.
 - **Autonomy**, set in the agent's editor:
 
   | Level | Claude account and API | Codex account |

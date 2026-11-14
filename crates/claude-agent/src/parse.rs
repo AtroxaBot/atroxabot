@@ -55,6 +55,24 @@ pub(crate) enum Parsed {
 
 static NULL: Value = Value::Null;
 
+impl Init {
+    /// Plugins that did not load, as `(plugin, why)`: its `plugin_errors`, which the binary leaves out when
+    /// all of them loaded.
+    #[must_use]
+    pub fn plugin_errors(&self) -> Vec<(String, String)> {
+        field(&self.raw, "plugin_errors")
+            .as_array()
+            .map(|errors| {
+                errors
+                    .iter()
+                    .map(|error| (text(error, "plugin"), text(error, "message")))
+                    .filter(|(plugin, why)| !plugin.is_empty() || !why.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+}
+
 fn field<'a>(value: &'a Value, key: &str) -> &'a Value {
     value.get(key).unwrap_or(&NULL)
 }
@@ -668,6 +686,18 @@ mod tests {
         assert_eq!(init.session_id, "");
         assert!(init.tools.is_empty());
         assert!(init.mcp_servers.is_empty());
+        assert!(init.plugin_errors().is_empty());
+    }
+
+    #[test]
+    fn plugins_that_did_not_load() {
+        let line =
+            r#"{"type":"system","subtype":"init","plugin_errors":[{"plugin":"lint@team","type":"hook-load-failed",
+            "message":"hooks.json is not valid JSON"},{"plugin":"","type":"x"},7,{"message":"no name"}]}"#
+                .replace('\n', " ");
+        let Event::Init(init) = event(&line) else { panic!("not init") };
+        let said = |plugin: &str, why: &str| (plugin.to_owned(), why.to_owned());
+        assert_eq!(init.plugin_errors(), [said("lint@team", "hooks.json is not valid JSON"), said("", "no name")]);
     }
 
     #[test]

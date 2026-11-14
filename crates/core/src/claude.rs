@@ -581,7 +581,11 @@ impl Mapper {
             out.push(AgentEvent::Status(String::new()));
         }
         match event {
-            sdk::Event::Init(init) => out.push(AgentEvent::Remote(init.session_id)),
+            sdk::Event::Init(init) => {
+                let failed = init.plugin_errors();
+                out.push(AgentEvent::Remote(init.session_id));
+                out.extend(failed.into_iter().map(|(plugin, why)| AgentEvent::Warning(plugin_failed(&plugin, &why))));
+            }
             // Claude Code says it runs a turn, at its very start, its own turns included.
             sdk::Event::SessionState(state) if state == "running" => out.push(AgentEvent::Working),
             // The model starts answering: the earliest sign of a turn, and the only one of a turn Claude Code
@@ -766,6 +770,8 @@ impl Mapper {
             }
             sdk::Event::Permission(request) => {
                 let reason = request.decision_reason.or(request.description).or(request.title).unwrap_or_default();
+                // "Always" saves the rules Claude Code suggests: without one it would only allow this once.
+                let always = !request.suggestions.is_empty();
                 out.push(AgentEvent::Permission(Ask {
                     id: request.request_id,
                     // A question is known by the tool's own name, whatever it is shown as.
@@ -777,6 +783,8 @@ impl Mapper {
                     summary: tools::summary(&request.input),
                     input: request.input.to_string(),
                     reason,
+                    call: request.tool_use_id.unwrap_or_default(),
+                    always,
                 }));
             }
             sdk::Event::PermissionCancelled { request_id } => out.push(AgentEvent::PermissionGone(request_id)),
@@ -891,6 +899,16 @@ impl Mapper {
     }
 }
 
+/// What to tell the user of a plugin Claude Code could not load.
+fn plugin_failed(plugin: &str, why: &str) -> String {
+    let why = why.trim().trim_end_matches('.');
+    match (plugin.is_empty(), why.is_empty()) {
+        (false, false) => format!("Claude Code could not load the plugin {plugin}: {why}."),
+        (false, true) => format!("Claude Code could not load the plugin {plugin}."),
+        (true, _) => format!("Claude Code could not load a plugin: {why}."),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::json;
@@ -912,6 +930,62 @@ mod tests {
             assert_eq!(claude.args, ["-c", "curl -fsSL https://claude.ai/install.sh | bash"]);
             assert_eq!(codex.args[1], "curl -fsSL https://chatgpt.com/codex/install.sh | sh");
         }
+    }
+
+    #[test]
+    fn plugins_that_did_not_load_are_told() {
+        let init = sdk::Init {
+            session_id: "s".into(),
+            model: String::new(),
+            cwd: String::new(),
+            tools: Vec::new(),
+            mcp_servers: Vec::new(),
+            permission_mode: String::new(),
+            api_key_source: String::new(),
+            claude_code_version: String::new(),
+            raw: json!({ "plugin_errors": [
+                { "plugin": "lint@team", "type": "hook-load-failed", "message": "hooks.json is not valid JSON." },
+                { "plugin": "", "type": "x", "message": "gone" },
+            ] }),
+        };
+        let out = Mapper::default().map(sdk::Event::Init(init));
+        let warned: Vec<&str> = out
+            .iter()
+            .filter_map(|e| if let AgentEvent::Warning(text) = e { Some(text.as_str()) } else { None })
+            .collect();
+        assert_eq!(
+            warned,
+            [
+                "Claude Code could not load the plugin lint@team: hooks.json is not valid JSON.",
+                "Claude Code could not load a plugin: gone."
+            ]
+        );
+        assert!(matches!(&out[0], AgentEvent::Remote(id) if id == "s"));
+    }
+
+    #[test]
+    fn always_allow_is_offered_only_with_a_rule_to_save() {
+        let asked = |suggestions: Vec<Value>| {
+            let request = sdk::PermissionRequest {
+                request_id: "r".into(),
+                tool_name: "Bash".into(),
+                input: json!({ "command": "cargo test" }),
+                tool_use_id: Some("toolu_1".into()),
+                title: None,
+                display_name: None,
+                description: None,
+                decision_reason: None,
+                blocked_path: None,
+                suggestions,
+            };
+            let out = Mapper::default().map(sdk::Event::Permission(request));
+            match out.as_slice() {
+                [AgentEvent::Permission(ask)] if ask.call == "toolu_1" => ask.always,
+                other => panic!("one approval, of its call: {other:?}"),
+            }
+        };
+        assert!(asked(vec![json!({ "type": "addRules", "behavior": "allow" })]));
+        assert!(!asked(Vec::new()), "nothing to save: a second allow");
     }
 
     #[test]

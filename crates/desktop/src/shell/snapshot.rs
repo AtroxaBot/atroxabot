@@ -71,6 +71,8 @@ fn snapshots() {
                     input: "{}".into(),
                     summary: "cargo test --workspace".into(),
                     reason: "This command is not on the allowed list.".into(),
+                    call: String::new(),
+                    always: true,
                 });
             }
             asking.composer.editor.insert(written);
