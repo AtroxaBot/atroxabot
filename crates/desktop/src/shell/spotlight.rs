@@ -262,7 +262,7 @@ impl Spotlight {
             let mid = row.y + row.h * 0.5;
             match entry.agent.as_deref().and_then(|agent| shell.agents.iter().find(|a| a.id == agent)) {
                 Some(agent) => {
-                    orb::agent(p, &agent.portrait, (row.x + 22.0, mid), 24.0, Shell::color_of(agent), Mood::Idle, 0.0);
+                    orb::agent(p, &agent.portrait, (row.x + 22.0, mid), 24.0, Shell::color_of(agent), Mood::Idle, None);
                 }
                 None => icon::draw(p, entry.glyph, (row.x + 22.0, mid), 16.0, t.text_muted),
             }

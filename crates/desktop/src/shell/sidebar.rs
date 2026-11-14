@@ -73,7 +73,7 @@ impl Shell {
                 p.rect(row, if selected { t.active } else { fade(t.hover, hover) }, theme::RADIUS);
                 let mood = if busy { Mood::Thinking } else { Mood::Idle };
                 let face = (row.x + 27.0, row.y + row.h * 0.5);
-                orb::agent(p, &agent.portrait, face, 32.0, Self::color_of(agent), mood, ui.time);
+                orb::agent(p, &agent.portrait, face, 32.0, Self::color_of(agent), mood, ui.motion());
                 let latest = self.latest_session(&agent.id);
                 // Right: how long ago, or an edit button while hovered.
                 let pen = Rect::new(row.right() - 30.0, row.y + 6.0, 24.0, 24.0);
@@ -181,7 +181,7 @@ impl Shell {
                     }
                     30.0
                 } else if working {
-                    let pulse = 0.5 + 0.5 * (ui.time * 4.0).sin();
+                    let pulse = ui.motion().map_or(1.0, |time| 0.5 + 0.5 * (time * 4.0).sin());
                     let dot = Rect::new(row.right() - 15.0, row.y + 11.0, 6.0, 6.0);
                     p.rect(dot, fade(t.accent, 0.4 + 0.6 * pulse), 3.0);
                     22.0

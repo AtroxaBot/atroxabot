@@ -1525,7 +1525,7 @@ impl Shell {
         let t = p.theme;
         let mid = header.y + header.h * 0.5;
         let mood = if busy { Mood::Thinking } else { Mood::Idle };
-        orb::agent(p, &agent.portrait, (header.x + 30.0, mid), 26.0, color, mood, ui.time);
+        orb::agent(p, &agent.portrait, (header.x + 30.0, mid), 26.0, color, mood, ui.motion());
         let name_w = p.label(&agent.name, theme::HEADING, header.x + 52.0, mid - 10.0, t.text);
 
         let mut right = header.right() - 12.0;
@@ -1654,7 +1654,7 @@ impl Shell {
         let top = area.y + (area.h * 0.5 - 150.0).max(24.0);
         let appear = ui.appear(id(("welcome", &agent.id)));
         let face = (center, top + 48.0 - 8.0 * (1.0 - appear));
-        orb::agent(p, &agent.portrait, face, 84.0, color, Mood::Idle, ui.time);
+        orb::agent(p, &agent.portrait, face, 84.0, color, Mood::Idle, ui.motion());
         let name = p.layout(&agent.name, theme::TITLE, None);
         p.text(&name, center - name.width() * 0.5, top + 112.0, fade(t.text, appear));
         let mut y = top + 112.0 + name.height() + 6.0;

@@ -147,7 +147,7 @@ impl Shell {
 
         let center = (canvas.x + canvas.w * 0.5, canvas.y + canvas.h * 0.40);
         let size = (canvas.h * 0.26).clamp(96.0, 190.0);
-        orb::reactor(p, &agent.portrait, center, size, color, mood, ui.time);
+        orb::reactor(p, &agent.portrait, center, size, color, mood, ui.motion());
 
         let mut y = center.1 + size * 0.95;
         let name = p.layout(&agent.name, theme::TITLE, None);

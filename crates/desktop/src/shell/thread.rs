@@ -141,7 +141,7 @@ pub(super) struct Background {
 pub(super) fn agent_mark(p: &mut Painter, ui: &Ui, at: (f32, f32), (running, failed): (bool, bool), ink: Color) {
     let t = p.theme;
     if running {
-        let pulse = 0.5 + 0.5 * (ui.time * 4.0).sin();
+        let pulse = ui.motion().map_or(1.0, |time| 0.5 + 0.5 * (time * 4.0).sin());
         p.rect(Rect::new(at.0 - 3.0, at.1 - 3.0, 6.0, 6.0), fade(t.text, 0.35 + 0.65 * pulse), 3.0);
     } else if failed {
         icon::draw(p, icon::ALERT, at, 12.0, t.danger);
@@ -165,9 +165,9 @@ fn drag_past(ui: &Ui, area: Rect) -> f32 {
     past * ui.dt * 14.0
 }
 
-/// A dot circling `at`: still running.
+/// A dot circling `at`: still running. Held at the top for less motion.
 fn spinner(p: &mut Painter, ui: &Ui, at: (f32, f32), color: Color) {
-    let angle = ui.time * 5.0;
+    let angle = ui.motion().map_or(-std::f32::consts::FRAC_PI_2, |time| time * 5.0);
     let dot = (at.0 + angle.cos() * 5.0, at.1 + angle.sin() * 5.0);
     p.rect(Rect::new(dot.0 - 2.0, dot.1 - 2.0, 4.0, 4.0), color, 2.0);
     p.bordered(Rect::new(at.0 - 6.5, at.1 - 6.5, 13.0, 13.0), fade(color, 0.0), 6.5, 1.0, fade(color, 0.25));
@@ -869,9 +869,6 @@ impl Thread {
             self.sub_scroll.follow_end();
             ui.animating = true;
         }
-        if self.busy {
-            ui.animating = true;
-        }
         self.show_found(ui, &[], (area, offset, opened), false);
         self.sub_scroll.bar(p, ui, area, content);
     }
@@ -969,9 +966,8 @@ impl Thread {
         } else if self.follow && !self.scroll.at_end() {
             // What was just written is brought into view.
             self.scroll.follow_end();
-            ui.animating = true;
-        }
-        if self.busy {
+            // A busy session alone does not ask for every frame: what shows it works is drawn at a
+            // gentler rate (`App::frame`), where every refresh of a fast screen would cost for nothing.
             ui.animating = true;
         }
         self.show_found(ui, entries, (area, offset, opened), true);
@@ -1046,10 +1042,13 @@ impl Thread {
     fn draw_working(&mut self, p: &mut Painter, ui: &mut Ui, (x, y): (f32, f32), color: Color) -> f32 {
         let t = p.theme;
         for dot in 0..3u8 {
-            let phase = (ui.time * 1.6 - f32::from(dot) * 0.18).rem_euclid(1.0);
-            let lift = (phase * std::f32::consts::PI).sin().max(0.0);
+            // Still for less motion: three dots in a row, half lit.
+            let lift = ui.motion().map_or(0.0, |time| {
+                let phase = (time * 1.6 - f32::from(dot) * 0.18).rem_euclid(1.0);
+                (phase * std::f32::consts::PI).sin().max(0.0)
+            });
             let at = Rect::new(x + f32::from(dot) * 11.0, y + 7.0 - 3.0 * lift, 6.0, 6.0);
-            p.rect(at, mix(t.text_faint, color, lift), 3.0);
+            p.rect(at, mix(t.text_faint, color, if ui.still { 0.5 } else { lift }), 3.0);
         }
         let seconds = elapsed(self.started);
         // What the engine says it is doing, else the task in hand, else how long it has been.
@@ -1365,9 +1364,9 @@ impl Thread {
         let row = Rect::new(x - 6.0, y - 2.0, 150.0, 26.0);
         let hovered = ui.hovered(row);
         let hover = ui.anim(id(("thinking", key)), f32::from(u8::from(hovered)));
+        // Its turn is running meanwhile, which draws the next frame.
         let color = if writing {
-            ui.animating = true;
-            mix(t.text_faint, t.text, (ui.time * 2.6).sin() * 0.35 + 0.4)
+            mix(t.text_faint, t.text, ui.motion().map_or(0.4, |time| (time * 2.6).sin() * 0.35 + 0.4))
         } else {
             mix(t.text_faint, t.text_muted, hover)
         };

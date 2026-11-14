@@ -179,7 +179,7 @@ impl AgentForm {
         let size = 76.0;
         let color = theme::agent_color(name, &self.color);
         let face = Rect::new(center.0 - size * 0.5, center.1 - size * 0.5, size, size);
-        orb::agent(p, &self.portrait, center, size, color, Mood::Idle, ui.time);
+        orb::agent(p, &self.portrait, center, size, color, Mood::Idle, ui.motion());
         let dot = Rect::new(face.right() - 22.0, face.bottom() - 22.0, 24.0, 24.0);
         let cross = Rect::new(face.right() - 20.0, face.y - 4.0, 22.0, 22.0);
         let has_picture = !self.portrait.is_empty();

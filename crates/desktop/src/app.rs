@@ -59,6 +59,8 @@ const GPU_RETRY: Duration = Duration::from_secs(2);
 /// Wait before drawing again when a frame could not be shown (a hidden or
 /// busy surface) while something moves: not at once, which would spin.
 const SKIPPED_RETRY: Duration = Duration::from_millis(100);
+/// How often a working agent's face is drawn at the least, in frames a second, when nothing else moves.
+const BUSY_FPS: f64 = 60.0;
 
 /// Results delivered from other threads.
 pub enum WorkerEvent {
@@ -168,6 +170,8 @@ pub enum WorkerEvent {
     Thumbnail(ImageKey, Result<image::Pixels, String>),
     /// Something went wrong out of sight: what to tell the user.
     Problem(String),
+    /// Whether the system asks for less motion ([`platform::reduce_motion`]).
+    Motion(bool),
     /// The tray icon was clicked, or another start of the app asks for the window.
     Tray(TrayEvent),
     /// What looking for an update or downloading one came to, or how far a download is.
@@ -370,8 +374,10 @@ pub struct App {
     renderer: Renderer,
     /// When to try again to bring back a lost GPU.
     gpu_retry: Option<Instant>,
-    /// When to draw again after a frame that could not be shown.
+    /// When to draw again: after a frame that could not be shown, or the next frame of a working agent's face.
     redraw_at: Option<Instant>,
+    /// The refresh rate of the window's screen in millihertz, when the platform says.
+    refresh: Option<u32>,
     fonts: Fonts,
     atlas: GlyphAtlas,
     images: ImageAtlas,
@@ -436,6 +442,8 @@ pub struct App {
     tray: Option<Tray>,
     /// The window is hidden, its icon in the tray.
     hidden: bool,
+    /// The platform says the window cannot be seen (minimised, hidden or covered), where it says.
+    occluded: bool,
     /// When the title bar strip was last pressed, to maximize on a second press.
     title_press: Option<f32>,
     /// The new version to start once the app has closed: an update was moved in.
@@ -528,12 +536,14 @@ impl App {
         })
         .ok();
         let now = Instant::now();
+        let refresh = refresh_rate(&window);
         let mut app = Self {
             window,
             display,
             renderer,
             gpu_retry: None,
             redraw_at: None,
+            refresh,
             fonts: Fonts::load(),
             atlas: GlyphAtlas::default(),
             images: ImageAtlas::default(),
@@ -569,6 +579,7 @@ impl App {
             closing: false,
             tray,
             hidden: false,
+            occluded: false,
             title_press: None,
             restart: None,
         };
@@ -580,6 +591,7 @@ impl App {
         let mut actions = Vec::new();
         app.shell.start(&mut actions);
         app.apply(actions);
+        app.spawn(|| WorkerEvent::Motion(platform::reduce_motion()));
         // Draw the first frame directly: hidden windows never receive
         // `RedrawRequested` on Windows, so waiting for one would keep the
         // window invisible forever. `frame` shows it once drawn.
@@ -655,12 +667,22 @@ impl App {
             }
             WindowEvent::Resized(size) => {
                 self.renderer.resize(size.width, size.height);
+                self.refresh = refresh_rate(&self.window);
                 self.window.request_redraw();
+            }
+            // Uncovered, it is drawn again at once (below).
+            WindowEvent::Occluded(occluded) => self.occluded = occluded,
+            // Onto another screen, which may refresh at another rate.
+            WindowEvent::Moved(_) => {
+                self.refresh = refresh_rate(&self.window);
+                return;
             }
             WindowEvent::Focused(focused) => {
                 // Coming back, perhaps from signing in to Claude in a terminal.
                 if focused && !self.ui.focused {
                     self.shell.focused(&mut actions);
+                    // The system's motion setting may have changed meanwhile.
+                    self.spawn(|| WorkerEvent::Motion(platform::reduce_motion()));
                 }
                 self.ui.focused = focused;
             }
@@ -898,6 +920,7 @@ impl App {
                 }
             }
             WorkerEvent::Problem(text) => self.shell.notify(text),
+            WorkerEvent::Motion(still) => self.ui.still = still,
         }
         self.apply(actions);
         self.window.request_redraw();
@@ -1444,8 +1467,13 @@ impl App {
         if self.renderer.is_lost() {
             self.recover_gpu();
         }
-        let now = Instant::now();
         self.redraw_at = None;
+        // What cannot be seen is not drawn, and nothing asks for the next frame: showing the window again
+        // (restoring it, from the tray, or uncovered) draws it.
+        if self.unseen() {
+            return;
+        }
+        let now = Instant::now();
         let dt = (now - self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         self.ui.begin(dt, (now - self.start).as_secs_f32());
@@ -1551,28 +1579,46 @@ impl App {
                 WorkerEvent::Thumbnail(last, pixels)
             });
         }
-        if self.ui.animating || self.shell.is_busy() {
+        let busy = self.shell.is_busy();
+        if self.ui.animating || (busy && !self.ui.still) {
             if drawn == Frame::Skipped {
                 self.redraw_at = Some(Instant::now() + SKIPPED_RETRY);
+            } else if let Some(wait) = busy_interval(self.refresh).filter(|_| !self.ui.animating) {
+                // Only a working agent's face moves, slowly: not drawn at every refresh of a fast screen.
+                self.redraw_at = Some(now + wait);
             } else {
                 self.window.request_redraw();
             }
+        } else if busy {
+            // Held still for less motion: only how long it has worked changes, once a second.
+            self.redraw_at = Some(now + Duration::from_secs(1));
         }
+    }
+
+    /// Whether the window cannot be seen: minimised, in the tray, or (where the platform says) covered.
+    /// The first frame is drawn regardless: it is what shows the window.
+    fn unseen(&self) -> bool {
+        self.shown && (self.hidden || self.occluded || self.renderer.is_hidden())
     }
 
     /// How long the event loop may sleep: until the caret blinks next, a
     /// tooltip shows, or something the shell waits for is due.
     pub fn control_flow(&self) -> ControlFlow {
-        let blink = self.ui.focused.then(|| self.last_frame + Duration::from_secs_f32(self.ui.next_blink().max(0.01)));
+        // Unseen, nothing on screen is due: the caret, a tooltip and the next frame wait until it is seen.
+        let seen = !self.unseen();
+        let blink = (seen && self.ui.focused)
+            .then(|| self.last_frame + Duration::from_secs_f32(self.ui.next_blink().max(0.01)));
         // A tooltip shows once the mouse has rested a moment, with nothing else moving.
-        let tip = self.ui.next_tip().map(|left| self.last_frame + Duration::from_secs_f32(left.max(0.01)));
+        let tip =
+            self.ui.next_tip().filter(|_| seen).map(|left| self.last_frame + Duration::from_secs_f32(left.max(0.01)));
         // A session going on after a usage limit, or a limit's notice going: the clock is looked at once a
         // minute meanwhile (a sleeping computer stops the event loop's own), and what counts down is redrawn.
         let due = self.shell.next_wake().map(|at| {
             let left = at.saturating_sub(atroxabot_core::unix_now()).clamp(1, 60);
             Instant::now() + Duration::from_secs(left)
         });
-        match blink.into_iter().chain(tip).chain(self.gpu_retry).chain(self.redraw_at).chain(due).min() {
+        let next_frame = self.redraw_at.filter(|_| seen);
+        match blink.into_iter().chain(tip).chain(self.gpu_retry).chain(next_frame).chain(due).min() {
             Some(at) => ControlFlow::WaitUntil(at),
             None => ControlFlow::Wait,
         }
@@ -1765,6 +1811,20 @@ fn zoomed(zoom: u16, key: &Key) -> Option<u16> {
 /// Whether `key` is the letter `letter`, in either case.
 fn is_key(key: &Key, letter: &str) -> bool {
     matches!(key, Key::Character(c) if c.eq_ignore_ascii_case(letter))
+}
+
+/// The refresh rate of `window`'s screen in millihertz, when the platform says.
+fn refresh_rate(window: &Window) -> Option<u32> {
+    window.current_monitor().and_then(|screen| screen.refresh_rate_millihertz())
+}
+
+/// How long the next frame waits when only a working agent's face moves: a whole number of the screen's
+/// refreshes, as many as still keep it at [`BUSY_FPS`] or more. `None` (draw at every refresh) when that
+/// is one, or the rate is unknown.
+fn busy_interval(refresh_millihertz: Option<u32>) -> Option<Duration> {
+    let hz = f64::from(refresh_millihertz?) / 1000.0;
+    let refreshes = (hz / BUSY_FPS).floor();
+    (refreshes >= 2.0).then(|| Duration::from_secs_f64(refreshes / hz))
 }
 
 /// The smallest the window may be at `zoom` (percent): the interface is
@@ -1989,6 +2049,17 @@ mod tests {
         assert_eq!(zoomed(150, &key("0")), Some(100));
         assert_eq!(zoomed(ZOOM.1, &key("+")), Some(ZOOM.1), "clamped");
         assert_eq!(zoomed(100, &key("k")), None);
+    }
+
+    #[test]
+    fn a_working_face_is_drawn_on_whole_refreshes_at_sixty_or_more() {
+        let fps = |millihertz| busy_interval(Some(millihertz)).map(|wait| (1.0 / wait.as_secs_f64()).round());
+        assert_eq!(fps(165_000), Some(83.0), "every second refresh");
+        assert_eq!(fps(240_000), Some(60.0), "every fourth");
+        assert_eq!(fps(144_000), Some(72.0));
+        assert_eq!(fps(59_940), None, "every refresh");
+        assert_eq!(fps(100_000), None);
+        assert_eq!(busy_interval(None), None, "unknown: every refresh");
     }
 
     #[test]

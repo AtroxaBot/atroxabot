@@ -38,14 +38,17 @@ fn disc((cx, cy): (f32, f32), size: f32) -> Rect {
 }
 
 /// Draws the face of an agent coloured `color`, `size` across, centred on
-/// `center`, at `time` seconds (for its motion).
-pub fn face(p: &mut Painter, center: (f32, f32), size: f32, color: Color, mood: Mood, time: f32) {
+/// `center`, at `time` seconds (for its motion), or still with `None` (the
+/// system asks for less motion): a steady glow says it works.
+pub fn face(p: &mut Painter, center: (f32, f32), size: f32, color: Color, mood: Mood, time: Option<f32>) {
     let light = p.theme.is_light();
-    let (level, glow) = match mood {
-        Mood::Idle => (0.0, 0.0),
-        Mood::Thinking => (0.0, 0.5 + 0.5 * (time * 2.4).sin()),
-        Mood::Listening => (0.0, 0.25 + 0.15 * (time * 1.3).sin()),
-        Mood::Hearing(level) | Mood::Speaking(level) => (level.clamp(0.0, 1.0), 0.4 + 0.6 * level.clamp(0.0, 1.0)),
+    let (level, glow) = match (mood, time) {
+        (Mood::Idle, _) => (0.0, 0.0),
+        (Mood::Thinking, Some(time)) => (0.0, 0.5 + 0.5 * (time * 2.4).sin()),
+        (Mood::Thinking, None) => (0.0, 0.75),
+        (Mood::Listening, Some(time)) => (0.0, 0.25 + 0.15 * (time * 1.3).sin()),
+        (Mood::Listening, None) => (0.0, 0.25),
+        (Mood::Hearing(level) | Mood::Speaking(level), _) => (level.clamp(0.0, 1.0), 0.4 + 0.6 * level.clamp(0.0, 1.0)),
     };
     // Speech swells the orb; listening leans in a little.
     let swell = match mood {
@@ -67,12 +70,12 @@ pub fn face(p: &mut Painter, center: (f32, f32), size: f32, color: Color, mood: 
     p.shadow(sheen, fade(hex(0xFFFFFF), 0.28), body * 0.1, body * 0.10);
 
     // Eyes: they wander while thinking, widen when hearing, and blink.
-    let look = match mood {
-        Mood::Thinking => ((time * 1.7).sin() * 0.07, (time * 1.1).cos() * 0.035 - 0.03),
-        Mood::Hearing(_) => (0.0, -0.02),
+    let look = match (mood, time) {
+        (Mood::Thinking, Some(time)) => ((time * 1.7).sin() * 0.07, (time * 1.1).cos() * 0.035 - 0.03),
+        (Mood::Hearing(_), _) => (0.0, -0.02),
         _ => (0.0, 0.0),
     };
-    let blinking = mood.animated() && (time * 0.37).fract() < 0.035;
+    let blinking = mood.animated() && time.is_some_and(|time| (time * 0.37).fract() < 0.035);
     let open = match mood {
         _ if blinking => 0.12,
         Mood::Hearing(_) => 1.0 + 0.25 * level,
@@ -90,13 +93,22 @@ pub fn face(p: &mut Painter, center: (f32, f32), size: f32, color: Color, mood: 
 
 /// Draws an agent: its picture at `portrait` when it has one that can be
 /// shown, glowing in its colour while it is busy, and its drawn face otherwise.
-pub fn agent(p: &mut Painter, portrait: &str, center: (f32, f32), size: f32, color: Color, mood: Mood, time: f32) {
+/// `time` as for [`face`].
+pub fn agent(
+    p: &mut Painter,
+    portrait: &str,
+    center: (f32, f32),
+    size: f32,
+    color: Color,
+    mood: Mood,
+    time: Option<f32>,
+) {
     if portrait.is_empty() {
         face(p, center, size, color, mood, time);
         return;
     }
     if mood.animated() {
-        let pulse = 0.5 + 0.5 * (time * 2.4).sin();
+        let pulse = time.map_or(0.5, |time| 0.5 + 0.5 * (time * 2.4).sin());
         p.shadow(disc(center, size * 1.04), fade(color, 0.25 + 0.3 * pulse), size * 0.52, size * 0.3);
     }
     // Until the picture is decoded (or if it cannot be), the face stands in.
@@ -106,15 +118,25 @@ pub fn agent(p: &mut Painter, portrait: &str, center: (f32, f32), size: f32, col
 }
 
 /// Draws the large face of a call, `size` across: the agent inside rings
-/// that ripple with whoever is speaking.
-pub fn reactor(p: &mut Painter, portrait: &str, center: (f32, f32), size: f32, color: Color, mood: Mood, time: f32) {
+/// that ripple with whoever is speaking (held where they are without `time`,
+/// as for [`face`]).
+pub fn reactor(
+    p: &mut Painter,
+    portrait: &str,
+    center: (f32, f32),
+    size: f32,
+    color: Color,
+    mood: Mood,
+    time: Option<f32>,
+) {
+    let clock = time.unwrap_or(0.0);
     let level = match mood {
         Mood::Hearing(level) | Mood::Speaking(level) => level.clamp(0.0, 1.0),
         _ => 0.0,
     };
     // Three rings drift outwards; sound pushes them further and brighter.
     for ring in 0..3u8 {
-        let phase = (time * 0.35 + f32::from(ring) / 3.0).fract();
+        let phase = (clock * 0.35 + f32::from(ring) / 3.0).fract();
         let reach = size * (1.05 + (0.55 + 0.5 * level) * phase);
         let alpha = (1.0 - phase) * (0.10 + 0.35 * level) * if mood == Mood::Idle { 0.0 } else { 1.0 };
         p.bordered(disc(center, reach), fade(color, 0.0), reach * 0.5, 1.5, fade(color, alpha));
@@ -122,7 +144,7 @@ pub fn reactor(p: &mut Painter, portrait: &str, center: (f32, f32), size: f32, c
     // While thinking, three sparks orbit the face.
     if mood == Mood::Thinking {
         for spark in 0..3u8 {
-            let angle = time * 1.8 + f32::from(spark) * std::f32::consts::TAU / 3.0;
+            let angle = clock * 1.8 + f32::from(spark) * std::f32::consts::TAU / 3.0;
             let at = (center.0 + angle.cos() * size * 0.72, center.1 + angle.sin() * size * 0.72);
             p.shadow(disc(at, size * 0.07), fade(color, 0.9), size * 0.035, size * 0.04);
         }

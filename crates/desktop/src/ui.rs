@@ -50,6 +50,8 @@ pub struct Ui {
     pub blocker: Option<Rect>,
     /// Set when something is mid-animation and needs another frame.
     pub animating: bool,
+    /// The system asks for less motion: what shows that something works holds still ([`Ui::motion`]).
+    pub still: bool,
     /// A scroll bar holds the mouse (it is being dragged): nothing else is
     /// hovered or clicked until the button is let go.
     pub held: bool,
@@ -140,6 +142,13 @@ impl Ui {
     /// Eases the value stored under `id` towards `target` and returns it.
     pub fn anim(&mut self, id: u64, target: f32) -> f32 {
         self.ease(id, target, target)
+    }
+
+    /// The time that drives what moves by itself (a working agent's face, a spinner), or `None` when
+    /// the system asks for less motion and it is drawn still.
+    #[must_use]
+    pub fn motion(&self) -> Option<f32> {
+        (!self.still).then_some(self.time)
     }
 
     /// Eases from 0 to 1 from the first frame `id` is drawn in: something

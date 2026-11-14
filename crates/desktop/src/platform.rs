@@ -143,6 +143,44 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().filter(|&c| c != 0).chain([0]).collect()
 }
 
+/// Whether the system asks apps for less motion: Windows' "Animation effects" off, macOS' "Reduce
+/// motion" on, or GNOME's "Enable animations" off. `false` when it cannot be told. Runs a helper
+/// outside Windows, so call it on a worker thread.
+#[must_use]
+pub fn reduce_motion() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn SystemParametersInfoW(action: u32, param: u32, value: *mut std::ffi::c_void, ini: u32) -> i32;
+        }
+        /// `SPI_GETCLIENTAREAANIMATION`: whether animations within windows are on.
+        const CLIENT_AREA_ANIMATION: u32 = 0x1042;
+        let mut on: i32 = 1;
+        // SAFETY: this action writes one BOOL through the pointer, which points at one.
+        let read = unsafe { SystemParametersInfoW(CLIENT_AREA_ANIMATION, 0, (&raw mut on).cast(), 0) };
+        read != 0 && on == 0
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let (program, args): (&str, &[&str]) = if cfg!(target_os = "macos") {
+            ("defaults", &["read", "com.apple.universalaccess", "reduceMotion"])
+        } else {
+            ("gsettings", &["get", "org.gnome.desktop.interface", "enable-animations"])
+        };
+        let mut command = Command::new(program);
+        command.args(args).stdin(Stdio::null()).stderr(Stdio::null());
+        command.output().is_ok_and(|output| output.status.success() && asks_less_motion(&output.stdout))
+    }
+}
+
+/// Whether a setting's printed value asks for less motion: macOS' `reduceMotion` reads `1`, GNOME's
+/// `enable-animations` reads `false`.
+#[cfg_attr(target_os = "windows", allow(dead_code, reason = "Windows asks the system directly"))]
+fn asks_less_motion(printed: &[u8]) -> bool {
+    matches!(String::from_utf8_lossy(printed).trim(), "1" | "false")
+}
+
 /// Runs a picker helper and returns the non-empty lines it printed.
 fn run_picker(mut command: Command) -> io::Result<Vec<String>> {
     let output = no_window(&mut command).stdin(Stdio::null()).stderr(Stdio::null()).output()?;
@@ -578,6 +616,16 @@ fn run_in_unix_terminal(program: &Path, args: &[String], env: &[(String, String)
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn less_motion_is_read_from_what_the_setting_prints() {
+        assert!(asks_less_motion(b"1\n"));
+        assert!(asks_less_motion(b"false\n"));
+        assert!(!asks_less_motion(b"0\n"));
+        assert!(!asks_less_motion(b"true\n"));
+        assert!(!asks_less_motion(b""));
+        assert!(!asks_less_motion(&[0xFF, 0xFE]));
+    }
 
     /// Opens a real console window for a moment: `cargo test -p atroxabot terminal -- --ignored`.
     #[test]

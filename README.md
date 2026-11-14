@@ -739,7 +739,13 @@ same way.
 macOS bundle's `Info.plist`, the Linux launcher entry and `install.sh`, the release key's public half
 (`update-key.pub`), `release.sh` (makes a version) and `manifest.sh` (signs a release).
 
-The app redraws only when something changes. Model requests, tools, the Claude Agent's process, calls and
+The app redraws only when something changes. A working agent's glowing face is drawn at 60 frames a second
+or a little more, on whole refreshes of the screen, not at every refresh of a fast one; and a window that
+cannot be seen (minimised, in the tray, or covered where the platform says so) is not drawn at all. When the
+system asks for less motion (Windows' "Animation effects" off, macOS' "Reduce motion", GNOME's "Enable
+animations" off; read at start and whenever the window is focused again), what shows that an agent works holds
+still: a steady glow on its face, a still dot, and the window is drawn once a second for the time it has
+worked. Model requests, tools, the Claude Agent's process, calls and
 file reads run on other threads and post results to the event loop; every file write goes through one
 writer thread.
 

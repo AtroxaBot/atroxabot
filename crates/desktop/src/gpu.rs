@@ -207,6 +207,12 @@ impl Renderer {
         self.lost.load(Ordering::Relaxed)
     }
 
+    /// The window is minimised (zero-sized): there is nothing to draw on.
+    #[must_use]
+    pub fn is_hidden(&self) -> bool {
+        self.hidden
+    }
+
     /// The window has a new size. The swapchain follows before the next
     /// frame: setting it up waits for the GPU, so it is not done for every
     /// step of a resize. A zero-sized (minimised) window draws nothing.

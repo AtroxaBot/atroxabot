@@ -797,6 +797,32 @@ fn ledger(agents: [&str; 2]) -> Ledger {
     Ledger { records }
 }
 
+/// A session at work with nothing else moving leaves its frames to the app's gentler rate for what
+/// shows it works, rather than asking for every refresh of the screen.
+#[test]
+fn a_busy_session_alone_does_not_ask_for_every_frame() {
+    let fonts = Fonts::load();
+    let (mut atlas, mut images) = (GlyphAtlas::default(), ImageAtlas::default());
+    let mut shell = shell();
+    if let Some(thread) = shell.thread_mut() {
+        thread.busy = true;
+    }
+    let mut ui = Ui::default();
+    (ui.focused, ui.mouse) = (true, (-1.0, -1.0));
+    let view = Rect::new(0.0, 0.0, SIZE.0 as f32, SIZE.1 as f32);
+    let palette = Scheme::Black.palette();
+    let mut instances = Vec::new();
+    for second in 0..5u8 {
+        // Long frames, so every ease lands.
+        ui.begin(1.0, 10.0 + f32::from(second));
+        let mut p = Painter::new(&fonts, (&mut atlas, &mut images), &mut instances, 1.0, view, palette);
+        shell.draw(&mut p, &mut ui, view, Scheme::Black, &mut Vec::new());
+        ui.end();
+    }
+    assert!(shell.is_busy(), "the session works");
+    assert!(!ui.animating, "nothing but what shows it works moves");
+}
+
 /// Draws a screen with `draw`, the mouse resting at `mouse`, until its
 /// animations settled (and a tooltip there showed), then renders the last frame.
 fn frame(

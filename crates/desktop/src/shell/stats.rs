@@ -582,7 +582,7 @@ fn breakdown(p: &mut Painter, shell: &Shell, summary: &Summary, (x, y, w): (f32,
         match shell.agents.iter().find(|agent| agent.id == *id) {
             Some(agent) => {
                 let color = Shell::color_of(agent);
-                orb::agent(p, &agent.portrait, (x + 9.0, row + 9.0), 18.0, color, Mood::Idle, 0.0);
+                orb::agent(p, &agent.portrait, (x + 9.0, row + 9.0), 18.0, color, Mood::Idle, None);
                 share_row(p, (x + 26.0, row, half - 26.0), (&agent.name, &used(tally), &about(tally)), (share, color));
             }
             None => share_row(p, (x, row, half), ("An agent since deleted", &used(tally), &about(tally)), (share, ink)),
