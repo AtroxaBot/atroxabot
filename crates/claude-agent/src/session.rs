@@ -1,6 +1,6 @@
 //! A running Claude Code process: its pipes, reader threads and the control protocol.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -12,7 +12,10 @@ use serde_json::{Map, Value, json};
 
 use crate::cli::{build_args, command};
 use crate::parse::{Parsed, answer, is_refusal, parse_line};
-use crate::{Error, Event, Info, McpServerStatus, Options, PermissionMode, PlanUsage, find_cli};
+use crate::{
+    ElicitationAnswer, Error, Event, Info, McpServerStatus, Options, PermissionMode, PlanUsage, find_cli,
+    initialize_request,
+};
 
 /// Longest line accepted from the binary; a longer one is dropped and reported.
 const MAX_LINE: usize = 8 * 1024 * 1024;
@@ -64,6 +67,9 @@ struct Shared {
     callback: Mutex<Option<Callback>>,
     next_request: AtomicU64,
     ask_permissions: bool,
+    answer_elicitations: bool,
+    /// The elicitations not yet answered, by request id.
+    asked: Mutex<HashSet<String>>,
     /// The end of what the binary wrote to stderr, to say why it stopped.
     said: Mutex<VecDeque<String>>,
     /// What to do once each of these control requests is answered, by request id.
@@ -154,6 +160,8 @@ impl Session {
             callback: Mutex::new(Some(callback)),
             next_request: AtomicU64::new(1),
             ask_permissions: options.ask_permissions,
+            answer_elicitations: options.answer_elicitations,
+            asked: Mutex::new(HashSet::new()),
             said: Mutex::new(VecDeque::new()),
             waiting: Mutex::new(HashMap::new()),
         });
@@ -176,7 +184,7 @@ impl Session {
         });
         spawned.map_err(Error::Io)?;
 
-        session.request(&json!({"subtype": "initialize", "hooks": null}))?;
+        session.request(&initialize_request(options))?;
         Ok(session)
     }
 
@@ -227,6 +235,16 @@ impl Session {
     /// [`Error::Closed`] after the session closed, [`Error::Io`] when the write fails.
     pub fn interrupt(&self, cancel_queued: bool) -> Result<(), Error> {
         self.request(&json!({"subtype": "interrupt", "cancel_queued": cancel_queued}))
+    }
+
+    /// Stops one task of the session: a subagent, or a command or monitor running in the background, by its
+    /// [`Task::task_id`](crate::Task::task_id). Its end arrives as an [`Event::Task`]; a refusal (it already
+    /// ended) as an [`Event::Error`].
+    ///
+    /// # Errors
+    /// [`Error::Closed`] after the session closed, [`Error::Io`] when the write fails.
+    pub fn stop_task(&self, task_id: &str) -> Result<(), Error> {
+        self.request(&json!({"subtype": "stop_task", "task_id": task_id}))
     }
 
     /// Changes the permission mode. A refusal arrives as an [`Event::Error`].
@@ -315,6 +333,19 @@ impl Session {
             return Err(Error::UnknownRequest(request_id.to_owned()));
         };
         self.shared.write(&decision_response(request_id, decision, input))
+    }
+
+    /// Answers the [`Event::Elicitation`] with this `request_id`.
+    ///
+    /// # Errors
+    /// [`Error::UnknownRequest`] when no such request is pending (already answered, or withdrawn by an
+    /// [`Event::PermissionCancelled`]), [`Error::Closed`] after the session closed, [`Error::Io`] when the write
+    /// fails.
+    pub fn answer(&self, request_id: &str, answer: ElicitationAnswer) -> Result<(), Error> {
+        if !lock(&self.shared.asked).remove(request_id) {
+            return Err(Error::UnknownRequest(request_id.to_owned()));
+        }
+        self.shared.write(&elicitation_response(request_id, answer))
     }
 
     /// Ends the session: closes the binary's input, waits up to five seconds for it to exit by itself, then kills
@@ -536,9 +567,18 @@ impl Shared {
                 lock(&self.pending).insert(request.request_id.clone(), request.input.clone());
                 self.emit(Event::Permission(request));
             }
+            Parsed::Event(Event::Elicitation(request)) if !self.answer_elicitations => {
+                // A failed write means the process is going away; `Closed` will say so.
+                let _ = self.write(&elicitation_response(&request.request_id, ElicitationAnswer::Decline));
+            }
+            Parsed::Event(Event::Elicitation(request)) => {
+                lock(&self.asked).insert(request.request_id.clone());
+                self.emit(Event::Elicitation(request));
+            }
             Parsed::Event(Event::PermissionCancelled { request_id }) => {
                 // The binary also cancels requests we refused; only report the ones the caller has seen.
-                if lock(&self.pending).remove(&request_id).is_some() {
+                let seen = lock(&self.pending).remove(&request_id).is_some();
+                if seen || lock(&self.asked).remove(&request_id) {
                     self.emit(Event::PermissionCancelled { request_id });
                 }
             }
@@ -615,6 +655,7 @@ impl Shared {
             });
         *lock(&self.stdin) = None;
         lock(&self.pending).clear();
+        lock(&self.asked).clear();
         // What still waited for an answer will get none.
         let waiting: Vec<Answered> = lock(&self.waiting).drain().map(|(_, done)| done).collect();
         for done in waiting {
@@ -693,6 +734,20 @@ fn decision_response(request_id: &str, decision: Decision, original_input: Value
             }
         }
     }
+    json!({
+        "type": "control_response",
+        "response": {"subtype": "success", "request_id": request_id, "response": response},
+    })
+}
+
+/// The `control_response` that answers an `elicitation` request.
+fn elicitation_response(request_id: &str, answer: ElicitationAnswer) -> Value {
+    let response = match answer {
+        ElicitationAnswer::Accept(content) if content.is_object() => json!({"action": "accept", "content": content}),
+        ElicitationAnswer::Accept(_) => json!({"action": "accept"}),
+        ElicitationAnswer::Decline => json!({"action": "decline"}),
+        ElicitationAnswer::Cancel => json!({"action": "cancel"}),
+    };
     json!({
         "type": "control_response",
         "response": {"subtype": "success", "request_id": request_id, "response": response},
@@ -870,6 +925,32 @@ mod tests {
     }
 
     #[test]
+    fn elicitations_are_answered_as_the_sdk_answers_them() {
+        let answered = |answer| elicitation_response("cli_4", answer)["response"].clone();
+        let accepted = answered(ElicitationAnswer::Accept(json!({"region": "eu"})));
+        assert_eq!(
+            accepted,
+            json!({"subtype": "success", "request_id": "cli_4",
+            "response": {"action": "accept", "content": {"region": "eu"}}})
+        );
+        let opened = answered(ElicitationAnswer::Accept(Value::Null));
+        assert_eq!(opened["response"], json!({"action": "accept"}), "a page has no content");
+        assert_eq!(answered(ElicitationAnswer::Decline)["response"], json!({"action": "decline"}));
+        assert_eq!(answered(ElicitationAnswer::Cancel)["response"], json!({"action": "cancel"}));
+    }
+
+    #[test]
+    fn initialize_says_only_what_the_caller_does() {
+        assert_eq!(initialize_request(&Options::default()), json!({"subtype": "initialize", "hooks": null}));
+        let options = Options { forward_subagent_text: true, stop_tasks: true, ..Options::default() };
+        let request = initialize_request(&options);
+        assert_eq!(
+            (request["forwardSubagentText"].clone(), request["perTaskStopAffordance"].clone()),
+            (json!(true), json!(true))
+        );
+    }
+
+    #[test]
     fn deny_with_and_without_interrupt() {
         let deny = |interrupt| {
             let decision = Decision::Deny { message: "not now".into(), interrupt };
@@ -970,6 +1051,8 @@ mod tests {
             callback: Mutex::new(None),
             next_request: AtomicU64::new(1),
             ask_permissions: false,
+            answer_elicitations: false,
+            asked: Mutex::new(HashSet::new()),
             said: Mutex::new(VecDeque::new()),
             waiting: Mutex::new(HashMap::new()),
         };

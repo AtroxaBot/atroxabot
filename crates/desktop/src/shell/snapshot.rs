@@ -38,6 +38,10 @@ use crate::ui::Ui;
 /// Logical size of every snapshot, drawn at a scale of one unless `ATROXABOT_SNAPSHOT_SCALE` says more.
 const SIZE: (u32, u32) = (1440, 900);
 
+/// Where the side panel's first subagent row and its first command in the background are, for the scenes
+/// whose mouse rests on them.
+const STOP_ROWS: (f32, f32) = (266.0, 368.0);
+
 /// The scale the snapshots are drawn at: 1, or what `ATROXABOT_SNAPSHOT_SCALE` asks for (1 to 4).
 fn scale() -> f32 {
     let asked = std::env::var("ATROXABOT_SNAPSHOT_SCALE").ok().and_then(|scale| scale.parse::<f32>().ok());
@@ -73,6 +77,7 @@ fn snapshots() {
                     reason: "This command is not on the allowed list.".into(),
                     call: String::new(),
                     always: true,
+                    ..Ask::default()
                 });
             }
             asking.composer.editor.insert(written);
@@ -242,6 +247,45 @@ fn snapshots() {
                 ..Ask::default()
             });
         }
+        // An MCP server asks: a form of two fields, in its own words, and a page to open.
+        let server = |ask: Ask| {
+            let mut asking = shell();
+            if let Some(thread) = asking.thread_mut() {
+                thread.busy = true;
+                thread.asks.push(ask);
+            }
+            asking
+        };
+        let server_form = server(Ask {
+            id: "e1".into(),
+            tool: "AskUserQuestion".into(),
+            from: "deploy-tools".into(),
+            reason: "Before I start the deploy, tell me where it goes.".into(),
+            input: serde_json::json!({ "questions": [
+                { "question": "Environment", "header": "environment", "multiSelect": false,
+                  "options": [{ "label": "Staging", "description": "" }, { "label": "Production", "description": "" }] },
+                { "question": "Release notes: one line for the changelog", "header": "notes", "multiSelect": false, "options": [] },
+            ]})
+            .to_string(),
+            ..Ask::default()
+        });
+        let server_page = server(Ask {
+            id: "e2".into(),
+            tool: "a page".into(),
+            from: "linear".into(),
+            reason: "Sign in to Linear to let me read your issues.".into(),
+            summary: "https://linear.app/oauth/authorize?client_id=atroxabot".into(),
+            link: "https://linear.app/oauth/authorize?client_id=atroxabot".into(),
+            ..Ask::default()
+        });
+        // A subagent and a command at work in the session's Claude Code: the row under the mouse can stop it.
+        let stoppable = || {
+            let mut stoppable = delegate(None);
+            if let Some(thread) = stoppable.thread_mut() {
+                thread.live = true;
+            }
+            stoppable
+        };
         let mut slash = shell();
         slash.composer.editor.insert("/co");
         // Between turns, Claude Code's guess at the next message waits in the empty message box; a long one is cut.
@@ -672,6 +716,8 @@ fn snapshots() {
             ("plan-changed", changed),
             ("subagent-open", inside),
             ("question", asked),
+            ("server-form", server_form),
+            ("server-page", server_page),
             ("slash", slash),
             ("mention", mention),
             ("tasks", tasks()),
@@ -716,7 +762,12 @@ fn snapshots() {
             ("edits-cache-cold", edits(false)),
         ];
         // Tooltips: the mouse rests on a row of the side panel (which starts at x 1112).
-        let hovered = [("tip-task", tasks(), (1200.0, 313.0)), ("tip-context", context, (1180.0, 90.0))];
+        let hovered = [
+            ("tip-task", tasks(), (1200.0, 313.0)),
+            ("tip-context", context, (1180.0, 90.0)),
+            ("stop-subagent", stoppable(), (1200.0, STOP_ROWS.0)),
+            ("stop-background", stoppable(), (1200.0, STOP_ROWS.1)),
+        ];
         let screens = screens.into_iter().map(|(name, shell)| (name, shell, (-1.0, -1.0))).chain(hovered);
         for (name, mut shell, mouse) in screens {
             let pixels = frame(&mut gpu, &fonts, scheme, mouse, &mut |p, ui, view| {

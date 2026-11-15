@@ -22,6 +22,7 @@ mod client;
 mod codex;
 mod completions;
 mod config;
+mod elicit;
 mod engine;
 mod error;
 pub mod git;

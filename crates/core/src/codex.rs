@@ -798,6 +798,7 @@ impl Mapper {
                     call: request.item_id,
                     // Codex takes any approval for the rest of the session.
                     always: true,
+                    ..Ask::default()
                 }));
             }
             // A question, in the shape the app's question card reads.
@@ -827,6 +828,7 @@ impl Mapper {
                     reason: String::new(),
                     call: String::new(),
                     always: false,
+                    ..Ask::default()
                 }));
             }
             sdk::Event::RequestResolved { request_id } => {

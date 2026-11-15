@@ -278,7 +278,9 @@ page lists every worktree on disk, with what it holds and how much room it takes
   (the pen puts it back in the message box) or removed.
   - *Send now* (Ctrl/Cmd+Enter) stops the step in progress, so the agent reads it at once, with
     everything it did so far.
-  - Stop (Esc) stops the turn and puts what waits back in the message box.
+  - Stop (Esc) stops the turn and puts what waits back in the message box. On a Claude account a
+    subagent or a command sent to the background goes on: each is stopped on its own, from its row in
+    the side panel.
   - A command (`/compact`) waits for the turn to end.
   - On a Claude account this is Claude Code's own queue: the app hands a message over while a tool runs,
     and Claude Code says when it takes it in. Claude Code also carries on by itself when something sent to
@@ -291,7 +293,14 @@ page lists every worktree on disk, with what it holds and how much room it takes
   second *Allow*. To say why not, write it in the message box first: *Deny with reason* (or Esc) then gives
   the agent your words with the no, so it knows what to do instead, and the box is empty again. Codex takes
   no words with a no; there they follow it as a message. A call you denied says *Not run* in the
-  conversation, not that it failed.
+  conversation, not that it failed; so does one Claude Code turned down itself (a rule, *Read only*, or
+  auto mode's classifier).
+- **What an MCP server asks.** An MCP server of a Claude account's session can ask you something
+  itself: its request comes on the same cards, under the server's name and in its own words. A form is
+  asked as questions (a choice as its options, yes or no as two, text as a line to type in) and your
+  answers go back as the values it asked for; a page to open (to sign in, say) is an approval whose
+  *Open* opens it in your browser (only an `http(s)` address opens); a bare go-ahead is an approval. A
+  no, or Esc, tells the server only no: what is in the message box stays for the agent.
 - **Autonomy**, set in the agent's editor:
 
   | Level | Claude account and API | Codex account |
@@ -310,8 +319,10 @@ page lists every worktree on disk, with what it holds and how much room it takes
 - **Subagents.** An agent that delegates shows each subagent as a card in the conversation (what it is
   for, what it is doing, and what it took), and the side panel lists the turn's subagents under the tasks,
   each with how it is doing. A click on either opens the subagent's own conversation in the session's
-  place (what it was asked, what it said and every tool it called), under a bar that leads back. Sending a
-  message takes you back to the conversation too.
+  place (what it was asked, what it said and thought, and every tool it called), under a bar that leads
+  back. Sending a message takes you back to the conversation too. On a Claude account a subagent at work
+  can be stopped on its own: its row in the side panel shows a stop under the mouse; the turn and the
+  other subagents go on.
   An agent on an API starts its own with its `agent` tool. Each works on its brief in a conversation of
   its own with the agent's tools (it cannot ask you anything, keep a task list or start subagents), on the
   same system prompt and tool list, so the provider's cache serves them all. Several started in one reply
@@ -514,9 +525,10 @@ server-side compaction on its own API, by a request of the app's elsewhere.
     each part of its request and gives the conversation the rest of the tokens the provider counted. The
     session keeps the latest breakdown.
   - The tasks and subagents (see above), and the plan's limits (see *Plan limits*).
-  - What Claude Code runs in the background (a command, a monitor), while it runs. The session's
-    Claude Code process stays up for it when you open another session (the sidebar shows a still dot by
-    the session), so it can finish and the agent can answer it. Should the process end anyway (it
+  - What Claude Code runs in the background (a command, a monitor), while it runs; its row shows a stop
+    under the mouse. The session's Claude Code process stays up for it (and for a subagent still at
+    work) when you open another session (the sidebar shows a still dot by the session), so it can finish
+    and the agent can answer it. Should the process end anyway (it
     stopped, or the session's next message goes with another account), a line in the conversation says
     which task was stopped with it. What a subagent runs in the background is the subagent's: it shows in
     the subagent, not as lines in your conversation. Nothing of it outlives the app.
@@ -653,6 +665,18 @@ against Claude Code 2.1.322, as was the shape of its answer to `get_usage` (reru
 `cargo test -p atroxabot-claude-agent live_plan_usage -- --ignored` after Claude Code changes: it uses
 nothing).
 
+As the official SDK does for a host that offers them, `initialize` tells Claude Code that the app stops
+tasks one at a time (`perTaskStopAffordance`: an interrupt then ends only the turn, and `stop_task` stops a
+subagent or a command) and wants what subagents write and think (`forwardSubagentText`, which only passes
+on what Claude Code already has; nothing more is asked of the model). An MCP server's `elicitation` is
+answered from the cards above. The app also follows what Claude Code reports by itself: a model that
+declined a request and the one that answered instead (`model_refusal_fallback`; when the session goes on
+with it, so does the session's model, and a line in the conversation says so), a request declined with no
+fallback, a call it turned down (`permission_denied`), the slash commands and skills of the session's own
+process (its folder's included, `commands_changed` when they change), and transcript lines it could not
+save for a full disk (`session_writes_lost`, told once). These were written from the SDK's types (0.3.325)
+and Claude Code 2.1.322 knows each of them; none was run against a live account.
+
 ## Codex accounts
 
 A Codex account is the Codex CLI you installed, used the way OpenAI documents for clients of its own:
@@ -710,7 +734,7 @@ To look at the design without opening the app, draw every screen offscreen in ev
 | `crates/claude-agent` (`atroxabot-claude-agent`) | Rust port of the Claude Agent SDK's transport and control protocol. Only dependency: `serde_json`. |
 | `crates/codex` (`atroxabot-codex`) | Drives the installed Codex CLI through `codex app-server`: the handshake, threads and turns as a state machine without I/O (`machine.rs`), its messages (`parse.rs`), the process (`session.rs`), finding the binary (`cli.rs`). Only dependency: `serde_json`. |
 | `crates/mcp` (`atroxabot-mcp`) | A small MCP client (stdio and Streamable HTTP): lists a server's tools and calls them. |
-| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Anthropic's Messages in `messages.rs`, OpenAI's Responses in `openai.rs`, Chat Completions in `completions.rs`); the agent loop and its tools (`engine.rs`, `tools.rs`, and `pattern.rs`, the regular expressions `search` reads); the Claude Agent and Codex engines (`claude.rs`, `codex.rs`); usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the sessions' worktrees and their cleaning up (`worktree.rs`); pictures read and made small enough for a model (`picture.rs`); updating the app from a signed release (`update.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
+| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Anthropic's Messages in `messages.rs`, OpenAI's Responses in `openai.rs`, Chat Completions in `completions.rs`); the agent loop and its tools (`engine.rs`, `tools.rs`, and `pattern.rs`, the regular expressions `search` reads); the Claude Agent and Codex engines (`claude.rs`, `codex.rs`), and an MCP server's form as questions on the app's card (`elicit.rs`); usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the sessions' worktrees and their cleaning up (`worktree.rs`); pictures read and made small enough for a model (`picture.rs`); updating the app from a signed release (`update.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
 | `crates/voice` (`atroxabot-voice`) | Fish Audio and ElevenLabs speech-to-text and text-to-speech, voice-activity detection, the call loop, and audio devices (`cpal`). |
 | `crates/desktop` | The app (`atroxabot`): winit window, wgpu renderer, text engine, immediate-mode UI. |
 

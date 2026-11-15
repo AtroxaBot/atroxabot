@@ -168,6 +168,15 @@ pub enum AgentEvent {
     LimitReached,
     /// What the context holds, by kind (system prompt, tools, messages, …).
     Context(Vec<ContextPart>),
+    /// The tool call `id` was not run: a rule, the permission mode or auto mode's classifier said no
+    /// ([`ToolUse::denied`]).
+    Denied(String),
+    /// The session goes on with this model: its provider put it in the place of the one chosen (it
+    /// declined a request). It is the session's model from now on ([`Session::model`]).
+    Model(String),
+    /// The commands and skills a message can start with, as the agent's process offers them in the
+    /// session's folder: each its name and a line on it. Not kept in the session.
+    Commands(Vec<(String, String)>),
     /// The Claude Agent's own session id, to resume it later.
     Remote(String),
     /// The turn took in a message the user sent while it ran: the model
@@ -280,6 +289,12 @@ pub struct Ask {
     /// Whether "always allow" can stop the engine asking about this kind of call again. Claude Code says
     /// so by offering a rule to save, and offers none where saving one would not allow the call again.
     pub always: bool,
+    /// Who asks, when it is not the agent: the MCP server whose question this is. Its words (`reason`,
+    /// the questions) are that server's, not the agent's.
+    pub from: String,
+    /// The page a yes opens, for a server that asks the user to open one (to sign in, say); a yes is
+    /// then [`Verdict::Allow`]. Empty otherwise.
+    pub link: String,
 }
 
 /// What a question the user put away without answering it tells the model.
@@ -402,10 +417,16 @@ impl Session {
                 }
             }
             AgentEvent::Remote(id) => self.remote.clone_from(id),
+            AgentEvent::Denied(id) => {
+                let Some(call) = self.find_tool(id) else { return };
+                call.denied = true;
+            }
+            AgentEvent::Model(model) => self.model.clone_from(model),
             AgentEvent::FollowUp { text, note, files, .. } => {
                 self.entries.push(Entry::User { text: text.clone(), note: note.clone(), files: files.clone() });
             }
             AgentEvent::Queued(_)
+            | AgentEvent::Commands(_)
             | AgentEvent::Background { .. }
             | AgentEvent::Suggestion(_)
             | AgentEvent::Warning(_)
@@ -1247,6 +1268,7 @@ impl ApiEngine {
             reason: String::new(),
             call: String::new(),
             always: false,
+            ..Ask::default()
         };
         emit(session, AgentEvent::Permission(ask));
         let verdict = inbox.verdict(&call.call_id);
@@ -1277,6 +1299,7 @@ impl ApiEngine {
             reason: String::new(),
             call: call.call_id.clone(),
             always: true,
+            ..Ask::default()
         };
         emit(session, AgentEvent::Permission(ask));
         let verdict = inbox.verdict(&call.call_id);

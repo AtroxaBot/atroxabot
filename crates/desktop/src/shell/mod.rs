@@ -1112,6 +1112,10 @@ impl Shell {
             return;
         }
         let ask = thread.asks.remove(0);
+        // A yes to an MCP server's page opens it (only an http(s) one opens).
+        if !ask.link.is_empty() && matches!(verdict, Verdict::Allow | Verdict::AllowAlways) {
+            actions.push(Action::OpenLink(ask.link.clone()));
+        }
         // A no to a tool call means it never ran: it says so, rather than that it failed. (A question
         // put away is no tool call refused.)
         if matches!(verdict, Verdict::Deny(_))
@@ -1206,6 +1210,7 @@ impl Shell {
             AgentEvent::FollowUp { id, .. } => thread.follow_ups.retain(|waiting| waiting.message.id != id),
             AgentEvent::Queued(count) => thread.more = count,
             AgentEvent::Background { id, what, ended } => thread.background_task(id, what, ended),
+            AgentEvent::Commands(commands) => thread.commands = Some(commands),
             // Only between turns: one that started since makes it stale.
             AgentEvent::Suggestion(text) if suggesting && !thread.busy => thread.suggestion = Some(text),
             AgentEvent::TurnEnded { problem } => {
@@ -2549,6 +2554,62 @@ mod tests {
     }
 
     /// A shell whose agent (on a Claude account) is answering "Fix the bug": the session's id.
+    /// What an MCP server asks rides on the approval card as the server's: a yes to its page opens the page,
+    /// and a no tells it only no, leaving what the user wrote for the agent.
+    #[test]
+    fn an_mcp_servers_request_is_answered_as_its_own() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        shell.start(&mut actions);
+        let first = working(&mut shell, &mut actions);
+        let page = atroxabot_core::Ask {
+            id: "e1".into(),
+            tool: "a page".into(),
+            from: "linear".into(),
+            link: "https://linear.app/auth".into(),
+            summary: "https://linear.app/auth".into(),
+            ..atroxabot_core::Ask::default()
+        };
+        shell.agent_event(&first, AgentEvent::Permission(page), &mut actions);
+        actions.clear();
+        shell.decide(Verdict::Allow, &mut actions);
+        assert!(actions.iter().any(|a| matches!(a, Action::OpenLink(url) if url == "https://linear.app/auth")));
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Decide { ask, verdict: Verdict::Allow, .. } if ask == "e1"))
+        );
+
+        let go = atroxabot_core::Ask {
+            id: "e2".into(),
+            tool: "your go-ahead".into(),
+            from: "linear".into(),
+            ..atroxabot_core::Ask::default()
+        };
+        shell.agent_event(&first, AgentEvent::Permission(go), &mut actions);
+        shell.composer.editor.insert("use the staging board");
+        actions.clear();
+        shell.deny(&mut actions);
+        assert!(
+            actions.iter().any(|a| matches!(a, Action::Decide { verdict: Verdict::Deny(why), .. } if why.is_empty()))
+        );
+        assert!(!actions.iter().any(|a| matches!(a, Action::OpenLink(_))), "a no opens nothing");
+        assert_eq!(shell.composer.editor.text(), "use the staging board", "what was written stays");
+    }
+
+    /// The session goes on with the model its provider put in place of the one that declined, and offers the
+    /// commands its own process lists.
+    #[test]
+    fn a_fallback_model_and_the_sessions_own_commands() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        shell.start(&mut actions);
+        let first = working(&mut shell, &mut actions);
+        shell.agent_event(&first, AgentEvent::Model("claude-opus-4-8".into()), &mut actions);
+        assert_eq!(shell.threads[&first].session.model, "claude-opus-4-8");
+        let listed = vec![("deploy".to_owned(), "Ship it".to_owned())];
+        shell.agent_event(&first, AgentEvent::Commands(listed.clone()), &mut actions);
+        assert_eq!(shell.threads[&first].commands, Some(listed));
+    }
+
     /// What Claude Code runs in the background keeps its process up when the user looks elsewhere.
     #[test]
     fn a_session_running_something_in_the_background_keeps_its_process() {

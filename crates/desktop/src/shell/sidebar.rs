@@ -161,8 +161,9 @@ impl Shell {
                 let confirming = self.confirm_delete.as_deref() == Some(session.id.as_str());
                 let thread = self.threads.get(&session.id);
                 let working = thread.is_some_and(|thread| thread.busy);
-                // Something runs in the background between its turns: a still dot, as that may take an hour.
-                let waiting = thread.is_some_and(|thread| !thread.background.is_empty());
+                // Something runs in the background between its turns (a command, a subagent): a still dot, as
+                // that may take an hour.
+                let waiting = thread.is_some_and(|thread| !thread.busy && thread.at_work());
                 // Right: a delete button while hovered, a pulse while it works, a dot while it waits.
                 let mut on_control = false;
                 let right = if (hovered && !carried) || confirming {

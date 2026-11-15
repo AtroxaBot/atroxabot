@@ -7,8 +7,8 @@ use serde_json::Value;
 
 use crate::cli::preview;
 use crate::{
-    Account, Block, ContextCategory, ContextUsage, Event, Info, Init, McpServerStatus, ModelInfo, PermissionRequest,
-    PlanLimits, PlanUsage, RateLimit, RateWindow, SlashCommand, Task, TaskState, TurnResult, Usage,
+    Account, Block, ContextCategory, ContextUsage, Elicitation, Event, Info, Init, McpServerStatus, ModelInfo,
+    PermissionRequest, PlanLimits, PlanUsage, RateLimit, RateWindow, SlashCommand, Task, TaskState, TurnResult, Usage,
 };
 
 /// How a control request of ours that failed is reported: [`Event::Error`] with this before its id.
@@ -349,21 +349,25 @@ fn info(answer: &Value) -> Info {
             subscription: text(account, "subscriptionType"),
         },
         version: text(answer, "claude_code_version"),
-        commands: field(answer, "commands")
-            .as_array()
-            .map(Vec::as_slice)
-            .unwrap_or_default()
-            .iter()
-            .take(1024)
-            .map(|command| SlashCommand {
-                name: text(command, "name"),
-                description: text(command, "description"),
-                argument_hint: text(command, "argumentHint"),
-            })
-            .filter(|command| !command.name.is_empty())
-            .collect(),
+        commands: commands(field(answer, "commands")),
         raw: answer.clone(),
     }
+}
+
+/// A list of slash commands, as `initialize` and `commands_changed` give it; one without a name is left out.
+fn commands(list: &Value) -> Vec<SlashCommand> {
+    list.as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .take(1024)
+        .map(|command| SlashCommand {
+            name: text(command, "name"),
+            description: text(command, "description"),
+            argument_hint: text(command, "argumentHint"),
+        })
+        .filter(|command| !command.name.is_empty())
+        .collect()
 }
 
 fn system(data: Value) -> Parsed {
@@ -416,6 +420,7 @@ fn system(data: Value) -> Parsed {
             };
             Event::Task(Task {
                 tool_use_id: text(&data, "tool_use_id"),
+                task_id: text(&data, "task_id"),
                 state,
                 description: text(&data, "description"),
                 subagent_type: text(&data, "subagent_type"),
@@ -430,6 +435,25 @@ fn system(data: Value) -> Parsed {
         }
         // Sent to a host that set CLAUDE_CODE_SDK_READS_SESSION_STATE, as this crate does.
         "session_state_changed" => Event::SessionState(text(&data, "state")),
+        "model_refusal_fallback" => Event::RefusalFallback {
+            original_model: text(&data, "original_model"),
+            fallback_model: text(&data, "fallback_model"),
+            // Older builds say no scope: their fallbacks are all the session's.
+            whole_session: field(&data, "scope").as_str() != Some("local"),
+        },
+        "model_refusal_no_fallback" => Event::Refused { model: text(&data, "original_model") },
+        "permission_denied" => Event::PermissionDenied {
+            tool_use_id: text(&data, "tool_use_id"),
+            tool_name: text(&data, "tool_name"),
+            reason: opt_text(&data, "decision_reason").filter(|reason| !reason.trim().is_empty()),
+        },
+        "commands_changed" => Event::Commands(commands(field(&data, "commands"))),
+        "session_writes_lost" => Event::WritesLost {
+            error_code: text(&data, "error_code"),
+            transcript: field(&data, "lost")
+                .as_array()
+                .is_some_and(|lost| lost.iter().any(|what| what.as_str() == Some("transcript"))),
+        },
         _ => Event::Other { kind: "system".into(), subtype, raw: data },
     })
 }
@@ -455,6 +479,18 @@ fn control_request(data: &Value) -> Parsed {
     let request_id = text(data, "request_id");
     let request = field(data, "request");
     let subtype = text(request, "subtype");
+    if subtype == "elicitation" {
+        let order = strings(field(request, "property_order")).into_iter().take(64).collect();
+        let url = opt_text(request, "url").filter(|_| field(request, "mode").as_str() == Some("url"));
+        return Parsed::Event(Event::Elicitation(Elicitation {
+            request_id,
+            server: text(request, "mcp_server_name"),
+            message: text(request, "message"),
+            schema: if url.is_some() { Value::Null } else { field(request, "requested_schema").clone() },
+            url,
+            order,
+        }));
+    }
     if subtype != "can_use_tool" {
         return Parsed::Unsupported { request_id, subtype };
     }
@@ -581,6 +617,68 @@ mod tests {
             Parsed::Event(event) => event,
             other => panic!("expected an event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn refusals_denials_commands_and_lost_writes() {
+        let fallback = r#"{"type":"system","subtype":"model_refusal_fallback","trigger":"refusal","direction":"retry",
+            "original_model":"claude-opus-5-5","fallback_model":"claude-opus-4-8","request_id":null,"content":"x"}"#;
+        let swapped = Event::RefusalFallback {
+            original_model: "claude-opus-5-5".into(),
+            fallback_model: "claude-opus-4-8".into(),
+            whole_session: true,
+        };
+        assert_eq!(event(&fallback.replace('\n', "")), swapped, "older builds say no scope: the session's");
+        let local = fallback.replace(r#""direction":"retry","#, r#""direction":"retry","scope":"local","#);
+        assert!(matches!(event(&local.replace('\n', "")), Event::RefusalFallback { whole_session: false, .. }));
+        let refused = r#"{"type":"system","subtype":"model_refusal_no_fallback","original_model":"claude-opus-5-5"}"#;
+        assert_eq!(event(refused), Event::Refused { model: "claude-opus-5-5".into() });
+
+        let denied = r#"{"type":"system","subtype":"permission_denied","tool_name":"Bash","tool_use_id":"toolu_1",
+            "decision_reason_type":"classifier","decision_reason":"Deletes files","message":"no"}"#;
+        assert_eq!(
+            event(&denied.replace('\n', "")),
+            Event::PermissionDenied {
+                tool_use_id: "toolu_1".into(),
+                tool_name: "Bash".into(),
+                reason: Some("Deletes files".into())
+            }
+        );
+
+        let changed = r#"{"type":"system","subtype":"commands_changed","commands":[
+            {"name":"review","description":"Review the diff","argumentHint":"<pr>"},{"description":"no name"},7]}"#;
+        let Event::Commands(commands) = event(&changed.replace('\n', "")) else { panic!("commands") };
+        assert_eq!(commands.len(), 1);
+        assert_eq!((commands[0].name.as_str(), commands[0].argument_hint.as_str()), ("review", "<pr>"));
+
+        let lost = r#"{"type":"system","subtype":"session_writes_lost","error_code":"ENOSPC","lost":["global_config","transcript"]}"#;
+        assert_eq!(event(lost), Event::WritesLost { error_code: "ENOSPC".into(), transcript: true });
+        let config =
+            r#"{"type":"system","subtype":"session_writes_lost","error_code":"EDQUOT","lost":["global_config"]}"#;
+        assert_eq!(event(config), Event::WritesLost { error_code: "EDQUOT".into(), transcript: false });
+    }
+
+    #[test]
+    fn an_mcp_servers_question_is_a_form_or_a_page() {
+        let form = r#"{"type":"control_request","request_id":"e1","request":{"subtype":"elicitation",
+            "mcp_server_name":"github","message":"Which repository?","mode":"form",
+            "requested_schema":{"type":"object","properties":{"repo":{"type":"string"}}},"property_order":["repo"]}}"#;
+        let Event::Elicitation(asked) = event(&form.replace('\n', "")) else { panic!("a form") };
+        assert_eq!(
+            (asked.request_id.as_str(), asked.server.as_str(), asked.message.as_str()),
+            ("e1", "github", "Which repository?")
+        );
+        assert_eq!((asked.url, asked.order), (None, vec!["repo".to_owned()]));
+        assert_eq!(asked.schema["properties"]["repo"]["type"], "string");
+
+        let page = r#"{"type":"control_request","request_id":"e2","request":{"subtype":"elicitation",
+            "mcp_server_name":"linear","message":"Sign in","mode":"url","url":"https://linear.app/auth"}}"#;
+        let Event::Elicitation(asked) = event(&page.replace('\n', "")) else { panic!("a page") };
+        assert_eq!((asked.url.as_deref(), asked.schema.is_null()), (Some("https://linear.app/auth"), true));
+        // A link without the page mode is no page to open.
+        let stray = page.replace(r#""mode":"url","#, "");
+        let Event::Elicitation(asked) = event(&stray.replace('\n', "")) else { panic!("a form") };
+        assert_eq!(asked.url, None);
     }
 
     #[test]

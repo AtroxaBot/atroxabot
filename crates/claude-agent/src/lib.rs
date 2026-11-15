@@ -22,6 +22,18 @@ pub use cli::{cli_version, find_cli};
 pub use serde_json::Value;
 pub use session::{Decision, Session, info, mcp_servers, plan_usage};
 
+/// What the binary is told in `initialize`, beside the fields every session sends: what this caller does.
+pub(crate) fn initialize_request(options: &Options) -> Value {
+    let mut request = serde_json::json!({"subtype": "initialize", "hooks": null});
+    if options.forward_subagent_text {
+        request["forwardSubagentText"] = true.into();
+    }
+    if options.stop_tasks {
+        request["perTaskStopAffordance"] = true.into();
+    }
+    request
+}
+
 /// How to launch the Claude Code binary. `Options::default()` is a plain session in the current directory.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
@@ -67,6 +79,18 @@ pub struct Options {
     /// Route permission prompts to this process (`--permission-prompt-tool stdio`): each arrives as an
     /// [`Event::Permission`] and waits for [`Session::respond`].
     pub ask_permissions: bool,
+    /// Pass on what an MCP server asks the user (`elicitation`): each arrives as an [`Event::Elicitation`] and
+    /// waits for [`Session::answer`]. Without it every such request is declined, as the official SDK does
+    /// when it has no `onElicitation`.
+    pub answer_elicitations: bool,
+    /// Forward what subagents write and think, not only their tool calls (`forwardSubagentText`, said in
+    /// `initialize`): it arrives as [`Event::Assistant`] with `parent_tool_use_id` set. Nothing more is
+    /// asked of the model; the binary only passes on what it already has.
+    pub forward_subagent_text: bool,
+    /// Say that the caller stops tasks one at a time with [`Session::stop_task`] (`perTaskStopAffordance`,
+    /// said in `initialize`). [`Session::interrupt`] then ends only the turn, and subagents and commands
+    /// running in the background go on; without it the binary stops them all with the turn.
+    pub stop_tasks: bool,
     /// Environment variables added to the inherited environment.
     pub env: Vec<(String, String)>,
     /// Further flags, without the leading `--`, each with an optional value. `bare` is refused: it disables
@@ -234,6 +258,8 @@ pub enum TaskState {
 pub struct Task {
     /// The tool call that started it, matching a [`Block::ToolUse`] and the `parent_tool_use_id` of its messages.
     pub tool_use_id: String,
+    /// The binary's own id of the task, which [`Session::stop_task`] takes; empty when not said.
+    pub task_id: String,
     /// How it is doing.
     pub state: TaskState,
     /// What it was started for, or (while running) what it is doing now.
@@ -357,7 +383,8 @@ pub enum Event {
     },
     /// The binary asks whether a tool may run (`can_use_tool`). Answer with [`Session::respond`].
     Permission(PermissionRequest),
-    /// The binary withdrew a pending [`Event::Permission`]; it can no longer be answered.
+    /// The binary withdrew a pending [`Event::Permission`] or [`Event::Elicitation`]; it can no longer be
+    /// answered.
     PermissionCancelled {
         /// The withdrawn request.
         request_id: String,
@@ -396,6 +423,44 @@ pub enum Event {
         pre_tokens: u64,
         /// Its size after; 0 when not said.
         post_tokens: u64,
+    },
+    /// An MCP server asks the user something (`elicitation`; needs [`Options::answer_elicitations`]). Answer
+    /// with [`Session::answer`].
+    Elicitation(Elicitation),
+    /// `system`/`model_refusal_fallback`: the model declined a request and it was answered again by another.
+    RefusalFallback {
+        /// The model that declined, e.g. `claude-opus-5-5`.
+        original_model: String,
+        /// The model that answered instead.
+        fallback_model: String,
+        /// Whether the session goes on with `fallback_model` (the main conversation fell back), rather than
+        /// only a subagent's or a side question's answer coming from it.
+        whole_session: bool,
+    },
+    /// `system`/`model_refusal_no_fallback`: the model declined a request and no other answered it.
+    Refused {
+        /// The model that declined.
+        model: String,
+    },
+    /// `system`/`permission_denied`: a tool call was not run, whoever decided so (a rule, the permission
+    /// mode, auto mode's classifier, the caller).
+    PermissionDenied {
+        /// The call, matching a [`Block::ToolUse`].
+        tool_use_id: String,
+        /// The tool.
+        tool_name: String,
+        /// Why, when the binary says.
+        reason: Option<String>,
+    },
+    /// The slash commands and skills a message can start with changed (`system`/`commands_changed`): the
+    /// whole list as it is now.
+    Commands(Vec<SlashCommand>),
+    /// `system`/`session_writes_lost`: the binary could not save some of what it writes (the disk is full).
+    WritesLost {
+        /// Why: `ENOSPC` (the disk is full), `EDQUOT` (the quota is used up) or another code.
+        error_code: String,
+        /// Lines of the session's transcript were lost: resuming it may miss part of the conversation.
+        transcript: bool,
     },
     /// Any other message: other `system` subtypes (hook events, ...), stream events that are not text or thinking
     /// deltas (`kind` is `stream_event`, `subtype` the event's type), answers to control requests this crate
@@ -512,6 +577,36 @@ pub struct PermissionRequest {
     pub suggestions: Vec<Value>,
 }
 
+/// What an MCP server asks the user, from `elicitation`: to fill in a form, or to open a page (to sign in,
+/// say). The server's words are its own: show them as the server's, never as the app's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Elicitation {
+    /// Identifies the request to [`Session::answer`].
+    pub request_id: String,
+    /// The MCP server that asks.
+    pub server: String,
+    /// What it says.
+    pub message: String,
+    /// The page to open, for a request of that kind; `None` for a form.
+    pub url: Option<String>,
+    /// The form's JSON Schema (`requested_schema`): an object whose `properties` are the fields. `null` for a
+    /// page.
+    pub schema: Value,
+    /// The fields' names in the order the server listed them; empty when it did not say.
+    pub order: Vec<String>,
+}
+
+/// The user's answer to an [`Event::Elicitation`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum ElicitationAnswer {
+    /// Yes: the form's values (an object, by field name), or `null` for a page the user opened.
+    Accept(Value),
+    /// No.
+    Decline,
+    /// Put away without an answer.
+    Cancel,
+}
+
 /// The end of a turn, from a `result` message.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TurnResult {
@@ -603,7 +698,8 @@ pub enum Error {
     Io(std::io::Error),
     /// The session is closed.
     Closed,
-    /// [`Session::respond`] named a request that is not pending: unknown, already answered, or withdrawn.
+    /// [`Session::respond`] or [`Session::answer`] named a request that is not pending: unknown, already
+    /// answered, or withdrawn.
     UnknownRequest(String),
     /// The binary did not report a version; the text says what happened.
     Version(String),
@@ -629,7 +725,7 @@ impl fmt::Display for Error {
             Self::Spawn(error) => write!(f, "failed to start the Claude Code binary: {error}"),
             Self::Io(error) => write!(f, "failed to talk to the Claude Code binary: {error}"),
             Self::Closed => f.write_str("the session is closed"),
-            Self::UnknownRequest(id) => write!(f, "no pending permission request {id}"),
+            Self::UnknownRequest(id) => write!(f, "no pending request {id}"),
             Self::Version(why) => write!(f, "could not read the Claude Code version: {why}"),
             Self::NoInfo(why) => write!(f, "Claude Code did not report its models and account: {why}"),
             Self::Unsupported(why) => write!(f, "Claude Code does not answer the request as expected: {why}"),

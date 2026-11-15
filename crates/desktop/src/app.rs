@@ -242,6 +242,14 @@ pub enum Action {
     StopJobs(String),
     /// Ask the Claude Agent process of this session, if it has one, what its context holds.
     AskContext(String),
+    /// Stop the subagent, or the command in the background, that the tool call `call` of the session's
+    /// Claude Agent process started; the turn and every other task go on.
+    StopTask {
+        /// The session.
+        session: String,
+        /// The id of the call that started the task.
+        call: String,
+    },
     /// Read a session's messages.
     LoadSession(String),
     /// Write a session to disk.
@@ -986,6 +994,13 @@ impl App {
             Action::AskContext(session) => {
                 if let Some(live) = self.live.get(&session) {
                     live.ask_context();
+                }
+            }
+            Action::StopTask { session, call } => {
+                if let Some(Live::Claude(agent)) = self.live.get(&session)
+                    && !agent.stop_task(&call)
+                {
+                    crate::log::error(format!("session {session}: Claude Code named no task for the call {call}"));
                 }
             }
             Action::LoadSession(session) => {

@@ -346,8 +346,9 @@ impl Shell {
         if let Some(guess) = guess.as_deref().filter(|_| shown.is_empty()) {
             draw_suggestion(p, ui, guess, (origin.0, origin.1, text_w), line_h);
         } else if shown.is_empty() {
-            // While an approval waits, what is written here is the reason of a no.
-            let approving = self.thread().is_some_and(|thread| !thread.asks.is_empty()) && !elsewhere;
+            // While an approval waits, what is written here is the reason of a no (an MCP server's takes none).
+            let first = self.thread().and_then(|thread| thread.asks.first());
+            let approving = first.is_some_and(|ask| ask.from.is_empty()) && !elsewhere;
             let invite = if approving {
                 format!("Message {}, or write why you deny this", agent.name)
             } else {
@@ -431,7 +432,13 @@ impl Shell {
             // A question is answered on a card of its own.
             Some(ask) if self.asks_question(&ask) => {
                 let Some(mut form) = self.question.take() else { return top };
-                let (top, verdict) = form.draw(p, ui, (x, waiting - 2.0, width), &ask.input, &agent.name);
+                // An MCP server's question is the server's, with its own words over it.
+                let who = if ask.from.is_empty() {
+                    (agent.name.as_str(), "")
+                } else {
+                    (ask.from.as_str(), ask.reason.as_str())
+                };
+                let (top, verdict) = form.draw(p, ui, (x, waiting - 2.0, width), &ask.input, who);
                 match verdict {
                     Some(verdict) => self.decide(verdict, actions),
                     None => self.question = Some(form),
@@ -559,13 +566,25 @@ impl Shell {
         }
         if let Some(connection) = connection.filter(|connection| connection.kind == ConnectionKind::ClaudeAgent) {
             commands.push(("compact".to_owned(), "Summarise the conversation to free up its context".to_owned()));
-            if let Some(Account::Ready(info)) = self.claude.get(&connection.id) {
-                let own = |name: &str| commands.iter().any(|(known, _)| known == name);
-                let listed: Vec<_> = info.commands.iter().filter(|command| !own(&command.name)).collect();
-                commands.extend(listed.into_iter().map(|command| {
-                    let line = command.description.lines().next().unwrap_or_default();
-                    (command.name.clone(), line.chars().take(160).collect())
-                }));
+            // What the session's own process offers (its folder's commands and skills too), or else the account's.
+            let listed: Vec<(String, String)> = match self.thread().and_then(|thread| thread.commands.clone()) {
+                Some(listed) => listed,
+                None => match self.claude.get(&connection.id) {
+                    Some(Account::Ready(info)) => info
+                        .commands
+                        .iter()
+                        .map(|command| {
+                            let line = command.description.lines().next().unwrap_or_default();
+                            (command.name.clone(), line.chars().take(160).collect())
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                },
+            };
+            for (name, line) in listed {
+                if !commands.iter().any(|(known, _)| *known == name) {
+                    commands.push((name, line));
+                }
             }
         }
         let mut found: Vec<_> =
@@ -856,10 +875,23 @@ impl Shell {
         let raised = Rect::new(card.x + 8.0, card.y + 8.0, card.w - 16.0, card.h);
         p.shadow(raised, fade(t.shadow, 0.7), theme::RADIUS_LG, 22.0);
         p.bordered(card, t.surface, theme::RADIUS_LG, 1.0, mix(t.border_strong, t.border_focus, appear));
-        icon::draw(p, icon::SHIELD, (card.x + 24.0, card.y + 25.0), 16.0, t.text);
-        let title = format!("{agent} wants to use {}", ask.tool);
+        // What an MCP server asks for is its own: a page to open, or a go-ahead.
+        let server = !ask.from.is_empty();
+        let mark = if !ask.link.is_empty() {
+            icon::LINK
+        } else if server {
+            icon::PLUG
+        } else {
+            icon::SHIELD
+        };
+        icon::draw(p, mark, (card.x + 24.0, card.y + 25.0), 16.0, t.text);
+        let title = match (server, ask.link.is_empty()) {
+            (true, false) => format!("{} asks you to open a page", ask.from),
+            (true, true) => format!("{} asks for your go-ahead", ask.from),
+            (false, _) => format!("{agent} wants to use {}", ask.tool),
+        };
         p.label(&title, theme::LABEL, card.x + 42.0, card.y + 16.0, t.text);
-        if !ask.reason.is_empty() {
+        if !ask.reason.is_empty() && ask.reason != ask.summary {
             let mut reason = p.layout(&ask.reason, theme::TINY, None);
             reason.truncate(p.fonts, width - 64.0);
             p.text(&reason, card.x + 42.0, card.y + 35.0, t.text_faint);
@@ -875,8 +907,9 @@ impl Shell {
         let mut verdict = None;
         // "Always allow" only where it can stop the asking; elsewhere it would be a second "Allow".
         let always = ask.always.then_some(("Always allow", 112.0, ButtonStyle::Secondary, Verdict::AllowAlways));
+        let yes = if ask.link.is_empty() { ("Allow  ↵", 92.0) } else { ("Open  ↵", 92.0) };
         for (label, w, style, answer) in
-            std::iter::once(("Allow  ↵", 92.0, ButtonStyle::Primary, Verdict::Allow)).chain(always)
+            std::iter::once((yes.0, yes.1, ButtonStyle::Primary, Verdict::Allow)).chain(always)
         {
             right -= w;
             if button(p, ui, Rect::new(right, y, w, 30.0), label, style, true) {
@@ -884,9 +917,14 @@ impl Shell {
             }
             right -= 8.0;
         }
-        // What is written in the message box goes with a no, as the reason.
-        let (label, wide) =
-            if self.reason().is_empty() { ("Deny  esc", 92.0) } else { ("Deny with reason  esc", 164.0) };
+        // What is written in the message box goes with a no, as the reason (a server takes none).
+        let (label, wide) = if server {
+            ("Decline  esc", 104.0)
+        } else if self.reason().is_empty() {
+            ("Deny  esc", 92.0)
+        } else {
+            ("Deny with reason  esc", 164.0)
+        };
         if button(p, ui, Rect::new(right - wide, y, wide, 30.0), label, ButtonStyle::Ghost, true) {
             self.deny(actions);
         }
@@ -907,7 +945,10 @@ impl Shell {
     /// is taken out of the box. Codex takes no reason with a no: there it
     /// is sent as a message, which the agent reads at its next step.
     pub(super) fn deny(&mut self, actions: &mut Vec<Action>) {
-        if self.thread().is_none_or(|thread| thread.asks.is_empty()) {
+        let Some(asked) = self.thread().and_then(|thread| thread.asks.first()) else { return };
+        // An MCP server is only told no: what is written stays for the agent.
+        if !asked.from.is_empty() {
+            self.decide(Verdict::Deny(String::new()), actions);
             return;
         }
         let why = self.reason().to_owned();

@@ -247,6 +247,9 @@ mod tests {
             include_partial_messages: true,
             prompt_suggestions: true,
             ask_permissions: true,
+            answer_elicitations: true,
+            forward_subagent_text: true,
+            stop_tasks: true,
             env: Vec::new(),
             extra_args: vec![
                 ("debug".into(), None),

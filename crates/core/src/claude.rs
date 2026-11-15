@@ -19,7 +19,8 @@ use serde_json::Value;
 use crate::agent::{Agent, Autonomy};
 use crate::attach;
 use crate::config::Connection;
-use crate::engine::{AgentEvent, Ask, FollowUp, LimitWindow, Limits, Verdict};
+use crate::elicit::Form;
+use crate::engine::{AgentEvent, Ask, FollowUp, LimitWindow, Limits, QUESTION_TOOL, Verdict};
 use crate::responses::Usage;
 #[cfg(test)]
 use crate::session::TodoState;
@@ -229,6 +230,11 @@ pub struct ClaudeAgent {
     /// The model and effort it answers with: what it was started with, or
     /// took since ([`ClaudeAgent::retune`]).
     tuned: Arc<Mutex<(String, String)>>,
+    /// What MCP servers asked and the user has not answered, by request id:
+    /// the form each answer fills in (`None` for a page or a go-ahead).
+    elicitations: Arc<Mutex<HashMap<String, Option<Form>>>>,
+    /// Claude Code's id of each task, by the call that started it, to stop it by.
+    task_ids: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl std::fmt::Debug for ClaudeAgent {
@@ -258,8 +264,11 @@ impl ClaudeAgent {
         let suggestions: Arc<Mutex<HashMap<String, Vec<Value>>>> = Arc::default();
         let pending = Arc::clone(&suggestions);
         // The binary's running total includes what a resumed session cost before.
-        let mut mapper = Mapper { total: session.cost(), ..Mapper::default() };
+        let tuned = Arc::new(Mutex::new(tuning(&agent.model, &agent.effort)));
+        let mut mapper = Mapper { total: session.cost(), tuned: Arc::clone(&tuned), ..Mapper::default() };
         let follow_ups = Arc::clone(&mapper.follow_ups);
+        let elicitations = Arc::clone(&mapper.elicitations);
+        let task_ids = Arc::clone(&mapper.task_ids);
         let (prompt, memory) = session.account_prompt(agent);
         let mut options = options(agent, connection, session, &prompt);
         options.mcp_config = mcp;
@@ -278,8 +287,7 @@ impl ClaudeAgent {
                 emit(event);
             }
         })?;
-        let tuned = Arc::new(Mutex::new(tuning(&agent.model, &agent.effort)));
-        Ok(Self { session, suggestions, follow_ups, tuned })
+        Ok(Self { session, suggestions, follow_ups, tuned, elicitations, task_ids })
     }
 
     /// Whether it answers with `model` at `effort` as it runs now.
@@ -350,8 +358,34 @@ impl ClaudeAgent {
         let _ = self.session.interrupt(cancel_queued);
     }
 
+    /// Stops the subagent, or the command running in the background, that
+    /// the tool call `call` started. Its end arrives as its news does; the
+    /// turn, and every other task, go on. `false` when Claude Code named
+    /// no such task.
+    #[must_use]
+    pub fn stop_task(&self, call: &str) -> bool {
+        let task = self.task_ids.lock().ok().and_then(|ids| ids.get(call).cloned());
+        // Fails only if the process is gone, which stops the task anyway.
+        task.is_some_and(|task| self.session.stop_task(&task).is_ok())
+    }
+
     /// Answers the approval `id`.
     pub fn decide(&self, id: &str, verdict: Verdict) {
+        let asked = self.elicitations.lock().ok().and_then(|mut asked| asked.remove(id));
+        if let Some(form) = asked {
+            let answer = match (verdict, form) {
+                (Verdict::Answer(answers), Some(form)) => sdk::ElicitationAnswer::Accept(form.content(&answers)),
+                // A page opened, or a go-ahead given.
+                (Verdict::Allow | Verdict::AllowAlways, None) => {
+                    sdk::ElicitationAnswer::Accept(Value::Object(serde_json::Map::new()))
+                }
+                (Verdict::Deny(why), _) if why == crate::engine::DISMISSED => sdk::ElicitationAnswer::Cancel,
+                _ => sdk::ElicitationAnswer::Decline,
+            };
+            // Fails if the request was withdrawn or the process is gone.
+            let _ = self.session.answer(id, answer);
+            return;
+        }
         let suggested = self.suggestions.lock().ok().and_then(|mut pending| pending.remove(id)).unwrap_or_default();
         let decision = match verdict {
             Verdict::Allow => sdk::Decision::Allow { updated_input: None, updated_permissions: Vec::new() },
@@ -456,6 +490,12 @@ fn options(agent: &Agent, connection: &Connection, session: &Session, prompt: &s
         plugin_dirs: crate::skills::Library::open().ok().and_then(|library| library.plugin_dir()).into_iter().collect(),
         include_partial_messages: true,
         ask_permissions,
+        // What an MCP server asks the user reaches the user, on the cards an approval and a question ride on.
+        answer_elicitations: true,
+        // What subagents write and think is shown when one is opened; Claude Code only passes it on.
+        forward_subagent_text: true,
+        // A subagent or a command in the background is stopped from its row, so Stop ends only the turn.
+        stop_tasks: true,
         // Claude Code gives a session an app starts its task list tools only when they are named here.
         allowed_tools: TASK_TOOLS.map(str::to_owned).into(),
         env: account_env(connection),
@@ -555,6 +595,13 @@ struct Mapper {
     /// The tasks a subagent started, by their call: Claude Code tells that
     /// subagent when one ends, not the session, so the conversation does not.
     owned: HashSet<String>,
+    /// The model and effort the process answers with; shared with
+    /// [`ClaudeAgent`], whose model a fallback replaces.
+    tuned: Arc<Mutex<(String, String)>>,
+    /// What MCP servers asked, by request id; shared with [`ClaudeAgent::decide`].
+    elicitations: Arc<Mutex<HashMap<String, Option<Form>>>>,
+    /// Claude Code's id of each task, by its call; shared with [`ClaudeAgent::stop_task`].
+    task_ids: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Mapper {
@@ -668,6 +715,15 @@ impl Mapper {
                 }
             }
             sdk::Event::Task(task) if !task.tool_use_id.is_empty() => {
+                if let Ok(mut ids) = self.task_ids.lock() {
+                    if matches!(task.state, sdk::TaskState::Started | sdk::TaskState::Running) {
+                        if !task.task_id.is_empty() {
+                            ids.insert(task.tool_use_id.clone(), task.task_id.clone());
+                        }
+                    } else {
+                        ids.remove(&task.tool_use_id);
+                    }
+                }
                 // A task of a subagent's kind is one, whatever its call is named.
                 let kind = task.task_type.as_str();
                 if kind.contains("agent") || kind.contains("teammate") {
@@ -785,9 +841,52 @@ impl Mapper {
                     reason,
                     call: request.tool_use_id.unwrap_or_default(),
                     always,
+                    ..Ask::default()
                 }));
             }
-            sdk::Event::PermissionCancelled { request_id } => out.push(AgentEvent::PermissionGone(request_id)),
+            sdk::Event::PermissionCancelled { request_id } => {
+                if let Ok(mut asked) = self.elicitations.lock() {
+                    asked.remove(&request_id);
+                }
+                out.push(AgentEvent::PermissionGone(request_id));
+            }
+            sdk::Event::Elicitation(asked) => out.push(AgentEvent::Permission(self.elicited(asked))),
+            sdk::Event::PermissionDenied { tool_use_id, .. } if !tool_use_id.is_empty() => {
+                out.push(AgentEvent::Denied(tool_use_id));
+            }
+            sdk::Event::RefusalFallback { original_model, fallback_model, whole_session } => {
+                let (declined, answered) = (model_name(&original_model), model_name(&fallback_model));
+                out.push(AgentEvent::Note(if whole_session {
+                    format!("{declined} declined this request, so {answered} answered it and goes on with the session")
+                } else {
+                    format!("{declined} declined a subagent's request, so {answered} answered it")
+                }));
+                if whole_session && !fallback_model.is_empty() {
+                    // The process answers with it now: no change to make when the session's model says so too.
+                    if let Ok(mut tuned) = self.tuned.lock() {
+                        tuned.0.clone_from(&fallback_model);
+                    }
+                    out.push(AgentEvent::Model(fallback_model));
+                }
+            }
+            sdk::Event::Refused { model } => {
+                out.push(AgentEvent::Note(format!("{} declined this request", model_name(&model))));
+            }
+            // The process's own list: the commands and skills of the session's folder are in it.
+            sdk::Event::Ready(info) => out.push(AgentEvent::Commands(commands(&info.commands))),
+            sdk::Event::Commands(listed) => out.push(AgentEvent::Commands(commands(&listed))),
+            sdk::Event::WritesLost { error_code, transcript } => {
+                let why = match error_code.as_str() {
+                    "ENOSPC" => "the disk is full".to_owned(),
+                    "EDQUOT" => "the disk quota is used up".to_owned(),
+                    other => format!("error {other}"),
+                };
+                out.push(AgentEvent::Warning(if transcript {
+                    format!("Claude Code could not save all of this conversation ({why}): resuming it later may miss part of it.")
+                } else {
+                    format!("Claude Code could not save its settings ({why}).")
+                }));
+            }
             sdk::Event::PromptSuggestion(text) => out.push(AgentEvent::Suggestion(text)),
             sdk::Event::Result(result) => {
                 self.begin(&mut out);
@@ -889,6 +988,25 @@ impl Mapper {
         })
     }
 
+    /// The card an MCP server's question rides on: a form is asked as
+    /// questions, a page to open and a bare go-ahead as an approval. What
+    /// the answer fills in is kept until it is given.
+    fn elicited(&self, asked: sdk::Elicitation) -> Ask {
+        let message: String = asked.message.trim().chars().take(600).collect();
+        let form = asked.url.is_none().then(|| Form::new(&message, &asked.schema, &asked.order)).flatten();
+        let ask = match (&asked.url, &form) {
+            (_, Some(form)) => Ask { tool: QUESTION_TOOL.to_owned(), input: form.questions(), ..Ask::default() },
+            (Some(url), None) => {
+                Ask { tool: "a page".to_owned(), summary: url.clone(), link: url.clone(), ..Ask::default() }
+            }
+            (None, None) => Ask { tool: "your go-ahead".to_owned(), summary: message.clone(), ..Ask::default() },
+        };
+        if let Ok(mut waiting) = self.elicitations.lock() {
+            waiting.insert(asked.request_id.clone(), form);
+        }
+        Ask { id: asked.request_id, from: asked.server, reason: message, ..ask }
+    }
+
     /// Starts the turn's reply if nothing did yet. The whole turn is one
     /// reply: the binary keeps the context, so nothing is replayed from it.
     fn begin(&mut self, out: &mut Vec<AgentEvent>) {
@@ -897,6 +1015,44 @@ impl Mapper {
             out.push(AgentEvent::ReplyStarted);
         }
     }
+}
+
+/// A model as the conversation names it: `claude-opus-4-8` is `Opus 4.8`,
+/// and a name it does not know is left as it is.
+fn model_name(id: &str) -> String {
+    let Some(rest) = id.trim().strip_prefix("claude-") else { return id.trim().to_owned() };
+    let mut words: Vec<String> = Vec::new();
+    let mut version: Vec<&str> = Vec::new();
+    for part in rest.split('-').filter(|part| !part.is_empty()) {
+        if part.bytes().all(|byte| byte.is_ascii_digit()) {
+            // A date (`20251001`) says when, not which.
+            if part.len() < 8 {
+                version.push(part);
+            }
+            continue;
+        }
+        if !version.is_empty() {
+            words.push(version.join("."));
+            version.clear();
+        }
+        let mut letters = part.chars();
+        words.extend(letters.next().map(|first| first.to_uppercase().chain(letters).collect::<String>()));
+    }
+    if !version.is_empty() {
+        words.push(version.join("."));
+    }
+    if words.is_empty() { id.trim().to_owned() } else { words.join(" ") }
+}
+
+/// Slash commands as the app lists them: each its name and the first line of what it does.
+fn commands(listed: &[sdk::SlashCommand]) -> Vec<(String, String)> {
+    listed
+        .iter()
+        .map(|command| {
+            let line = command.description.lines().next().unwrap_or_default();
+            (command.name.clone(), line.chars().take(160).collect())
+        })
+        .collect()
 }
 
 /// What to tell the user of a plugin Claude Code could not load.
@@ -1503,6 +1659,125 @@ mod tests {
             (other.resume, other.permission_mode, other.ask_permissions),
             (None, Some(sdk::PermissionMode::Auto), true)
         );
+    }
+
+    #[test]
+    fn a_fallback_is_said_and_the_session_goes_on_with_its_model() {
+        let mut mapper = Mapper::default();
+        *mapper.tuned.lock().unwrap() = tuning("opus", "high");
+        let out = mapper.map(sdk::Event::RefusalFallback {
+            original_model: "claude-opus-5-5".into(),
+            fallback_model: "claude-opus-4-8".into(),
+            whole_session: true,
+        });
+        assert_eq!(
+            out,
+            [
+                AgentEvent::Note(
+                    "Opus 5.5 declined this request, so Opus 4.8 answered it and goes on with the session".into()
+                ),
+                AgentEvent::Model("claude-opus-4-8".into()),
+            ]
+        );
+        assert_eq!(
+            *mapper.tuned.lock().unwrap(),
+            ("claude-opus-4-8".to_owned(), "high".to_owned()),
+            "no change to make"
+        );
+        let local = mapper.map(sdk::Event::RefusalFallback {
+            original_model: "claude-opus-5-5".into(),
+            fallback_model: "claude-sonnet-5-5".into(),
+            whole_session: false,
+        });
+        assert!(matches!(local.as_slice(), [AgentEvent::Note(note)] if note.contains("a subagent's request")));
+        let refused = mapper.map(sdk::Event::Refused { model: "claude-fable-5-2".into() });
+        assert_eq!(refused, [AgentEvent::Note("Fable 5.2 declined this request".into())]);
+    }
+
+    #[test]
+    fn models_are_named_as_people_say_them() {
+        for (id, name) in [
+            ("claude-opus-4-8", "Opus 4.8"),
+            ("claude-sonnet-5", "Sonnet 5"),
+            ("claude-haiku-4-5-20251001", "Haiku 4.5"),
+            ("claude-3-5-sonnet-20241022", "3.5 Sonnet"),
+            ("gpt-5", "gpt-5"),
+            ("claude-", "claude-"),
+        ] {
+            assert_eq!(model_name(id), name);
+        }
+    }
+
+    #[test]
+    fn an_mcp_servers_question_rides_on_a_card() {
+        let mut mapper = Mapper::default();
+        let asked = |request_id: &str, url: Option<&str>, schema: Value| sdk::Elicitation {
+            request_id: request_id.into(),
+            server: "github".into(),
+            message: "Which repository?".into(),
+            url: url.map(str::to_owned),
+            schema,
+            order: Vec::new(),
+        };
+        let form = json!({ "properties": { "repo": { "type": "string" } } });
+        let out = mapper.map(sdk::Event::Elicitation(asked("e1", None, form)));
+        let [AgentEvent::Permission(ask)] = out.as_slice() else { panic!("one card: {out:?}") };
+        assert_eq!((ask.id.as_str(), ask.tool.as_str(), ask.from.as_str()), ("e1", QUESTION_TOOL, "github"));
+        assert!(ask.input.contains("Which repository?"), "{}", ask.input);
+
+        let out = mapper.map(sdk::Event::Elicitation(asked("e2", Some("https://github.com/login"), Value::Null)));
+        let [AgentEvent::Permission(page)] = out.as_slice() else { panic!("one card") };
+        assert_eq!((page.link.as_str(), page.reason.as_str()), ("https://github.com/login", "Which repository?"));
+        assert!(!page.always, "a page is opened once");
+
+        let out = mapper.map(sdk::Event::Elicitation(asked("e3", None, json!({ "properties": {} }))));
+        let [AgentEvent::Permission(go)] = out.as_slice() else { panic!("one card") };
+        assert_eq!(
+            (go.tool.as_str(), go.summary.as_str(), go.link.as_str()),
+            ("your go-ahead", "Which repository?", "")
+        );
+
+        let waiting = mapper.elicitations.lock().unwrap();
+        assert!(waiting["e1"].is_some() && waiting["e2"].is_none() && waiting["e3"].is_none());
+        drop(waiting);
+        mapper.map(sdk::Event::PermissionCancelled { request_id: "e1".into() });
+        assert!(!mapper.elicitations.lock().unwrap().contains_key("e1"), "withdrawn: no answer is kept for it");
+    }
+
+    #[test]
+    fn denials_tasks_commands_and_lost_writes() {
+        let mut mapper = Mapper::default();
+        let denied = mapper.map(sdk::Event::PermissionDenied {
+            tool_use_id: "toolu_1".into(),
+            tool_name: "Bash".into(),
+            reason: None,
+        });
+        assert_eq!(denied, [AgentEvent::Denied("toolu_1".into())]);
+
+        let task = |state| sdk::Task {
+            tool_use_id: "toolu_2".into(),
+            task_id: "t2".into(),
+            state,
+            task_type: "local_bash".into(),
+            ..sdk::Task::default()
+        };
+        mapper.map(sdk::Event::Task(task(sdk::TaskState::Started)));
+        assert_eq!(mapper.task_ids.lock().unwrap().get("toolu_2").map(String::as_str), Some("t2"));
+        mapper.map(sdk::Event::Task(task(sdk::TaskState::Stopped)));
+        assert!(mapper.task_ids.lock().unwrap().is_empty(), "an ended task is no longer stopped");
+
+        let command = sdk::SlashCommand {
+            name: "review".into(),
+            description: "Review the diff\nin detail".into(),
+            argument_hint: String::new(),
+        };
+        assert_eq!(
+            mapper.map(sdk::Event::Commands(vec![command])),
+            [AgentEvent::Commands(vec![("review".into(), "Review the diff".into())])]
+        );
+
+        let lost = mapper.map(sdk::Event::WritesLost { error_code: "ENOSPC".into(), transcript: true });
+        assert!(matches!(lost.as_slice(), [AgentEvent::Warning(text)] if text.contains("the disk is full")));
     }
 }
 

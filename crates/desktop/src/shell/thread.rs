@@ -329,6 +329,10 @@ pub(super) struct Thread {
     /// What its Claude Code runs in the background, oldest first: while
     /// there is any, the process is not closed by itself (`mod.rs`).
     pub background: Vec<Background>,
+    /// The commands and skills its agent's process offers in the session's
+    /// folder (its project's own among them), each a name and a line on
+    /// it; `None` until a process of it has said.
+    pub commands: Option<Vec<(String, String)>>,
 }
 
 impl Thread {
@@ -381,6 +385,7 @@ impl Thread {
             resume: None,
             tries: 0,
             background: Vec::new(),
+            commands: None,
         }
     }
 
@@ -409,10 +414,13 @@ impl Thread {
     }
 
     /// Whether its agent is at work: in a turn, or on something it runs in
-    /// the background, which Claude Code answers in a turn of its own once
-    /// it ends. Its process is not closed by itself meanwhile.
+    /// the background (a command, or a subagent that goes on after the turn
+    /// ends or is stopped), which Claude Code answers in a turn of its own
+    /// once it ends. Its process is not closed by itself meanwhile.
     pub fn at_work(&self) -> bool {
-        self.busy || !self.background.is_empty()
+        self.busy
+            || !self.background.is_empty()
+            || (self.live && turn_agents(&self.session.entries, None).into_iter().any(at_work))
     }
 
     /// A turn starts: the view follows it.
@@ -761,7 +769,8 @@ impl Thread {
         let listed = |call: &ToolUse| Subagent {
             id: call.id.clone(),
             label: agent_label(call),
-            running: self.busy && at_work(call),
+            // One sent to the background goes on after the turn, for as long as its process does.
+            running: (self.busy || self.live) && at_work(call),
             failed: call.is_error,
             open: self.sub.as_deref() == Some(call.id.as_str()),
         };

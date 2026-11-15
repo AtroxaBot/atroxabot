@@ -227,14 +227,16 @@ impl QuestionForm {
 
     /// Draws the card ending at `bottom`, `width` wide from `x`. Returns
     /// its top edge and, once the user answered or dismissed it, what to
-    /// tell the agent. `input` is the call's input, `agent` who asks.
+    /// tell the agent. `input` is the call's input, `who` who asks, and
+    /// `said` a line of theirs before the questions (an MCP server's own
+    /// words; empty for the agent, whose questions say it all).
     pub fn draw(
         &mut self,
         p: &mut Painter,
         ui: &mut Ui,
         (x, bottom, width): (f32, f32, f32),
         input: &str,
-        agent: &str,
+        (who, said): (&str, &str),
     ) -> (f32, Option<Verdict>) {
         let t = p.theme;
         self.step = self.step.min(self.questions.len().saturating_sub(1));
@@ -243,7 +245,10 @@ impl QuestionForm {
         let asked = p.layout(&question.text, theme::BODY, Some(width - 40.0));
         let row_h = |description: &str| if description.is_empty() { 38.0 } else { 50.0 };
         let options_h: f32 = question.options.iter().map(|(_, description)| row_h(description) + 5.0).sum();
-        let height = 50.0 + asked.height() + 14.0 + options_h + 42.0 + 60.0;
+        // Their line goes under the head, and the questions move down for it.
+        let said = said.trim();
+        let lead = if said.is_empty() || question.text.starts_with(said) { 0.0 } else { 18.0 };
+        let height = 50.0 + lead + asked.height() + 14.0 + options_h + 42.0 + 60.0;
         let card = Rect::new(x, bottom - height, width, height);
         let appear = ui.appear(id(("question", &self.ask)));
         p.shadow(
@@ -255,7 +260,12 @@ impl QuestionForm {
         p.bordered(card, t.surface, theme::RADIUS_LG, 1.0, mix(t.border_strong, t.border_focus, appear));
 
         icon::draw(p, icon::MESSAGE, (card.x + 25.0, card.y + 25.0), 16.0, t.text);
-        p.label(&format!("{agent} asks"), theme::LABEL, card.x + 43.0, card.y + 16.0, t.text);
+        p.label(&format!("{who} asks"), theme::LABEL, card.x + 43.0, card.y + 16.0, t.text);
+        if lead > 0.0 {
+            let mut line = p.layout(said, theme::TINY, None);
+            line.truncate(p.fonts, width - 60.0);
+            p.text(&line, card.x + 43.0, card.y + 36.0, t.text_faint);
+        }
         // Several questions: a step each, at the right of the head.
         let mut jump = None;
         let mut right = card.right() - 16.0;
@@ -284,8 +294,8 @@ impl QuestionForm {
             right -= 6.0;
         }
 
-        p.text(&asked, card.x + 20.0, card.y + 48.0, t.text);
-        let mut y = card.y + 48.0 + asked.height() + 14.0;
+        p.text(&asked, card.x + 20.0, card.y + 48.0 + lead, t.text);
+        let mut y = card.y + 48.0 + lead + asked.height() + 14.0;
         let mut picked = None;
         for (index, (label, description)) in question.options.iter().enumerate() {
             let row = Rect::new(card.x + 12.0, y, width - 24.0, row_h(description));
@@ -324,7 +334,9 @@ impl QuestionForm {
         mark(p, (other.x + 22.0, other.y + 19.0), question.multi, own);
         if let Some(editor) = self.others.get_mut(step) {
             let field = Rect::new(other.x + 44.0, other.y, other.w - 56.0, other.h);
-            line_field(p, ui, field, editor, ("Something else: just type", theme::SMALL), true);
+            // With nothing to pick, the answer is only typed.
+            let hint = if question.options.is_empty() { "Type your answer" } else { "Something else: just type" };
+            line_field(p, ui, field, editor, (hint, theme::SMALL), true);
         }
 
         let foot = card.bottom() - 46.0;

@@ -8,7 +8,7 @@
 
 use atroxabot_core::git::{Change, GitFile, GitStatus, Job, Report};
 use atroxabot_core::stats::Ledger;
-use atroxabot_core::{ContextPart, LimitWindow, Limits, Todo, TodoState};
+use atroxabot_core::{ConnectionKind, ContextPart, LimitWindow, Limits, Todo, TodoState};
 use winit::window::CursorIcon;
 
 use super::change::Touched;
@@ -16,7 +16,7 @@ use super::menu::Menu;
 use super::plan;
 use super::thread::{Thread, agent_mark};
 use super::widgets::{Scroll, dropdown, field_label, modal};
-use super::{Modal, Shell, ago, compact, money, until};
+use super::{Modal, Shell, ago, compact, money, ran_on, until};
 use crate::app::Action;
 use crate::paint::{Color, Painter, Rect, fade, mix};
 use crate::text::Style;
@@ -33,6 +33,22 @@ const LINE_H: f32 = 19.0;
 const TAB: &str = "    ";
 /// Most tasks of the agent's list shown at once.
 const TASKS_SHOWN: usize = 8;
+/// A control in `at` that stops a task: a small square, as the message
+/// box's own stop shows. Returns whether it was clicked.
+fn stop_control(p: &mut Painter, ui: &mut Ui, at: Rect, key: u64) -> bool {
+    let t = p.theme;
+    let hovered = ui.hovered(at);
+    let hover = ui.anim(id(("stop-hover", key)), f32::from(u8::from(hovered)));
+    p.rect(at, fade(t.active, hover), theme::RADIUS_SM);
+    let (cx, cy) = (at.x + at.w * 0.5, at.y + at.h * 0.5);
+    p.rect(Rect::new(cx - 4.0, cy - 4.0, 8.0, 8.0), mix(t.text_muted, t.text, hover), 2.0);
+    ui.tip(key, at, || Tip::text("Stop".to_owned()));
+    if hovered {
+        ui.cursor = CursorIcon::Pointer;
+    }
+    hovered && ui.clicked(at)
+}
+
 /// Most subagents of a turn listed at once.
 const AGENTS_SHOWN: usize = 8;
 /// How old an account's plan limits may be, in seconds, before the panel says so.
@@ -509,9 +525,16 @@ impl Shell {
     /// click on the open one goes back. With more than fit, the ones from
     /// the first still at work are shown. Returns where the list ends (`y`
     /// itself when there are none).
-    fn draw_subagents(&mut self, p: &mut Painter, ui: &mut Ui, (x, mut y, w): (f32, f32, f32)) -> f32 {
+    fn draw_subagents(
+        &mut self,
+        p: &mut Painter,
+        ui: &mut Ui,
+        (x, mut y, w): (f32, f32, f32),
+        actions: &mut Vec<Action>,
+    ) -> f32 {
         let t = p.theme;
         let agents = self.thread().map(Thread::subagents).unwrap_or_default();
+        let stops = self.stops_tasks();
         if agents.is_empty() {
             return y;
         }
@@ -532,10 +555,16 @@ impl Shell {
             p.rect(row, fade(t.hover, hover), theme::RADIUS_SM);
             let ink = mix(if agent.running { t.text } else { t.text_muted }, t.text, hover);
             agent_mark(p, ui, (x + 7.0, y + 9.0), (agent.running, agent.failed), ink);
+            // One at work can be stopped on its own: the control shows on its row under the mouse.
+            let stop =
+                (stops && agent.running && hovered).then(|| Rect::new(row.right() - 26.0, row.y + 2.0, 22.0, 22.0));
             let mut label = p.layout(&agent.label, theme::SMALL, None);
-            label.truncate(p.fonts, w - 22.0);
+            label.truncate(p.fonts, w - if stop.is_some() { 48.0 } else { 22.0 });
             p.text(&label, x + 22.0, y, ink);
-            if hovered {
+            let stopping = stop.is_some_and(|stop| stop_control(p, ui, stop, id(("stop-subagent", &agent.id))));
+            if stopping {
+                self.stop_task(&agent.id, actions);
+            } else if hovered && !stop.is_some_and(|stop| ui.hovered(stop)) {
                 ui.cursor = CursorIcon::Pointer;
                 if ui.clicked(row) {
                     pick = Some((!agent.open).then(|| agent.id.clone()));
@@ -562,11 +591,19 @@ impl Shell {
     /// monitor), while it does: what each was started for. It is drawn
     /// still, as a running command may take an hour. Returns where the
     /// list ends (`y` itself when nothing runs).
-    fn draw_background(&self, p: &mut Painter, ui: &mut Ui, (x, mut y, w): (f32, f32, f32)) -> f32 {
+    fn draw_background(
+        &mut self,
+        p: &mut Painter,
+        ui: &mut Ui,
+        (x, mut y, w): (f32, f32, f32),
+        actions: &mut Vec<Action>,
+    ) -> f32 {
         let t = p.theme;
-        let Some(tasks) = self.thread().map(|thread| &thread.background).filter(|tasks| !tasks.is_empty()) else {
+        let Some(tasks) = self.thread().map(|thread| thread.background.clone()).filter(|tasks| !tasks.is_empty())
+        else {
             return y;
         };
+        let stops = self.stops_tasks();
         p.rect(Rect::new(x - 16.0, y, w + 32.0, 1.0), t.border, 0.0);
         y += 18.0;
         field_label(p, icon::TERMINAL, "IN THE BACKGROUND", x, y);
@@ -574,16 +611,19 @@ impl Shell {
         p.text(&count, x + w - count.width(), y + 1.0, t.text_faint);
         y += 26.0;
         for task in tasks.iter().take(AGENTS_SHOWN) {
+            let row = Rect::new(x - 8.0, y - 4.0, w + 16.0, 24.0);
             p.rect(Rect::new(x + 4.0, y + 6.0, 6.0, 6.0), t.text_muted, 3.0);
+            let stop = (stops && ui.hovered(row)).then(|| Rect::new(row.right() - 26.0, row.y + 1.0, 22.0, 22.0));
+            let room = w - if stop.is_some() { 48.0 } else { 22.0 };
             let what = if task.what.is_empty() { "A command" } else { task.what.as_str() };
             let mut label = p.layout(what, theme::SMALL, None);
-            let cut = label.width() > w - 22.0;
-            label.truncate(p.fonts, w - 22.0);
+            let cut = label.width() > room;
+            label.truncate(p.fonts, room);
             p.text(&label, x + 22.0, y, t.text);
-            if cut {
-                ui.tip(id(("background", &task.id)), Rect::new(x - 8.0, y - 4.0, w + 16.0, 24.0), || {
-                    Tip::text(what.to_owned())
-                });
+            if stop.is_some_and(|stop| stop_control(p, ui, stop, id(("stop-background", &task.id)))) {
+                self.stop_task(&task.id, actions);
+            } else if cut && !stop.is_some_and(|stop| ui.hovered(stop)) {
+                ui.tip(id(("background", &task.id)), row, || Tip::text(what.to_owned()));
             }
             y += 24.0;
         }
@@ -593,6 +633,21 @@ impl Shell {
             y += 20.0;
         }
         y + 6.0
+    }
+
+    /// Whether the open session's tasks can be stopped one at a time: its
+    /// Claude Code runs, which stops a subagent or a command on its own.
+    fn stops_tasks(&self) -> bool {
+        let Some(thread) = self.thread().filter(|thread| thread.live) else { return false };
+        let provider = ran_on(thread, &self.agents);
+        self.config.connection(&provider).is_some_and(|connection| connection.kind == ConnectionKind::ClaudeAgent)
+    }
+
+    /// Stops the task the call `call` of the open session started.
+    fn stop_task(&self, call: &str, actions: &mut Vec<Action>) {
+        if let Some(thread) = self.thread() {
+            actions.push(Action::StopTask { session: thread.session.id.clone(), call: call.to_owned() });
+        }
     }
 
     /// The account whose plan limits the panel shows: the one the top bar
@@ -676,8 +731,8 @@ impl Shell {
         }
         let mut y = used + 8.0;
         y = self.draw_todos(p, ui, (x, y, w));
-        y = self.draw_subagents(p, ui, (x, y, w));
-        y = self.draw_background(p, ui, (x, y, w));
+        y = self.draw_subagents(p, ui, (x, y, w), actions);
+        y = self.draw_background(p, ui, (x, y, w), actions);
         y = self.draw_limits(p, ui, (x, y, w), actions);
         p.rect(Rect::new(rect.x, y, rect.w, 1.0), t.border, 0.0);
         y += 18.0;
