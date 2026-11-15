@@ -168,6 +168,7 @@ in Settings, Providers. A plugin Claude Code could not load is said once in a no
 
 - **Git**, for worktrees, the side panel's view of your repository, and skills from repositories outside
   GitHub.
+- **GitHub CLI** (`gh`), signed in, for the side panel to show the pull request a branch is on.
 - **Git for Windows**, on Windows: API agents run their commands in its Git Bash (never WSL's). Without it
   they use PowerShell.
 - A **Fish Audio** or **ElevenLabs** key, for voice calls (Settings, Voice).
@@ -535,7 +536,11 @@ server-side compaction on its own API, by a request of the app's elsewhere.
   - The git repository of the session's folder: the branch (a click switches it), how far it is from what
     it tracks, and the changed files with their added and removed lines (a click opens the diff).
     Committing and pushing are the agent's: the panel only shows. It uses your installed `git` and reads
-    the repository again when a turn ends and when you come back to the window.
+    the repository again when a turn ends and when you come back to the window. A branch on a GitHub pull
+    request shows it in its icon (green while open, a draft's dashed, purple once merged, red once closed) and in a
+    line under it that opens its page; the title shows under the mouse. That is asked of your installed
+    GitHub CLI (`gh`, signed in by you), only for a repository with a remote, at most every 20 seconds
+    unless the refresh button or another branch asks; without `gh` the branch just shows as a branch.
 - **Spotlight** (Ctrl/Cmd+K, or the magnifier over the agents). One field over everything: it finds
   sessions by title at once and by what was said in them a moment later, agents by name, and things to do
   (a new session, a new agent, the statistics, the settings, the side panel). Arrows move, Enter opens,

@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use atroxabot_core::git::{Change, GitFile, GitStatus, Report};
+use atroxabot_core::git::{Change, GitFile, GitStatus, PullRequest, PullState, Report};
 use atroxabot_core::skills::{self, Catalog, Elsewhere, Group, Origin, Skill, Source};
 use atroxabot_core::stats::{Ledger, Record, day_of};
 use atroxabot_core::update::{Release, Staged, Version};
@@ -134,6 +134,20 @@ fn snapshots() {
         branch.open_menu(Menu::Branch, Rect::new(1120.0, 318.0, 288.0, 36.0));
         let mut plain = panel();
         plain.git.status = None;
+        // The branch is on a pull request: its icon says how it stands, a line under it which one.
+        let on_pull = |state| {
+            let mut shell = panel();
+            let branch = repository().branch;
+            shell.git.pull_branch.clone_from(&branch);
+            shell.git.pull = Some(PullRequest {
+                branch,
+                number: 128,
+                state,
+                title: "Escaped quotes end a string no more".into(),
+                url: "https://github.com/me/parser/pull/128".into(),
+            });
+            shell
+        };
         // Its account's limits were last reported a while ago: the panel says since when.
         plain.set_limits([("claude-agent".to_owned(), seen([0.31, 0.61]))].into());
         // A turn with subagents: their cards in the conversation and their list in the side
@@ -712,6 +726,9 @@ fn snapshots() {
             ("stats-loading", loading),
             ("panel", panel()),
             ("panel-no-git", plain),
+            ("panel-pull-open", on_pull(PullState::Open)),
+            ("panel-pull-draft", on_pull(PullState::Draft)),
+            ("panel-pull-merged", on_pull(PullState::Merged)),
             ("subagents", delegating),
             ("plan-changed", changed),
             ("subagent-open", inside),

@@ -82,7 +82,8 @@ cargo fmt --all --check
 
 Modern, quiet and uncluttered. The only colour on screen is an agent's own (`theme::agent_color`), on its
 face (`orb.rs`) and, faintly, washed down the top of its canvas; everything else is the theme's greys.
-The exceptions are what a diff adds and removes (`Palette::positive`, `Palette::danger`) and a provider's
+The exceptions are what a diff adds and removes (`Palette::positive`, `Palette::danger`), how a branch's
+pull request stands in the side panel (open green, merged `Palette::merged`, closed red) and a provider's
 mark: its platform's logo (`logo.rs`, drawn from an outline through the glyph atlas with `Painter::logo`,
 in `theme::provider_color` where the platform has a colour), or a picture the user put in
 `~/.atroxabot/icons/`. The owner decided the logos are fine to show as nominative use: they only say

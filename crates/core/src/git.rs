@@ -1,6 +1,7 @@
 //! What the app shows and does about a folder's git repository, through the
 //! user's own `git`: the branch, what changed, a file's diff, committing,
-//! pushing and switching branch. Every call blocks; run it off the UI thread.
+//! pushing and switching branch; and, through the user's own `gh`, the pull
+//! request the branch is on. Every call blocks; run it off the UI thread.
 
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -294,6 +295,89 @@ pub fn entries(folder: &Path) -> Vec<String> {
     found
 }
 
+/// The pull request a branch is on, as GitHub tells the user's own `gh`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    /// The branch it was asked for.
+    pub branch: String,
+    /// Its number in the repository.
+    pub number: u64,
+    /// Where it stands.
+    pub state: PullState,
+    /// Its title.
+    pub title: String,
+    /// Its page (always `https://` or `http://`).
+    pub url: String,
+}
+
+/// Where a pull request stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullState {
+    /// Open for review.
+    Open,
+    /// Open, but marked as a draft.
+    Draft,
+    /// Merged.
+    Merged,
+    /// Closed without merging.
+    Closed,
+}
+
+/// The branch checked out in `folder` (empty when detached or in no
+/// repository) and the pull request it is on, if any. Only reads: asks
+/// GitHub through the user's own `gh` (which keeps its own sign-in), and
+/// gives `None` without it, without a remote, or when GitHub has none.
+#[must_use]
+pub fn pull_request(folder: &Path) -> (String, Option<PullRequest>) {
+    let branch = git(folder, &["branch", "--show-current"])
+        .map(|name| String::from_utf8_lossy(&name).trim().to_owned())
+        .unwrap_or_default();
+    // A repository nobody pushes anywhere has no pull requests: `gh` is not even started.
+    let remotes = git(folder, &["remote"]).unwrap_or_default();
+    if branch.is_empty() || branch.starts_with('-') || remotes.iter().all(u8::is_ascii_whitespace) {
+        return (branch, None);
+    }
+    let mut command = Command::new("gh");
+    command
+        .args(["pr", "view", &branch, "--json", "number,state,isDraft,title,url"])
+        .current_dir(folder)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        // Fail rather than ask anything, and say nothing about gh's own updates.
+        .env("GH_PROMPT_DISABLED", "1")
+        .env("GH_NO_UPDATE_NOTIFIER", "1")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(&mut command, 0x0800_0000);
+    let pull = command
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| parse_pull(&String::from_utf8_lossy(&output.stdout), &branch));
+    (branch, pull)
+}
+
+/// Reads what `gh pr view --json number,state,isDraft,title,url` printed.
+fn parse_pull(json: &str, branch: &str) -> Option<PullRequest> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let state = match (value["state"].as_str()?, value["isDraft"].as_bool().unwrap_or(false)) {
+        ("OPEN", true) => PullState::Draft,
+        ("OPEN", false) => PullState::Open,
+        ("MERGED", _) => PullState::Merged,
+        ("CLOSED", _) => PullState::Closed,
+        _ => return None,
+    };
+    // The page is opened on a click: nothing but a web address is taken.
+    let url = value["url"].as_str().filter(|url| url.starts_with("https://") || url.starts_with("http://"))?;
+    Some(PullRequest {
+        branch: branch.to_owned(),
+        number: value["number"].as_u64()?,
+        state,
+        title: value["title"].as_str().unwrap_or_default().trim().to_owned(),
+        url: url.to_owned(),
+    })
+}
+
 /// Something the app asks of a folder's repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Job {
@@ -303,6 +387,8 @@ pub enum Job {
     Diff(GitFile),
     /// Check out this branch.
     Switch(String),
+    /// Ask GitHub which pull request the branch checked out is on.
+    Pull,
 }
 
 /// What came of a [`Job`].
@@ -322,6 +408,13 @@ pub enum Report {
         /// The diff, or what git complained about.
         text: Result<String, String>,
     },
+    /// The pull request of the branch checked out.
+    Pull {
+        /// The branch it was asked for (empty when none is checked out).
+        branch: String,
+        /// `None` when it is on none, or GitHub could not be asked.
+        pull: Option<PullRequest>,
+    },
 }
 
 /// Does `job` in `folder` and reads the status again.
@@ -329,6 +422,10 @@ pub enum Report {
 pub fn run(folder: &Path, job: Job) -> Report {
     let result = match job {
         Job::Diff(file) => return Report::Diff { text: diff(folder, &file), path: file.path },
+        Job::Pull => {
+            let (branch, pull) = pull_request(folder);
+            return Report::Pull { branch, pull };
+        }
         Job::Refresh => Ok(()),
         Job::Switch(branch) => switch(folder, &branch),
     };
@@ -367,6 +464,26 @@ mod tests {
         );
         // Garbage is skipped, not trusted.
         assert_eq!(parse_status("1\0\0x y z\x002 R.\0"), GitStatus::default());
+    }
+
+    #[test]
+    fn a_pull_request_is_read() {
+        let pull = |json: &str| parse_pull(json, "side").map(|pull| (pull.number, pull.state));
+        let json = r#"{"number":12,"state":"OPEN","isDraft":true,"title":" Faster parser ","url":"https://github.com/o/r/pull/12"}"#;
+        let read = parse_pull(json, "side").expect("a pull request");
+        assert_eq!(
+            (read.branch.as_str(), read.title.as_str(), read.state),
+            ("side", "Faster parser", PullState::Draft)
+        );
+        assert_eq!(pull(&json.replace("true", "false")), Some((12, PullState::Open)));
+        assert_eq!(pull(&json.replace("OPEN", "MERGED")), Some((12, PullState::Merged)));
+        assert_eq!(pull(&json.replace("OPEN", "CLOSED")), Some((12, PullState::Closed)));
+        // Hostile or broken answers are not trusted.
+        assert_eq!(pull(&json.replace("https://", "file://")), None, "only a web page is opened");
+        assert_eq!(pull(&json.replace("OPEN", "LOST")), None);
+        assert_eq!(pull(&json.replace("12,", "\"12\",")), None);
+        assert_eq!(pull("no pull requests found"), None);
+        assert_eq!(pull("[1, 2]"), None);
     }
 
     #[test]
@@ -452,6 +569,8 @@ mod tests {
         assert!(matches!(&report, Report::Status { status: Some(s), problem: None } if s.branch == "main"));
         let refused = run(&dir, Job::Switch("no-such-branch".into()));
         assert!(matches!(&refused, Report::Status { status: Some(s), problem: Some(_) } if s.branch == "main"));
+        // No remote: no pull request, and GitHub is not asked.
+        assert_eq!(run(&dir, Job::Pull), Report::Pull { branch: "main".into(), pull: None });
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

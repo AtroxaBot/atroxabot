@@ -359,6 +359,14 @@ pub mod icon {
     pub const CHART: char = '\u{e2a3}';
     /// A branch: git.
     pub const BRANCH: char = '\u{e0e2}';
+    /// A pull request, open.
+    pub const PULL: char = '\u{e0e5}';
+    /// A pull request, a draft.
+    pub const PULL_DRAFT: char = '\u{e35b}';
+    /// A pull request, closed.
+    pub const PULL_CLOSED: char = '\u{e35a}';
+    /// Two branches merging: a merged pull request.
+    pub const MERGE: char = '\u{e0e4}';
     /// A route: a gateway to many models.
     pub const ROUTE: char = '\u{e53e}';
     /// A hexagon: a model maker's own API.

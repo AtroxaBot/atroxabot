@@ -42,8 +42,10 @@ pub struct Palette {
     pub selection: Color,
     /// Errors and destructive actions; lines a diff removes.
     pub danger: Color,
-    /// Lines a diff adds.
+    /// Lines a diff adds; an open pull request.
     pub positive: Color,
+    /// A merged pull request.
+    pub merged: Color,
     /// Drop shadows under floating surfaces.
     pub shadow: Color,
     /// Background of code blocks.
@@ -80,6 +82,7 @@ impl Palette {
             selection: m(self.selection, other.selection),
             danger: m(self.danger, other.danger),
             positive: m(self.positive, other.positive),
+            merged: m(self.merged, other.merged),
             shadow: m(self.shadow, other.shadow),
             code_bg: m(self.code_bg, other.code_bg),
             link: m(self.link, other.link),
@@ -114,6 +117,7 @@ pub const BLACK: Palette = Palette {
     selection: hexa(0xFFFFFF, 0.16),
     danger: hex(0xF26D6D),
     positive: hex(0x6CCB8B),
+    merged: hex(0xB392F0),
     shadow: hexa(0x000000, 0.6),
     code_bg: hex(0x171717),
     link: hex(0x7DB3FF),
@@ -141,6 +145,7 @@ pub const WHITE: Palette = Palette {
     selection: hexa(0x2563EB, 0.16),
     danger: hex(0xDC2626),
     positive: hex(0x15803D),
+    merged: hex(0x8250DF),
     shadow: hexa(0x0F0F14, 0.09),
     code_bg: hex(0xF6F6F7),
     link: hex(0x2563EB),
@@ -168,6 +173,7 @@ pub const AMBER: Palette = Palette {
     selection: hexa(0xBF6129, 0.2),
     danger: hex(0xB93A2C),
     positive: hex(0x4D7C2A),
+    merged: hex(0x7A4FA0),
     shadow: hexa(0x3C280F, 0.1),
     code_bg: hex(0xF1EADD),
     link: hex(0xA3501C),

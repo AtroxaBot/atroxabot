@@ -1,12 +1,14 @@
 //! The side panel, right of the session: what the session used and how full
 //! its context is, the agent's task list and the turn's subagents, where
 //! the Claude account's plan limits stand, and its folder's git repository
-//! (the branch and what changed: committing and pushing are the agent's to
-//! do). A changed file opens as a diff, a modal.
+//! (the branch, the pull request it is on and what changed: committing and
+//! pushing are the agent's to do). A changed file opens as a diff, a modal.
 
 #![expect(clippy::many_single_char_names, reason = "p, t, x, y and w are the drawing code's names everywhere")]
 
-use atroxabot_core::git::{Change, GitFile, GitStatus, Job, Report};
+use std::time::{Duration, Instant};
+
+use atroxabot_core::git::{Change, GitFile, GitStatus, Job, PullRequest, PullState, Report};
 use atroxabot_core::stats::Ledger;
 use atroxabot_core::{ConnectionKind, ContextPart, LimitWindow, Limits, Todo, TodoState};
 use winit::window::CursorIcon;
@@ -15,7 +17,7 @@ use super::change::Touched;
 use super::menu::Menu;
 use super::plan;
 use super::thread::{Thread, agent_mark};
-use super::widgets::{Scroll, dropdown, field_label, modal};
+use super::widgets::{Scroll, dropdown_frame, field_label, modal};
 use super::{Modal, Shell, ago, compact, money, ran_on, until};
 use crate::app::Action;
 use crate::paint::{Color, Painter, Rect, fade, mix};
@@ -27,6 +29,10 @@ use crate::ui::{Tip, Ui, icon, icon_button, id};
 pub(super) const WIDTH: f32 = 320.0;
 /// Height of a changed file's row.
 const FILE_H: f32 = 30.0;
+/// How long GitHub is not asked again about the branch's pull request
+/// when the repository is read again by itself (the window coming back,
+/// a turn ending); the refresh button and another branch always ask.
+const PULL_AGAIN: Duration = Duration::from_secs(20);
 /// Height of a line of a diff.
 const LINE_H: f32 = 19.0;
 /// What a tab in a diff's line is drawn as.
@@ -112,6 +118,14 @@ pub(super) struct GitView {
     pub status: Option<GitStatus>,
     /// The status is being read.
     loading: bool,
+    /// The pull request of the branch GitHub was last asked about.
+    pub pull: Option<PullRequest>,
+    /// The branch the last question was about: another one checked out asks again.
+    pub pull_branch: String,
+    /// The folder a question to GitHub is out for.
+    pulling: Option<String>,
+    /// When GitHub was last asked.
+    pulled_at: Option<Instant>,
     scroll: Scroll,
 }
 
@@ -345,7 +359,13 @@ impl Shell {
 
     /// Asks git to do `job` in the session's folder.
     fn git_job(&mut self, job: Job, actions: &mut Vec<Action>) {
-        self.git.folder = self.work_folder();
+        let folder = self.work_folder();
+        if folder != self.git.folder {
+            // Another repository: what GitHub said was of the last one.
+            (self.git.pull, self.git.pulled_at) = (None, None);
+            self.git.pull_branch.clear();
+        }
+        self.git.folder = folder;
         self.git.loading = true;
         actions.push(Action::Git { folder: self.git.folder.clone(), job });
     }
@@ -353,16 +373,39 @@ impl Shell {
     /// Reads the repository again, if the panel is there to show it.
     pub(super) fn refresh_git(&mut self, actions: &mut Vec<Action>) {
         if self.config.panel {
+            // Of another folder, the pull request is asked about once its status is in.
+            let moved = self.work_folder() != self.git.folder;
             self.git_job(Job::Refresh, actions);
+            if !moved {
+                self.ask_pull(false, actions);
+            }
         }
+    }
+
+    /// Asks GitHub which pull request the branch is on, unless a question is
+    /// out already or, short of `now`, one was asked a moment ago.
+    fn ask_pull(&mut self, now: bool, actions: &mut Vec<Action>) {
+        let recent = self.git.pulled_at.is_some_and(|at| at.elapsed() < PULL_AGAIN);
+        if self.git.pulling.as_deref() == Some(self.git.folder.as_str()) || (recent && !now) {
+            return;
+        }
+        self.git.pull_branch = self.git.status.as_ref().map(|status| status.branch.clone()).unwrap_or_default();
+        (self.git.pulling, self.git.pulled_at) = (Some(self.git.folder.clone()), Some(Instant::now()));
+        actions.push(Action::Git { folder: self.git.folder.clone(), job: Job::Pull });
     }
 
     /// Git answered about `folder`.
     pub fn git_report(&mut self, folder: &str, report: Report) {
+        if let Report::Pull { .. } = report
+            && self.git.pulling.as_deref() == Some(folder)
+        {
+            self.git.pulling = None;
+        }
         if folder != self.git.folder {
             return;
         }
         match report {
+            Report::Pull { pull, .. } => self.git.pull = pull,
             Report::Status { status, problem } => {
                 (self.git.status, self.git.loading) = (status, false);
                 if let Some(problem) = problem {
@@ -738,6 +781,7 @@ impl Shell {
         y += 18.0;
         field_label(p, icon::BRANCH, "GIT", x, y);
         if icon_button(p, ui, Rect::new(x + w - 26.0, y - 6.0, 26.0, 26.0), icon::REFRESH, !self.git.loading) {
+            self.git.pulled_at = None;
             self.refresh_git(actions);
         }
         y += 30.0;
@@ -772,10 +816,17 @@ impl Shell {
         actions: &mut Vec<Action>,
     ) {
         let t = p.theme;
+        // Another branch checked out (by the agent, too): GitHub is asked about it once the status is in.
+        if !self.git.loading && self.git.pulling.is_none() && self.git.pull_branch != status.branch {
+            self.ask_pull(true, actions);
+        }
+        let pull = self.git.pull.clone().filter(|pull| pull.branch == status.branch);
         let branch = Rect::new(x, y, w, 36.0);
-        if dropdown(p, ui, branch, Some(icon::BRANCH), &status.branch, self.menu_open(Menu::Branch)) {
+        if dropdown_frame(p, ui, branch, &status.branch, self.menu_open(Menu::Branch), true) {
             self.toggle_menu(Menu::Branch, branch);
         }
+        let (glyph, ink) = pull.as_ref().map_or((icon::BRANCH, t.text_muted), |pull| pull_mark(&t, pull.state));
+        icon::draw(p, glyph, (branch.x + 19.0, branch.y + branch.h * 0.5), 15.0, ink);
         y += 44.0;
         let sync = match (status.upstream.is_empty(), status.ahead, status.behind) {
             (true, ..) => "Not pushed anywhere yet".to_owned(),
@@ -787,6 +838,25 @@ impl Shell {
         let mut sync = p.layout(&sync, theme::TINY, None);
         sync.truncate(p.fonts, w);
         p.text(&sync, x, y, t.text_faint);
+        // Its pull request: a click opens its page, its title under the mouse.
+        if let Some(pull) = &pull {
+            y += 18.0;
+            let mut line = p.layout(&pull_line(pull), theme::TINY, None);
+            line.truncate(p.fonts, w);
+            let at = Rect::new(x, y - 2.0, line.width(), line.height() + 4.0);
+            let hovered = ui.hovered(at);
+            let hover = ui.anim(id("pull-line"), f32::from(u8::from(hovered)));
+            p.text(&line, x, y, mix(t.text_faint, t.text, hover));
+            if !pull.title.is_empty() {
+                ui.tip(id(("pull-title", pull.number)), at, || Tip::text(pull.title.clone()));
+            }
+            if hovered {
+                ui.cursor = CursorIcon::Pointer;
+                if ui.clicked(at) {
+                    actions.push(Action::OpenLink(pull.url.clone()));
+                }
+            }
+        }
         // A session in a worktree: what it is of, and how its work stands.
         if let Some(line) = self.worktree_line() {
             y += 18.0;
@@ -848,6 +918,29 @@ impl Shell {
             actions.push(Action::Git { folder: self.git.folder.clone(), job: Job::Diff(file.clone()) });
             self.modal = Some(Modal::Diff(Box::new(DiffView::new(file))));
         }
+    }
+}
+
+/// The icon of a branch on a pull request that stands at `state`, and its ink:
+/// green while open, as a diff's added lines, purple once merged, red once
+/// closed unmerged.
+fn pull_mark(t: &Palette, state: PullState) -> (char, Color) {
+    match state {
+        PullState::Open => (icon::PULL, t.positive),
+        PullState::Draft => (icon::PULL_DRAFT, t.text_muted),
+        PullState::Merged => (icon::MERGE, t.merged),
+        PullState::Closed => (icon::PULL_CLOSED, t.danger),
+    }
+}
+
+/// The line under the branch that names its pull request.
+fn pull_line(pull: &PullRequest) -> String {
+    let number = pull.number;
+    match pull.state {
+        PullState::Open => format!("Pull request #{number}, open"),
+        PullState::Draft => format!("Draft pull request #{number}"),
+        PullState::Merged => format!("Pull request #{number}, merged"),
+        PullState::Closed => format!("Pull request #{number}, closed"),
     }
 }
 
@@ -967,5 +1060,45 @@ In the parser"
         assert!(actions.is_empty(), "already there");
         shell.switch_branch("side", &mut actions);
         assert!(matches!(&actions[..], [Action::Git { job: Job::Switch(branch), .. }] if branch == "side"));
+    }
+
+    #[test]
+    fn the_branch_shows_its_pull_request() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let mut actions = Vec::new();
+        shell.pending_folder = "/work".into();
+        shell.toggle_panel(&mut actions);
+        let pulls =
+            |actions: &[Action]| actions.iter().filter(|a| matches!(a, Action::Git { job: Job::Pull, .. })).count();
+        assert_eq!(pulls(&actions), 0, "a new folder: asked about once its status is in");
+        let status = GitStatus { branch: "side".into(), ..GitStatus::default() };
+        shell.git_report("/work", Report::Status { status: Some(status), problem: None });
+        shell.ask_pull(false, &mut actions);
+        assert_eq!(pulls(&actions), 1);
+        assert_eq!(shell.git.pull_branch, "side");
+
+        // One question at a time, and not again a moment later.
+        shell.refresh_git(&mut actions);
+        assert_eq!(pulls(&actions), 1, "one is out");
+        let pull = PullRequest {
+            branch: "side".into(),
+            number: 12,
+            state: PullState::Draft,
+            title: "Faster parser".into(),
+            url: "https://github.com/o/r/pull/12".into(),
+        };
+        shell.git_report("/elsewhere", Report::Pull { branch: "side".into(), pull: Some(pull.clone()) });
+        assert!(shell.git.pull.is_none() && shell.git.pulling.is_some(), "about another folder: dropped");
+        shell.git_report("/work", Report::Pull { branch: "side".into(), pull: Some(pull.clone()) });
+        assert_eq!((shell.git.pull.as_ref(), shell.git.pulling.as_ref()), (Some(&pull), None));
+        shell.refresh_git(&mut actions);
+        assert_eq!(pulls(&actions), 1, "asked a moment ago");
+        shell.ask_pull(true, &mut actions);
+        assert_eq!(pulls(&actions), 2, "the refresh button asks anyway");
+
+        assert_eq!(pull_line(&pull), "Draft pull request #12");
+        let t = theme::BLACK;
+        assert_eq!(pull_mark(&t, PullState::Open), (icon::PULL, t.positive));
+        assert_eq!(pull_mark(&t, PullState::Closed).0, icon::PULL_CLOSED);
     }
 }
