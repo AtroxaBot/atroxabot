@@ -353,7 +353,7 @@ impl Session {
             }
             AgentEvent::Activity { id, text } => {
                 let Some(call) = self.find_tool(id) else { return };
-                call.activity.clone_from(text);
+                call.activity = headline(text);
             }
             AgentEvent::Note(text) => self.entries.push(Entry::Note { text: text.clone() }),
             AgentEvent::Window(window) => self.window = *window,
@@ -1471,6 +1471,16 @@ fn bounded(output: &str) -> String {
     format!("{head}\n\n[… the middle was left out …]\n\n{tail}")
 }
 
+/// `text` as a line in a list or under a card: its first line that says
+/// something, trimmed, with an ellipsis when more follows. A command run
+/// in the background may be a whole script, which is no line.
+pub(crate) fn headline(text: &str) -> String {
+    let text = text.trim();
+    let Some((first, rest)) = text.split_once('\n') else { return text.to_owned() };
+    let first = first.trim_end();
+    if rest.trim().is_empty() { first.to_owned() } else { format!("{first} …") }
+}
+
 /// Whether Anthropic refused a request for the reasoning it replays: kept
 /// under a conversation that is not as it was when it was written.
 fn refuses_replay(error: &Error) -> bool {
@@ -2242,6 +2252,14 @@ mod tests {
         assert_eq!(kinds, ["user", "reply", "summary", "reply"], "no failed reply is left behind");
         assert_eq!(session.window, 9_000);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_script_is_headed_by_its_first_line() {
+        assert_eq!(headline("Wait for the build"), "Wait for the build");
+        assert_eq!(headline("python - <<'EOF'\r\nimport io\nEOF"), "python - <<'EOF' …");
+        assert_eq!(headline("\n  cargo test  \n\n"), "cargo test");
+        assert_eq!(headline(""), "");
     }
 
     #[test]

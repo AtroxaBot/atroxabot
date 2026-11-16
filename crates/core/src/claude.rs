@@ -20,7 +20,7 @@ use crate::agent::{Agent, Autonomy};
 use crate::attach;
 use crate::config::Connection;
 use crate::elicit::Form;
-use crate::engine::{AgentEvent, Ask, FollowUp, LimitWindow, Limits, QUESTION_TOOL, Verdict};
+use crate::engine::{AgentEvent, Ask, FollowUp, LimitWindow, Limits, QUESTION_TOOL, Verdict, headline};
 use crate::responses::Usage;
 #[cfg(test)]
 use crate::session::TodoState;
@@ -714,7 +714,9 @@ impl Mapper {
                     out.push(AgentEvent::Sub { parent: parent.clone(), event: Box::new(event) });
                 }
             }
-            sdk::Event::Task(task) if !task.tool_use_id.is_empty() => {
+            sdk::Event::Task(mut task) if !task.tool_use_id.is_empty() => {
+                // A command's description may be the whole script it runs.
+                task.description = headline(&task.description);
                 if let Ok(mut ids) = self.task_ids.lock() {
                     if matches!(task.state, sdk::TaskState::Started | sdk::TaskState::Running) {
                         if !task.task_id.is_empty() {
