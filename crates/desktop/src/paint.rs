@@ -124,8 +124,10 @@ impl<'a> Painter<'a> {
     }
 
     /// Draws the image file at `path` scaled to cover `rect` (cropping the
-    /// overflow) with rounded corners. Until its thumbnail is decoded, or if
-    /// it cannot be, nothing is drawn and the result says why.
+    /// overflow) with rounded corners. Until its thumbnail is decoded, one
+    /// of another size and the same proportions stands in, stretched, if
+    /// there is one; otherwise, or if it cannot be decoded, nothing is drawn
+    /// and the result says why.
     pub fn image(&mut self, path: &str, rect: Rect, radius: f32) -> Lookup {
         // Don't decode what is scrolled out of view.
         if self.clip.intersect(rect).w <= 0.0 || self.clip.intersect(rect).h <= 0.0 {
@@ -138,8 +140,13 @@ impl<'a> Painter<'a> {
         let (w, h) = (width.max(1.0) as u32, height.max(1.0) as u32);
         let key = ImageKey { path: path.to_owned(), w, h, whole: false };
         let lookup = self.images.lookup(&key);
-        if let Lookup::Ready(uv) = lookup {
-            // Exactly the thumbnail's pixels, so texels map one to one.
+        let uv = match lookup {
+            Lookup::Ready(uv) => Some(uv),
+            Lookup::Loading => self.images.stand_in(&key),
+            Lookup::Failed => None,
+        };
+        if let Some(uv) = uv {
+            // Exactly the thumbnail's pixels, so texels map one to one (a stand-in is stretched to them).
             self.push(
                 Rect::new(left / s, top / s, width / s, height / s),
                 [1.0; 4],

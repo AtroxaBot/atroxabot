@@ -193,6 +193,12 @@ in Settings, Providers. A plugin Claude Code could not load is said once in a no
   that opens to its input and output. Text can be selected with the mouse, across messages too.
   Sessions are saved as they go and reopen where they were. Click the title in the top bar to rename a
   session (Enter keeps the new name, Esc the old one).
+- **Pictures in replies.** A picture on disk that a reply shows (`![what](path)`, its path from the
+  session's folder or in full, or a code span that is such a path) appears under the paragraph that
+  shows it: side by side at their own proportions, a row as tall as fills the width (at most 300
+  points), no picture larger than it is. A click opens it over the screen. Agents are told to show a
+  picture this way. One that is not there stands as its path; one online is a link to it, never
+  fetched; one on another computer (`\\host\share`) is never looked up.
 - **Edits as a diff.** A call that changes a file (Claude Code's `Edit`, `MultiEdit` and `Write`, an API
   agent's `edit` and `write`, a Codex file change) says on its row how many lines it added and removed,
   and opens to those lines: what went in red, what came in green, the lines it only quoted to find its
@@ -885,8 +891,9 @@ Deliberate, for now.
 - **Edits as a diff** show what the agent's own edit calls say: a file a command changed (a formatter, a
   script) is not in a turn's list, and the lines of an edit are compared within what the call quoted, not
   with the file on disk.
-- **Pictures**: an agent's reply shows none (Markdown images are not drawn), so only the pictures you send
-  appear in the conversation. An opened picture is not zoomed past the window; a GIF is not decoded, so it
+- **Pictures**: a reply shows only PNG, JPEG and WebP files on this computer, not GIFs or pictures online;
+  a picture in a heading or a table stays text. A JPEG turned by its EXIF data is laid out at its size
+  before turning. An opened picture is not zoomed past the window; a GIF is not decoded, so one you send
   shows as a placeholder.
 - **Git**: the side panel shows the repository and switches branches; it does not commit, push, pull or
   create a branch (ask the agent). A diff's long lines scroll sideways (a sideways wheel, or Shift and the

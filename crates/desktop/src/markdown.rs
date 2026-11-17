@@ -9,7 +9,12 @@
 //! Deliberate differences from CommonMark: single newlines inside a paragraph
 //! are kept as line breaks (models use them for poems and addresses), and raw
 //! HTML, setext headings and indented code blocks are treated as text.
+//!
+//! A paragraph's pictures (`![what](path)`, and code spans that name an image
+//! file) are taken out of its text and follow it as a block of their own
+//! ([`Block::Pictures`]), as a reply shows them under what it says.
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 /// Inline styling of a text span.
@@ -48,6 +53,18 @@ pub enum Align {
     Center,
     /// `-:`.
     Right,
+}
+
+/// A picture a paragraph shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Picture {
+    /// What it shows, from `![what]`; empty for a code span.
+    pub alt: String,
+    /// Where it is, as written: a path, or a URL.
+    pub src: String,
+    /// Only named in a code span, which stays in the text: shown when it
+    /// is a picture on disk, and otherwise left to that text.
+    pub named: bool,
 }
 
 /// One list item.
@@ -98,6 +115,9 @@ pub enum Block {
         /// Body rows, padded to the header's width.
         rows: Vec<Vec<Inline>>,
     },
+    /// The pictures of the paragraph before it (or of one that was only
+    /// pictures), each once.
+    Pictures(Vec<Picture>),
 }
 
 /// Parses a document.
@@ -244,7 +264,13 @@ fn parse_lines(lines: &[&str], depth: usize) -> Vec<Block> {
     let mut paragraph: Vec<&str> = Vec::new();
     let flush = |paragraph: &mut Vec<&str>, blocks: &mut Vec<Block>| {
         if !paragraph.is_empty() {
-            blocks.push(Block::Paragraph(parse_inline(&paragraph.join("\n"))));
+            let (text, pictures) = parse_paragraph(&paragraph.join("\n"));
+            if pictures.is_empty() || !text.text.is_empty() {
+                blocks.push(Block::Paragraph(text));
+            }
+            if !pictures.is_empty() {
+                blocks.push(Block::Pictures(pictures));
+            }
             paragraph.clear();
         }
     };
@@ -378,8 +404,43 @@ fn parse_list(lines: &[&str], mut i: usize, ordered: bool, depth: usize) -> (Vec
 #[must_use]
 pub fn parse_inline(src: &str) -> Inline {
     let mut out = Inline::default();
-    inline_into(src, Mark::default(), &mut out, 0);
+    inline_into(src, Mark::default(), &mut out, 0, None);
     out
+}
+
+/// Parses a paragraph's inline markup, its pictures taken out of the text
+/// (which is trimmed of the space they leave) and listed apart, each once.
+fn parse_paragraph(src: &str) -> (Inline, Vec<Picture>) {
+    let mut out = Inline::default();
+    let mut pictures = Vec::new();
+    inline_into(src, Mark::default(), &mut out, 0, Some(&mut pictures));
+    if !pictures.is_empty() {
+        trim(&mut out);
+        let mut seen = HashSet::new();
+        pictures.retain(|picture| seen.insert(picture.src.clone()));
+    }
+    (out, pictures)
+}
+
+/// Removes the space at the start and end of `inline`'s text, keeping its
+/// spans on their characters.
+fn trim(inline: &mut Inline) {
+    let end = inline.text.trim_end().len();
+    let start = end - inline.text[..end].trim_start().len();
+    inline.text.truncate(end);
+    inline.text.drain(..start);
+    inline.spans.retain_mut(|(range, _)| {
+        *range = range.start.clamp(start, end) - start..range.end.clamp(start, end) - start;
+        range.start < range.end
+    });
+}
+
+/// Whether a code span's text is the path of a picture: one line ending in
+/// the extension of a format the app shows.
+fn names_picture(code: &str) -> bool {
+    const EXTENSIONS: [&str; 4] = [".png", ".jpg", ".jpeg", ".webp"];
+    let lower = code.trim().to_ascii_lowercase();
+    lower.len() > 4 && lower.len() <= 1024 && !lower.contains('\n') && EXTENSIONS.iter().any(|e| lower.ends_with(e))
 }
 
 fn push_text(out: &mut Inline, text: &str, mark: Mark) {
@@ -473,7 +534,9 @@ fn with_link(out: &mut Inline, mark: Mark, url: &str) -> Mark {
     Mark { link: u16::try_from(out.links.len()).unwrap_or(u16::MAX), ..mark }
 }
 
-fn inline_into(src: &str, mark: Mark, out: &mut Inline, depth: usize) {
+/// Parses `src` into `out` in `mark`. With `pictures`, a paragraph's: its
+/// pictures go there instead of into the text.
+fn inline_into(src: &str, mark: Mark, out: &mut Inline, depth: usize, mut pictures: Option<&mut Vec<Picture>>) {
     if depth >= MAX_DEPTH {
         push_text(out, src, mark);
         return;
@@ -500,6 +563,9 @@ fn inline_into(src: &str, mark: Mark, out: &mut Inline, depth: usize) {
                         code
                     };
                     push_text(out, code, Mark { code: true, ..mark });
+                    if let Some(list) = pictures.as_deref_mut().filter(|_| names_picture(code)) {
+                        list.push(Picture { alt: String::new(), src: code.trim().to_owned(), named: true });
+                    }
                     end + run
                 })
             }
@@ -510,19 +576,30 @@ fn inline_into(src: &str, mark: Mark, out: &mut Inline, depth: usize) {
                 (opens && !intraword).then(|| closing_run(src, i + run, b, run)).flatten().map(|end| {
                     push_text(out, &src[plain..i], mark);
                     let inner = Mark { strong: mark.strong || run >= 2, emphasis: mark.emphasis || run != 2, ..mark };
-                    inline_into(&src[i + run..end], inner, out, depth + 1);
+                    inline_into(&src[i + run..end], inner, out, depth + 1, pictures.as_deref_mut());
                     end + run
                 })
             }
             b'~' if bytes.get(i + 1) == Some(&b'~') => closing_run(src, i + 2, b'~', 2).map(|end| {
                 push_text(out, &src[plain..i], mark);
-                inline_into(&src[i + 2..end], Mark { strike: true, ..mark }, out, depth + 1);
+                inline_into(&src[i + 2..end], Mark { strike: true, ..mark }, out, depth + 1, pictures.as_deref_mut());
                 end + 2
             }),
+            b'!' if pictures.is_some() && bytes.get(i + 1) == Some(&b'[') => {
+                link_at(src, i + 1).map(|(alt, url, end)| {
+                    push_text(out, &src[plain..i], mark);
+                    if let Some(list) = pictures.as_deref_mut() {
+                        list.push(Picture { alt: alt.trim().to_owned(), src: url.to_owned(), named: false });
+                    }
+                    // A picture on a line of its own takes its line break along.
+                    let alone = i == 0 || bytes[i - 1] == b'\n';
+                    if alone && bytes.get(end) == Some(&b'\n') { end + 1 } else { end }
+                })
+            }
             b'[' => link_at(src, i).map(|(text, url, end)| {
                 push_text(out, &src[plain..i], mark);
                 let linked = with_link(out, mark, url);
-                inline_into(text, linked, out, depth + 1);
+                inline_into(text, linked, out, depth + 1, pictures.as_deref_mut());
                 end
             }),
             b'<' => {
@@ -676,6 +753,31 @@ mod tests {
     }
 
     #[test]
+    fn pictures_follow_their_paragraph() {
+        let doc = parse("Before and after:\n![before](shots/a.png)\n![after](shots/b.png)\nSame **light**.");
+        let [Block::Paragraph(text), Block::Pictures(pictures)] = doc.as_slice() else { panic!("{doc:?}") };
+        assert_eq!(text.text, "Before and after:\nSame light.");
+        assert_eq!(marks(text), [("light", Mark { strong: true, ..Mark::default() })]);
+        let srcs: Vec<_> = pictures.iter().map(|p| (p.alt.as_str(), p.src.as_str(), p.named)).collect();
+        assert_eq!(srcs, [("before", "shots/a.png", false), ("after", "shots/b.png", false)]);
+
+        // A paragraph of pictures only is no paragraph; each picture comes once.
+        let doc = parse("![](a.png) ![](a.png)");
+        assert!(matches!(doc.as_slice(), [Block::Pictures(p)] if p.len() == 1), "{doc:?}");
+
+        // A code span naming one stays in the text too.
+        let doc = parse("- `target/yard.png` (your angle)\n- `src/main.rs`");
+        let Block::List { items, .. } = &doc[0] else { panic!("{doc:?}") };
+        let [Block::Paragraph(first), Block::Pictures(named)] = items[0].blocks.as_slice() else { panic!("{doc:?}") };
+        assert_eq!(first.text, "target/yard.png (your angle)");
+        assert!(named[0].named && named[0].src == "target/yard.png");
+        assert_eq!(items[1].blocks.len(), 1);
+
+        // Headings and tables keep their text as it was.
+        assert!(matches!(&parse("# ![x](a.png)")[0], Block::Heading { text, .. } if text.text == "!x"));
+    }
+
+    #[test]
     fn hostile_nesting_is_bounded() {
         let quotes = ">".repeat(100_000) + " x";
         assert!(!parse(&quotes).is_empty());
@@ -685,5 +787,7 @@ mod tests {
         assert!(!parse_inline(&links).text.is_empty());
         let stars = "*".repeat(3) + &"_a ".repeat(10_000);
         assert!(!parse_inline(&stars).text.is_empty());
+        let pictures = "*![".repeat(20_000) + &"](a.png)*".repeat(20_000);
+        assert!(!parse(&pictures).is_empty());
     }
 }

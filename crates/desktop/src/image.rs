@@ -26,7 +26,7 @@ use crate::text::{ATLAS_SIZE, Upload, pad};
 /// Largest file read for a thumbnail.
 const MAX_FILE: u64 = 32 << 20;
 /// Largest thumbnail side, in pixels.
-const MAX_THUMB: u32 = 1024;
+pub const MAX_THUMB: u32 = 1024;
 /// Largest whole picture, in pixels: as wide as the atlas takes, and short
 /// enough to leave the thumbnails under it their room.
 pub const MAX_WHOLE: (u32, u32) = (ATLAS_SIZE - 1, 1536);
@@ -105,6 +105,19 @@ impl ImageAtlas {
             self.wanted.push(key.clone());
         }
         Lookup::Loading
+    }
+
+    /// A thumbnail of the file of `key` at another size but the same
+    /// proportions, to stand in while `key` is decoded: a picture being
+    /// resized keeps showing.
+    pub fn stand_in(&mut self, key: &ImageKey) -> Option<[f32; 4]> {
+        let ratio = |w: u32, h: u32| f64::from(w) / f64::from(h.max(1));
+        let wanted = ratio(key.w, key.h);
+        let (_, &(uv, row)) = self.entries.iter().find(|(other, _)| {
+            other.path == key.path && other.whole == key.whole && (ratio(other.w, other.h) / wanted - 1.0).abs() < 0.02
+        })?;
+        self.shelves.touch(row);
+        Some(uv)
     }
 
     /// Thumbnails to decode, each handed out once.
@@ -187,6 +200,18 @@ mod tests {
         encoder.set_depth(png::BitDepth::Eight);
         encoder.write_header().unwrap().write_image_data(pixels).unwrap();
         out
+    }
+
+    #[test]
+    fn a_size_being_decoded_has_another_stand_in() {
+        let mut atlas = ImageAtlas::default();
+        let key = |path: &str, w, h| ImageKey { path: path.into(), w, h, whole: false };
+        atlas.insert(key("a.png", 40, 20), Ok((vec![0; 40 * 20 * 4], 40, 20)));
+        assert_eq!(atlas.lookup(&key("a.png", 60, 30)), Lookup::Loading);
+        assert!(atlas.stand_in(&key("a.png", 60, 30)).is_some(), "the same proportions");
+        assert!(atlas.stand_in(&key("a.png", 30, 30)).is_none(), "other proportions would stretch it");
+        assert!(atlas.stand_in(&key("b.png", 60, 30)).is_none(), "another file");
+        assert!(atlas.stand_in(&ImageKey { whole: true, ..key("a.png", 60, 30) }).is_none());
     }
 
     #[test]

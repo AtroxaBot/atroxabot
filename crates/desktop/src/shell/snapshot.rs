@@ -391,6 +391,19 @@ fn snapshots() {
         let failed = AgentEvent::ToolResult { id: "q1".into(), output: "test result: FAILED".into(), is_error: false };
         queued.agent_event(&turn, failed, &mut Vec::new());
         queued.send("And keep the fix to one function, please", false, Vec::new(), &mut Vec::new());
+        // A reply that shows pictures on disk: side by side under its words, each as large as fits.
+        let mut shown = shell();
+        let turn = shown.current.clone().unwrap_or_default();
+        shown.send("Show me the app icon, large and small", false, Vec::new(), &mut Vec::new());
+        let icon = |size: u32| format!("{}/assets/icon/{size}.png", env!("CARGO_MANIFEST_DIR"));
+        let words = format!(
+            "Here they are side by side:\n\n![large]({})\n![small]({})\n\nThe small one is shown at its own size.",
+            icon(256),
+            icon(64)
+        );
+        for event in [AgentEvent::ReplyStarted, AgentEvent::Text(words), AgentEvent::TurnEnded { problem: None }] {
+            shown.agent_event(&turn, event, &mut Vec::new());
+        }
         // The account ran out mid-turn: its notice, and the session waiting above the message box to go on.
         let mut spent = shell();
         let turn = spent.current.clone().unwrap_or_default();
@@ -744,6 +757,7 @@ fn snapshots() {
             ("menu-branch", branch),
             ("diff", diff),
             ("picture", picture),
+            ("reply-pictures", shown),
             ("menu-autonomy", autonomy),
             ("settings-general", settings(Tab::General)),
             ("menu-close", closing),

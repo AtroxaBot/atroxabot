@@ -6,10 +6,17 @@
 //! Rebuilding after a streamed delta reuses every block that did not change,
 //! so long replies stay cheap to update.
 
+use std::collections::HashMap;
+use std::fs;
+use std::io::Read;
 use std::ops::Range;
+use std::path::{Path, PathBuf};
+use std::sync::{LazyLock, Mutex};
+use std::time::SystemTime;
 
 use crate::highlight::{self, Token};
-use crate::markdown::{self, Align as ColumnAlign, Block, Inline};
+use crate::image::{Lookup, MAX_THUMB};
+use crate::markdown::{self, Align as ColumnAlign, Block, Inline, Mark, Picture};
 use crate::paint::{Color, Painter, Rect, fade};
 use crate::text::{BACKGROUND, FontId, Fonts, Run, STRIKE, Style, TextLayout, UNDERLINE};
 use crate::theme::{self, Palette};
@@ -62,6 +69,18 @@ const CODE_HEADER: f32 = 32.0;
 const CODE_PAD: f32 = 12.0;
 /// Code font size.
 const CODE_STYLE: Style = Style::mono(13.0);
+/// The tallest a reply's picture is shown in the conversation.
+const PICTURE_HEIGHT: f32 = 300.0;
+/// The least height a row of pictures shrinks them to before the next goes
+/// to a row of its own (a picture smaller than that is shown whole).
+const PICTURE_ROW: f32 = 160.0;
+/// Space between pictures.
+const PICTURE_GAP: f32 = 8.0;
+/// The steps a picture made smaller than it is grows and shrinks by, so a
+/// window being resized decodes it again only now and then.
+const PICTURE_STEP: f32 = 8.0;
+/// How much of a picture file is read for the size its header gives.
+const PICTURE_HEAD: u64 = 256 << 10;
 
 /// A selectable run of text at a position inside the document.
 pub struct TextPiece {
@@ -135,6 +154,15 @@ pub enum Deco {
         /// Ticked.
         checked: bool,
     },
+    /// A picture on disk, at its own proportions and never larger than it is.
+    Picture {
+        /// The file.
+        path: String,
+        /// Width.
+        w: f32,
+        /// Height.
+        h: f32,
+    },
     /// The wash behind the added or removed lines of a diff.
     Wash {
         /// Width.
@@ -166,6 +194,8 @@ pub struct DocEvent {
     pub copy_code: Option<usize>,
     /// A link that was clicked.
     pub open_link: Option<String>,
+    /// The file of a picture that was clicked, to be opened whole.
+    pub open_picture: Option<String>,
 }
 
 /// A laid-out document.
@@ -216,6 +246,9 @@ struct Builder<'a> {
     emphasis_ink: u8,
     /// Paragraphs' style: the UI's sans-serif, or a story's serif.
     body: Style,
+    /// The folder a picture's relative path is from; without one, only
+    /// pictures named from the root are shown.
+    folder: Option<&'a Path>,
 }
 
 impl Doc {
@@ -310,27 +343,45 @@ impl Doc {
         }
     }
 
-    /// Lays out Markdown `src` at `width`. `previous`, when laid out at the
-    /// same width and scale, donates every leading block that is unchanged.
-    /// `base_ink` colours plain text (e.g. [`INK_MUTED`] for reasoning).
+    /// [`Doc::markdown_in`] with no folder: only pictures named from the
+    /// root of the disk are shown.
+    #[cfg(test)]
     #[must_use]
     pub fn markdown(fonts: &Fonts, src: &str, width: f32, scale: f32, base_ink: u8, previous: Option<Self>) -> Self {
-        Self::build(fonts, src, (width, scale), (base_ink, base_ink), theme::BODY, previous)
+        Self::build(fonts, src, (width, scale), (base_ink, base_ink), (theme::BODY, None), previous)
     }
 
-    /// [`Doc::markdown`] with `inks` for plain and emphasised text, and
-    /// paragraphs in `body`.
+    /// Lays out Markdown `src` at `width`. `previous`, when laid out at the
+    /// same width and scale, donates every leading block that is unchanged.
+    /// `base_ink` colours plain text (e.g. [`INK_MUTED`] for reasoning). It
+    /// is what an agent working in `folder` wrote: the pictures it shows are
+    /// found from there.
+    #[must_use]
+    pub fn markdown_in(
+        fonts: &Fonts,
+        src: &str,
+        (width, scale): (f32, f32),
+        base_ink: u8,
+        folder: &Path,
+        previous: Option<Self>,
+    ) -> Self {
+        Self::build(fonts, src, (width, scale), (base_ink, base_ink), (theme::BODY, Some(folder)), previous)
+    }
+
+    /// [`Doc::markdown_in`] with `inks` for plain and emphasised text,
+    /// paragraphs in `body`, and pictures found from `folder`.
     fn build(
         fonts: &Fonts,
         src: &str,
         (width, scale): (f32, f32),
         (base_ink, emphasis_ink): (u8, u8),
-        body: Style,
+        (body, folder): (Style, Option<&Path>),
         mut previous: Option<Self>,
     ) -> Self {
         let blocks = markdown::parse(src);
         let key = (width.to_bits(), scale.to_bits());
-        let mut b = Builder { fonts, scale, texts: Vec::new(), decos: Vec::new(), codes: 0, emphasis_ink, body };
+        let mut b =
+            Builder { fonts, scale, texts: Vec::new(), decos: Vec::new(), codes: 0, emphasis_ink, body, folder };
         let mut block_ends = Vec::with_capacity(blocks.len());
         let mut y = 0.0;
         let mut reused = 0;
@@ -354,11 +405,13 @@ impl Doc {
         }
         for block in &blocks[reused..] {
             let first = b.texts.is_empty() && b.decos.is_empty();
-            if !first {
-                y += BLOCK_GAP;
-            }
+            let gap = if first { 0.0 } else { BLOCK_GAP };
             let sep = if first { "" } else { "\n\n" };
-            y += b.block(block, 0.0, y, width, base_ink, sep);
+            let h = b.block(block, 0.0, y + gap, width, base_ink, sep);
+            // A block that shows nothing (pictures that are not there) takes no room.
+            if h > 0.0 {
+                y += gap + h;
+            }
             block_ends.push((b.texts.len(), b.decos.len(), b.codes, y));
         }
         code_scroll.resize(b.codes, 0.0);
@@ -549,6 +602,25 @@ impl Doc {
                     }
                     for &col in &cols[1..cols.len().saturating_sub(1)] {
                         p.rect(Rect::new(x + col, y, 1.0, table_h), t.border, 0.0);
+                    }
+                }
+                Deco::Picture { path, w, h } => {
+                    if piece.y > bottom || piece.y + h < top {
+                        continue;
+                    }
+                    let frame = Rect::new(x, y, *w, *h);
+                    // While it is read the room it takes stays empty; laid out at its size, nothing moves when it comes.
+                    if p.image(path, frame, theme::RADIUS) == Lookup::Failed {
+                        p.bordered(frame, t.surface, theme::RADIUS, 1.0, t.border);
+                        let middle = (frame.x + frame.w * 0.5, frame.y + frame.h * 0.5);
+                        crate::ui::icon::draw(p, crate::ui::icon::IMAGE, middle, 18.0, t.text_faint);
+                    } else if interactive && ui.hovered(frame) && clip.contains(ui.mouse) {
+                        ui.cursor = winit::window::CursorIcon::Pointer;
+                        // A click, not the end of a drag-selection.
+                        let still = (ui.press_pos.0 - ui.mouse.0).hypot(ui.press_pos.1 - ui.mouse.1) < 4.0;
+                        if ui.released && still && frame.contains(ui.press_pos) {
+                            event.open_picture = Some(path.clone());
+                        }
                     }
                 }
                 Deco::Wash { w, h, added } => {
@@ -781,7 +853,91 @@ impl Builder<'_> {
                 17.0
             }
             Block::Table { align, header, rows } => self.table(x, y, width, align, header, rows, ink, sep),
+            Block::Pictures(pictures) => self.pictures(pictures, x, y, width, ink, sep),
         }
+    }
+
+    /// Lays out a paragraph's pictures at `(x, y)`; returns their height.
+    /// Those on disk sit side by side at their own proportions, a row as
+    /// tall as fills the width (at most [`PICTURE_HEIGHT`], and no picture
+    /// larger than it is), and as many to a row as keeps it [`PICTURE_ROW`]
+    /// tall. One that is not on disk stands as where it was looked for
+    /// (online, as a link to it), or as nothing when only a code span named
+    /// it, whose text says it already.
+    fn pictures(&mut self, pictures: &[Picture], x: f32, y: f32, width: f32, ink: u8, sep: &'static str) -> f32 {
+        let mut h = 0.0;
+        let mut sep = sep;
+        let mut shown = Vec::new();
+        for picture in pictures {
+            if let Some(path) = on_disk(&picture.src, self.folder.unwrap_or(Path::new(""))) {
+                shown.push(path);
+                continue;
+            }
+            if picture.named {
+                continue;
+            }
+            let online = picture.src.starts_with("https://") || picture.src.starts_with("http://");
+            // Online, what it shows, as a link; on disk, where it was looked for.
+            let text = if online && !picture.alt.is_empty() { picture.alt.clone() } else { picture.src.clone() };
+            let mark =
+                if online { Mark { link: 1, ..Mark::default() } } else { Mark { code: true, ..Mark::default() } };
+            let links = if online { vec![picture.src.clone()] } else { Vec::new() };
+            let words = Inline { spans: vec![(0..text.len(), mark)], text, links };
+            if h > 0.0 {
+                h += ITEM_GAP;
+            }
+            let layout = self.inline(&words, self.body, width, ink);
+            h += self.text(x, y + h, layout, &words, sep);
+            sep = "\n";
+        }
+        if shown.is_empty() {
+            return h;
+        }
+        if h > 0.0 {
+            h += BLOCK_GAP;
+        }
+        // Each picture's own size (one whose header says none, as a large photograph), and the most
+        // it is shown at: no larger than it is, nor than a thumbnail is decoded at.
+        let most = MAX_THUMB as f32 / self.scale;
+        let sizes: Vec<(f32, f32)> = shown
+            .iter()
+            .map(|path| {
+                let (w, h) = picture_size(Path::new(path)).unwrap_or((4000, 3000));
+                (w as f32 / self.scale, h as f32 / self.scale)
+            })
+            .collect();
+        let tallest: Vec<f32> = sizes.iter().map(|&(w, h)| h.min(most).min(most * h / w)).collect();
+        let mut start = 0;
+        while start < shown.len() {
+            let mut end = start + 1;
+            let mut row_h = row_height(&sizes[start..end], &tallest[start..end], width);
+            while end < shown.len() {
+                let wider = row_height(&sizes[start..=end], &tallest[start..=end], width);
+                if !(start..=end).all(|i| wider.min(tallest[i]) >= PICTURE_ROW.min(tallest[i])) {
+                    break;
+                }
+                (end, row_h) = (end + 1, wider);
+            }
+            if start > 0 {
+                h += PICTURE_GAP;
+            }
+            let (mut left, mut row_bottom) = (x, 0.0f32);
+            for i in start..end {
+                let (natural_w, natural_h) = sizes[i];
+                let mut ph = row_h.min(tallest[i]);
+                if ph < natural_h {
+                    ph = (ph / PICTURE_STEP).floor().max(1.0) * PICTURE_STEP;
+                }
+                let pw = (ph * natural_w / natural_h).round().clamp(1.0, width);
+                let deco = Deco::Picture { path: shown[i].clone(), w: pw, h: ph.round() };
+                self.decos.push(DecoPiece { x: left, y: y + h, deco });
+                left += pw + PICTURE_GAP;
+                row_bottom = row_bottom.max(ph.round());
+            }
+            h += row_bottom;
+            start = end;
+        }
+        h
     }
 
     /// Stacks `blocks` vertically; returns their total height.
@@ -789,10 +945,12 @@ impl Builder<'_> {
     fn blocks(&mut self, blocks: &[Block], x: f32, y: f32, width: f32, ink: u8, sep: &'static str, gap: f32) -> f32 {
         let mut h = 0.0;
         for (i, block) in blocks.iter().enumerate() {
-            if i > 0 {
-                h += gap;
+            let before = if i > 0 { gap } else { 0.0 };
+            let height = self.block(block, x, y + h + before, width, ink, if i == 0 { sep } else { "\n\n" });
+            // A block that shows nothing (pictures that are not there) takes no room.
+            if height > 0.0 {
+                h += before + height;
             }
-            h += self.block(block, x, y + h, width, ink, if i == 0 { sep } else { "\n\n" });
         }
         h
     }
@@ -912,6 +1070,110 @@ fn scroll_code(
     };
     let thumb = Rect::new(track.x + (track.w - thumb_w) * (*scroll / max), track.y + 1.0, thumb_w, 4.0);
     p.rect(thumb, fade(t.text, alpha), 2.0);
+}
+
+/// The file a picture's `src` names, when it is one on this computer the
+/// app shows: a path (from `folder` when it is relative, from the home
+/// folder after `~/`) or a `file:` URL, of a PNG, JPEG or WebP that is
+/// there. Never a path on the network (`\\host\share`): only looking one
+/// up would hand the user's sign-in to that host, and a reply's words may
+/// come from a page the agent read.
+fn on_disk(src: &str, folder: &Path) -> Option<String> {
+    let src = src.trim();
+    let named = match src.strip_prefix("file://") {
+        Some(url) => {
+            let path = decode_percent(url.strip_prefix("localhost").unwrap_or(url))?;
+            // `file:///C:/x.png` is the path `C:/x.png`.
+            let drive = path.as_bytes().get(2) == Some(&b':') && path.as_bytes()[1].is_ascii_alphabetic();
+            if drive { path[1..].to_owned() } else { path }
+        }
+        None if src.contains("://") => return None,
+        None => src.to_owned(),
+    };
+    if named.starts_with("\\\\") || named.starts_with("//") || named.starts_with("\\/") || named.starts_with("/\\") {
+        return None;
+    }
+    let path = match named.strip_prefix("~/").or_else(|| named.strip_prefix("~\\")) {
+        Some(rest) => std::env::home_dir()?.join(rest),
+        None if Path::new(&named).is_absolute() => PathBuf::from(&named),
+        None if folder.as_os_str().is_empty() => return None,
+        None => folder.join(&named),
+    };
+    let extension = path.extension()?.to_str()?.to_ascii_lowercase();
+    let shown = matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "webp");
+    (shown && path.is_file()).then(|| path.to_string_lossy().into_owned())
+}
+
+/// The height a row of pictures of `sizes` (their own widths and heights)
+/// is shown at to fill `room`, each no taller than its `tallest`: those that
+/// reach theirs keep it, and the others share what is left. Never over
+/// [`PICTURE_HEIGHT`].
+fn row_height(sizes: &[(f32, f32)], tallest: &[f32], room: f32) -> f32 {
+    let room = room - PICTURE_GAP * sizes.len().saturating_sub(1) as f32;
+    let aspect = |i: usize| sizes[i].0 / sizes[i].1.max(1.0);
+    let mut held = vec![false; sizes.len()];
+    loop {
+        let taken: f32 = (0..sizes.len()).filter(|&i| held[i]).map(|i| tallest[i] * aspect(i)).sum();
+        let open: f32 = (0..sizes.len()).filter(|&i| !held[i]).map(aspect).sum();
+        if open <= 0.0 {
+            return PICTURE_HEIGHT;
+        }
+        let h = ((room - taken) / open).min(PICTURE_HEIGHT);
+        let reached: Vec<usize> = (0..sizes.len()).filter(|&i| !held[i] && tallest[i] < h).collect();
+        if reached.is_empty() {
+            return h;
+        }
+        for i in reached {
+            held[i] = true;
+        }
+    }
+}
+
+/// The width and height of the picture at `path` in pixels, from its
+/// header; read once for each time the file is written.
+fn picture_size(path: &Path) -> Option<(u32, u32)> {
+    type Sizes = HashMap<(PathBuf, SystemTime), Option<(u32, u32)>>;
+    static SIZES: LazyLock<Mutex<Sizes>> = LazyLock::new(Mutex::default);
+    let written = fs::metadata(path).and_then(|meta| meta.modified()).ok()?;
+    let key = (path.to_path_buf(), written);
+    if let Some(size) = SIZES.lock().ok()?.get(&key) {
+        return *size;
+    }
+    let mut head = Vec::new();
+    fs::File::open(path).and_then(|file| file.take(PICTURE_HEAD).read_to_end(&mut head)).ok()?;
+    let size = atroxabot_core::picture::dimensions(&head).filter(|&(w, h)| w > 0 && h > 0);
+    if let Ok(mut sizes) = SIZES.lock() {
+        // A bound on what is remembered: a long session's pictures, not every file ever shown.
+        if sizes.len() >= 512 {
+            sizes.clear();
+        }
+        sizes.insert(key, size);
+    }
+    size
+}
+
+/// A URL's path with its `%XX` escapes decoded; `None` when they are not UTF-8.
+fn decode_percent(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = bytes
+            .get(i + 1..i + 3)
+            .and_then(|h| std::str::from_utf8(h).ok())
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match (bytes[i], hex) {
+            (b'%', Some(byte)) => {
+                out.push(byte);
+                i += 3;
+            }
+            (byte, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Quotes render their text muted unless already coloured.
@@ -1046,6 +1308,83 @@ mod tests {
         // A streamed rebuild keeps the scroll.
         let next = Doc::markdown(&fonts, &format!("{src}\n\nmore"), 400.0, 1.0, INK_TEXT, Some(d));
         assert!((next.code_scroll[0] - 200.0).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn pictures_on_disk_sit_side_by_side() {
+        let fonts = Fonts::load();
+        let folder = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let src = "Lineup:\n![big](icon/256.png)\n![small](icon/64.png)\n![gone](icon/none.png)\n\n\
+                   - `icon/missing.png` was never made\n\nAfter.";
+        let d = Doc::markdown_in(&fonts, src, (600.0, 1.0), INK_TEXT, &folder, None);
+        let boxes: Vec<_> = d
+            .decos
+            .iter()
+            .filter_map(|piece| match &piece.deco {
+                Deco::Picture { path, w, h } => Some((piece.x, piece.y, *w, *h, path.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(boxes.len(), 2, "the two that are there");
+        // At their own sizes, which fit: side by side, the gap between them.
+        let ((x0, y0, w0, h0, big), (x1, y1, w1, h1, _)) = (boxes[0], boxes[1]);
+        assert!(big.ends_with("256.png") && (y0 - y1).abs() < f32::EPSILON);
+        assert_eq!((w0, h0, w1, h1, x1 - x0), (256.0, 256.0, 64.0, 64.0, 256.0 + PICTURE_GAP));
+        // One that is not there stands as where it was looked for; a code span's says itself.
+        let words: Vec<&str> = d.texts.iter().map(|piece| piece.text.as_str()).collect();
+        assert_eq!(words, ["Lineup:", "icon/none.png", "icon/missing.png was never made", "After."]);
+        let online = doc("![the chart](https://example.com/c.png)");
+        assert_eq!(
+            (online.texts[0].text.as_str(), online.texts[0].links.as_slice()),
+            ("the chart", &["https://example.com/c.png".to_owned()][..])
+        );
+        assert!(d.texts[2].y > y0 + h0, "the pictures come under what is not there");
+
+        // In a narrow column the large one shrinks (in steps) and the small one goes under it.
+        let narrow = Doc::markdown_in(&fonts, "![](icon/256.png)\n![](icon/64.png)", (230.0, 1.0), 0, &folder, None);
+        let shown: Vec<(f32, f32)> = narrow.decos.iter().map(|piece| (piece.y, piece.x)).collect();
+        assert_eq!(shown, [(0.0, 0.0), (224.0 + PICTURE_GAP, 0.0)]);
+        // Without a folder, a relative path finds nothing.
+        assert!(doc("![](icon/256.png)").decos.is_empty());
+    }
+
+    #[test]
+    fn a_row_of_pictures_fills_its_width() {
+        // Two wide shots share a row; the small one keeps its size and the other takes the rest.
+        let wide = [(1600.0, 900.0), (1600.0, 900.0)];
+        let h = row_height(&wide, &[1024.0, 1024.0], 2.0 * 320.0 + PICTURE_GAP);
+        assert!((h - 180.0).abs() < 0.01, "{h}");
+        let mixed = [(64.0, 64.0), (1600.0, 900.0)];
+        let h = row_height(&mixed, &[64.0, 1024.0], 64.0 + PICTURE_GAP + 320.0);
+        assert!((h - 180.0).abs() < 0.01, "{h}");
+        assert!((row_height(&[(10.0, 10.0)], &[10.0], 800.0) - PICTURE_HEIGHT).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn pictures_are_only_found_on_this_computer() {
+        let assets = Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+        let icon = assets.join("icon").join("256.png");
+        let absolute = icon.to_string_lossy().into_owned();
+        assert_eq!(on_disk("icon/256.png", &assets).map(PathBuf::from), Some(assets.join("icon/256.png")));
+        assert_eq!(on_disk(&absolute, Path::new("")), Some(absolute.clone()));
+        let url = format!("file://{}{}", if absolute.starts_with('/') { "" } else { "/" }, absolute.replace('\\', "/"));
+        assert!(on_disk(&url.replace(' ', "%20"), Path::new("")).is_some(), "{url}");
+        for elsewhere in [
+            r"\\host\share\a.png",
+            "//host/share/a.png",
+            r"\\?\UNC\host\a.png",
+            r"\/host/a.png",
+            "file://host/share/a.png",
+            "https://example.com/a.png",
+            "icon/256.png",
+        ] {
+            assert_eq!(on_disk(elsewhere, Path::new("")), None, "{elsewhere}");
+        }
+        // Only pictures: not another file, nor a folder.
+        assert_eq!(on_disk("../Cargo.toml", &assets), None);
+        assert_eq!(on_disk("icon", &assets), None);
+        assert_eq!(decode_percent("a%20b%2"), Some("a b%2".into()));
+        assert_eq!(decode_percent("%ff"), None);
     }
 
     #[test]

@@ -516,11 +516,13 @@ impl Thread {
 
     /// The Markdown layout of block `key`, made again when its text grew or
     /// the width changed; what was laid out before is reused where unchanged.
+    /// The pictures it shows are found from the session's folder.
     fn markdown(&mut self, p: &Painter, key: (usize, usize), text: &str, width: f32, ink: u8) -> &mut Doc {
         let stale = self.cache.get(&key).is_none_or(|c| c.len != text.len() || !c.doc.fits(width, p.scale));
         if stale && !self.wait(key, text) {
             let previous = self.cache.remove(&key).map(|c| c.doc);
-            let doc = Doc::markdown(p.fonts, text, width, p.scale, ink, previous);
+            let folder = self.session.folder();
+            let doc = Doc::markdown_in(p.fonts, text, (width, p.scale), ink, &folder, previous);
             self.cache.insert(key, Cached { doc, len: text.len() });
         }
         &mut self.cache.entry(key).or_insert_with(|| Cached { doc: Doc::default(), len: 0 }).doc
@@ -1232,6 +1234,9 @@ impl Thread {
                         if let Some(link) = event.open_link {
                             actions.push(Action::OpenLink(link));
                         }
+                        if let Some(picture) = event.open_picture {
+                            self.clicked_picture = Some(picture);
+                        }
                     }
                     y += height + 14.0;
                 }
@@ -1398,7 +1403,9 @@ impl Thread {
             p.rect(Rect::new(x + 6.0, y, 2.0, height), t.border_strong, 1.0);
             self.mark_found(p, key, (x + 22.0, y));
             let doc = self.markdown(p, key, text, width - 22.0, INK_MUTED);
-            doc.draw(p, ui, (x + 22.0, y), t.text_muted, true, None);
+            if let Some(picture) = doc.draw(p, ui, (x + 22.0, y), t.text_muted, true, None).open_picture {
+                self.clicked_picture = Some(picture);
+            }
             y += height + 12.0;
         }
         y
