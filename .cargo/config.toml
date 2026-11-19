@@ -1,0 +1,4 @@
+# why: link Microsoft's C runtime into the exe. Without it the app needs VCRUNTIME140.dll from the
+# Visual C++ Redistributable, which a fresh Windows does not have, and there it does not even start.
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -736,6 +736,9 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 ```
 
+On Windows the C runtime is linked into the exe (`.cargo/config.toml`), so the app starts on a PC without
+the Visual C++ Redistributable.
+
 To look at the design without opening the app, draw every screen offscreen in every theme:
 `ATROXABOT_SNAPSHOTS=<folder> cargo test -p atroxabot snapshots -- --ignored`.
 
