@@ -195,6 +195,8 @@ pub struct Shell {
     warned: HashSet<String>,
     call: Option<CallView>,
     sidebar_scroll: Scroll,
+    /// How far the side panel is scrolled, when it is taller than the window.
+    panel_scroll: Scroll,
     /// The repository of the folder the open session works in, for the side panel.
     git: GitView,
     /// The open session's title while it is being changed in the top bar.
@@ -270,6 +272,7 @@ impl Shell {
             warned: HashSet::new(),
             call: None,
             sidebar_scroll: Scroll::default(),
+            panel_scroll: Scroll::default(),
             git: GitView::default(),
             renaming: None,
             icons: HashMap::new(),

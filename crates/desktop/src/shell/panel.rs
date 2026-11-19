@@ -126,7 +126,6 @@ pub(super) struct GitView {
     pulling: Option<String>,
     /// When GitHub was last asked.
     pulled_at: Option<Instant>,
-    scroll: Scroll,
 }
 
 /// A changed file's diff, open as a modal.
@@ -765,10 +764,20 @@ impl Shell {
         if self.work_folder() != self.git.folder {
             self.refresh_git(actions);
         }
-        let clip = p.push_clip(rect);
+        // The whole panel scrolls as one when it is taller than the window. Within the canvas's
+        // corner radius of its ends nothing is drawn, so no line pokes out past its rounded corners.
+        let view = Rect::new(rect.x, rect.y + theme::CANVAS_RADIUS, rect.w, rect.h - 2.0 * theme::CANVAS_RADIUS);
+        let offset = self.panel_scroll.update(ui, ui.hovered(rect));
+        let clip = p.push_clip(view);
+        // What scrolled out of sight is not under the mouse, wherever the mouse is.
+        let mouse = ui.mouse;
+        if !view.contains(mouse) {
+            ui.mouse = (f32::MIN, f32::MIN);
+        }
+        let top = rect.y - offset;
         let (x, w) = (rect.x + 16.0, rect.w - 32.0);
-        field_label(p, icon::LAYERS, "SESSION", x, rect.y + 20.0);
-        let (used, compacting) = self.draw_usage(p, ui, (x, rect.y + 48.0, w));
+        field_label(p, icon::LAYERS, "SESSION", x, top + 20.0);
+        let (used, compacting) = self.draw_usage(p, ui, (x, top + 48.0, w));
         if compacting {
             self.send("/compact", false, Vec::new(), actions);
         }
@@ -787,7 +796,7 @@ impl Shell {
         y += 30.0;
         // Taken out while it is drawn, as the menus and the notices need the shell.
         if let Some(status) = self.git.status.take() {
-            self.draw_git(p, ui, (x, y, w), rect.bottom(), &status, actions);
+            y = self.draw_git(p, ui, (x, y, w), &status, actions);
             self.git.status.get_or_insert(status);
         } else {
             let note = if self.git.loading {
@@ -801,20 +810,32 @@ impl Shell {
             };
             let note = p.layout(note, theme::SMALL, Some(w));
             p.text(&note, x, y, t.text_faint);
+            y += note.height();
+        }
+        ui.mouse = mouse;
+        // Room under the last line, past the corner radius the view leaves out.
+        let content = y + offset - rect.y + 16.0 + theme::CANVAS_RADIUS;
+        self.panel_scroll.finish(ui, content, rect.h);
+        if content > rect.h {
+            // It fades out at its ends rather than being cut.
+            if offset > 0.5 {
+                p.gradient(Rect::new(view.x, view.y, view.w, 16.0), t.bg, fade(t.bg, 0.0), 0.0);
+            }
+            p.gradient(Rect::new(view.x, view.bottom() - 16.0, view.w, 16.0), fade(t.bg, 0.0), t.bg, 0.0);
         }
         p.set_clip(clip);
+        self.panel_scroll.bar(p, ui, rect, content);
     }
 
-    /// The repository: its branch and what changed.
+    /// The repository: its branch and what changed. Returns where it ends.
     fn draw_git(
         &mut self,
         p: &mut Painter,
         ui: &mut Ui,
         (x, mut y, w): (f32, f32, f32),
-        bottom: f32,
         status: &GitStatus,
         actions: &mut Vec<Action>,
-    ) {
+    ) -> f32 {
         let t = p.theme;
         // Another branch checked out (by the agent, too): GitHub is asked about it once the status is in.
         if !self.git.loading && self.git.pulling.is_none() && self.git.pull_branch != status.branch {
@@ -873,22 +894,20 @@ impl Shell {
         counts(p, total, x + w, y);
         y += 24.0;
 
-        // The files scroll in what is left of the panel.
-        let list = Rect::new(x - 8.0, y, w + 16.0, (bottom - y - 10.0).max(0.0));
-        let offset = self.git.scroll.update(ui, ui.hovered(list));
-        let clip = p.push_clip(list);
+        // The files, scrolling with the rest of the panel: only those in sight are drawn.
         if status.files.is_empty() {
             p.label("Nothing changed", theme::SMALL, x, y + 4.0, t.text_faint);
+            y += 24.0;
         }
-        let mut row_y = list.y - offset;
+        let sight = p.clip();
         let mut open = None;
         for file in &status.files {
-            let row = Rect::new(list.x, row_y, list.w, FILE_H - 2.0);
-            row_y += FILE_H;
-            if row.bottom() < list.y || row.y > list.bottom() {
+            let row = Rect::new(x - 8.0, y, w + 16.0, FILE_H - 2.0);
+            y += FILE_H;
+            if row.bottom() < sight.y || row.y > sight.bottom() {
                 continue;
             }
-            let hovered = ui.hovered(row) && list.contains(ui.mouse);
+            let hovered = ui.hovered(row);
             let hover = ui.anim(id(("changed", &file.path)), f32::from(u8::from(hovered)));
             p.rect(row, fade(t.hover, hover), theme::RADIUS_SM);
             let mid = row.y + row.h * 0.5;
@@ -910,14 +929,11 @@ impl Shell {
                 }
             }
         }
-        p.set_clip(clip);
-        let content = row_y + offset - list.y;
-        self.git.scroll.finish(ui, content, list.h);
-        self.git.scroll.bar(p, ui, list, content);
         if let Some(file) = open {
             actions.push(Action::Git { folder: self.git.folder.clone(), job: Job::Diff(file.clone()) });
             self.modal = Some(Modal::Diff(Box::new(DiffView::new(file))));
         }
+        y
     }
 }
 

@@ -520,7 +520,8 @@ server-side compaction on its own API, by a request of the app's elsewhere.
 ### Side panel, spotlight and statistics
 
 - **The side panel** (the last icon of the top bar). Where the window is too narrow to set it beside the
-  session, it floats over the session under the top bar; Esc or a click outside it puts it away.
+  session, it floats over the session under the top bar; Esc or a click outside it puts it away. Taller
+  than the window, it scrolls as one, its changed files with the rest.
   - What the session used and how full its context is. Under a context of 100,000 tokens or more, a
     line says how long the provider still keeps it cached (*Cached for 38 more min*, then *No longer
     cached*), with *Compact* beside it: a message sent in time reads the conversation at about a tenth of

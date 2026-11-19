@@ -812,6 +812,18 @@ fn snapshots() {
             narrow.draw(p, ui, Rect::new(view.x, view.y, 820.0, 560.0), scheme, &mut Vec::new());
         });
         write_png(&dir.join(format!("panel-narrow-{}.png", scheme.key())), pixel_size(), &pixels);
+        // There, with tasks too, it is taller than the window: scrolled down to its end.
+        let mut scrolled = tasks();
+        let mut draw = |shell: &mut Shell| {
+            frame(&mut gpu, &fonts, scheme, (-1.0, -1.0), &mut |p, ui, view| {
+                shell.draw(p, ui, Rect::new(view.x, view.y, 820.0, 560.0), scheme, &mut Vec::new());
+            })
+        };
+        draw(&mut scrolled);
+        scrolled.panel_scroll.nudge(f32::MAX);
+        scrolled.panel_scroll.settle();
+        let pixels = draw(&mut scrolled);
+        write_png(&dir.join(format!("panel-scrolled-{}.png", scheme.key())), pixel_size(), &pixels);
     }
 }
 
