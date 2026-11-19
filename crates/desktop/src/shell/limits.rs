@@ -289,17 +289,22 @@ impl Shell {
             let limits = self.limits.entry(account.clone()).or_default();
             (limits.status, limits.resets, limits.at) = ("rejected".to_owned(), 0, now);
         }
-        if mode == OutOfLimits::Stop || account.is_empty() {
+        if account.is_empty() {
+            return;
+        }
+        let Some(agent) = self.agent_of(session) else { return };
+        // It was moved to another provider while the turn ran: the user chose
+        // where it goes on, so it goes on there at once, whatever the settings say.
+        if agent.connection != account && self.out_until(&agent.connection).is_none() && tries <= TRIES {
+            self.go_on(session, actions);
+            return;
+        }
+        if mode == OutOfLimits::Stop {
             return;
         }
         if tries > TRIES {
             let title = self.threads.get(session).map(|thread| thread.session.title.clone()).unwrap_or_default();
             self.notify(format!("\"{title}\" kept running into usage limits, so it no longer goes on by itself."));
-            return;
-        }
-        let Some(agent) = self.agent_of(session) else { return };
-        // It was moved to another provider while the turn ran: the user chose where it goes on.
-        if mode == OutOfLimits::Wait && agent.connection != account {
             return;
         }
         if mode == OutOfLimits::Switch {
@@ -312,7 +317,8 @@ impl Shell {
             self.wait(session, lifts, true);
             return;
         }
-        let lifts = self.out_until(&account).into_iter().collect();
+        // It waits for the account it goes on with: the one it ran on, or the one it was moved to.
+        let lifts = self.out_until(&agent.connection).into_iter().collect();
         self.wait(session, lifts, false);
     }
 
@@ -730,6 +736,36 @@ mod tests {
         let texts = sent(&actions);
         assert!(matches!(&texts[..], [text] if text.starts_with(GO_ON) && text.ends_with("Also update the changelog")));
         assert!(shell.threads[&session].follow_ups.is_empty());
+    }
+
+    #[test]
+    fn a_session_moved_while_its_turn_ran_goes_on_with_the_account_chosen() {
+        for mode in OutOfLimits::ALL {
+            let (mut shell, session, mut actions) = two_accounts(mode);
+            // The user picks the other account while the turn still runs on the first.
+            shell.choose(Menu::Provider, "work", &mut actions);
+            actions.clear();
+            run_out(&mut shell, &session, unix_now() + 3_600, &mut actions);
+            let send = actions.iter().any(|a| matches!(a, Action::Send { session, .. } if session.account == "work"));
+            assert!(send, "{mode:?}: it goes on with the account chosen, at once");
+            let thread = &shell.threads[&session];
+            assert!(thread.busy && thread.resume.is_none(), "{mode:?}");
+            assert!(thread.session.entries.iter().any(
+                |entry| matches!(entry, Entry::Note { text } if text == "Claude is out of usage · going on with Work")
+            ));
+        }
+
+        // With the chosen account out too, it waits for that one.
+        let (mut shell, session, mut actions) = two_accounts(OutOfLimits::Wait);
+        shell.choose(Menu::Provider, "work", &mut actions);
+        let later = unix_now() + 7_200;
+        let window = LimitWindow { name: "five_hour".into(), used: 1.0, resets: later, label: String::new() };
+        let limits = Limits { at: unix_now(), status: "rejected".into(), resets: later, windows: vec![window] };
+        shell.limits.insert("work".into(), limits);
+        actions.clear();
+        run_out(&mut shell, &session, unix_now() + 3_600, &mut actions);
+        assert!(sent(&actions).is_empty());
+        assert_eq!(shell.threads[&session].resume.as_ref().map(|resume| resume.at), Some(later + GRACE));
     }
 
     #[test]

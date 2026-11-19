@@ -396,6 +396,9 @@ Each session has its own provider, model and effort.
     With none left, it waits for the first to lift.
   - *Stop*.
 
+  A session you moved to another account while its turn ran goes on there at once when the old one
+  runs out, whichever of these is chosen; with that one out too, the choice above goes for that one.
+
   While it waits, a row above the message box says when it goes on, with *Continue now* and a button to
   cancel; what you sent meanwhile waits there and goes with it. A line in the conversation says why it
   went on and on which account, and the agent is told it was cut short and to carry on; nothing is written
