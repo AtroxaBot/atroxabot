@@ -625,7 +625,14 @@ pub fn run_in_terminal(title: &str, program: &Path, args: &[String], env: &[(Str
         // title goes in quoted, with nothing in it that could end the quotes or be read by `cmd`.
         let title: String = title.chars().filter(|c| c.is_alphanumeric() || " .-".contains(*c)).collect();
         let mut command = Command::new("cmd");
-        command.args(["/C", "start"]).raw_arg(format!("\"{title}\"")).args(["cmd", "/K"]).arg(program).args(args);
+        command.args(["/C", "start"]).raw_arg(format!("\"{title}\"")).args(["cmd", "/K"]);
+        // A line that begins with a quote and holds more than that one pair has `cmd` drop its first quote
+        // and its last: a program in a folder with a space in its name, with an argument that has one too
+        // (both under a user folder such as `C:\Users\Ada Lovelace`). `call` before it keeps them all.
+        if program.to_string_lossy().contains(char::is_whitespace) {
+            command.arg("call");
+        }
+        command.arg(program).args(args);
         command.envs(env.iter().map(|(name, value)| (name.as_str(), value.as_str())));
         command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
         // The terminal is the user's: it stays when the app ends.
@@ -776,6 +783,36 @@ mod tests {
         let _ = Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output();
         let _ = std::fs::remove_file(&out);
         assert_eq!(written.trim(), "it works", "the program ran in the terminal, with the variable");
+    }
+
+    /// A program in a folder with a space in its name runs with an argument that has one too, as a
+    /// sign-in does for a user whose folder has one: `cargo test -p atroxabot spaced -- --ignored`.
+    #[test]
+    #[ignore = "opens a console window"]
+    fn a_spaced_program_runs_with_a_spaced_argument() {
+        let dir = std::env::temp_dir().join(format!("atroxabot spaced {}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // The program is a script here, which `cmd` runs as it runs a binary; it writes what it was given.
+        let (program, out) = (dir.join("say it.cmd"), dir.join("it said.txt"));
+        std::fs::write(&program, "@echo off\r\n>%2 echo %~1\r\nexit\r\n").unwrap();
+        let args = ["it works".to_owned(), out.to_string_lossy().into_owned()];
+        run_in_terminal("Spaced test", &program, &args, &[]).unwrap();
+        let mut written = String::new();
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            written = std::fs::read_to_string(&out).unwrap_or_default();
+            if !written.is_empty() {
+                break;
+            }
+        }
+        // The console `cmd /K` keeps open is closed again, found by the folder it was told of.
+        let marker = dir.file_name().and_then(|name| name.to_str()).unwrap_or_default();
+        let script = format!(
+            "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | Where-Object {{ $_.CommandLine -like '*{marker}*' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}"
+        );
+        let _ = Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(written.trim(), "it works", "the program ran, with its argument whole");
     }
 
     /// An installer's one-line command (a PowerShell pipe, as `irm … | iex` is) gets through the

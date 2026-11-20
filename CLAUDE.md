@@ -38,14 +38,26 @@ cargo fmt --all --check
   app sets `CODEX_HOME` to select an extra account's folder and never looks
   inside it. What the app gives Codex (MCP servers, the skill library) is for the run only: nothing is
   written to an account's configuration.
-- **Antigravity accounts, the same way.** Run the user's installed Antigravity binary as published (`agy
-  acp`), never a `.cmd` launcher, and say the app is AtroxaBot, never another client. Never read, store
-  or forward its credentials, and never send `authenticate`: signing in is `agy acp --login`, started in
-  a terminal the user sees, and installing is Google's own installer (`ANTIGRAVITY_INSTALL`), the same
-  way. Its plan limits are not shown, because reading them takes its sign-in. The app gives an extra
-  account a folder of its own (`--gemini-dir`, with `SSH_CONNECTION` so that Antigravity keeps the
-  sign-in there) and never looks inside it. It unpacks itself at every start: never start it only to
-  ask what an account offers when that is kept already (`antigravity_info`, `antigravity.json`).
+- **Antigravity accounts, by Google's terms**, which are not Anthropic's: the README's "What Google's
+  terms allow" is the reference, with the pages it was read from. Read them again before changing how
+  the binary is started, how it signs in, or what a session does by itself, and never take a rule over
+  from Claude or Codex without checking it there. Run the user's installed Antigravity binary as
+  published (`agy acp`), never a `.cmd` launcher, and say the app is AtroxaBot, never another client.
+  **A person drives every session**: nothing sends Antigravity a message by itself and no account is
+  changed by itself (`Shell::hands_on`: a session a quota stopped stops there, whatever the settings
+  say), and Antigravity is never made the engine of another agent or of anything that runs unattended.
+  **The sign-in never leaves the binary**: never read, copy, store or forward its tokens, and never call
+  Google with them, which is why its plan limits are not shown (asking its own `/usage` when the user
+  looks is the allowed way, never on a timer). Asking the binary to use the sign-in it has is fine
+  (`authenticate` with `oauth-personal`): a session does when it is told it needs one, and the
+  settings' check does only for an added account, never where it could open a browser the user did not
+  ask for. Signing in is `agy acp --login`, started in a terminal the user sees, and installing is
+  Google's own installer (`ANTIGRAVITY_INSTALL`), the same way. The app gives an extra account a folder
+  of its own (`--gemini-dir`, with `SSH_CONNECTION` so that Antigravity keeps the sign-in there); in an
+  account's folder it only puts copies of the user's global `AGENTS.md` and `GEMINI.md` (`share_rules`)
+  and removes the empty conversation its own check left (`forget_conversation`). It unpacks itself at
+  every start: never start it only to ask what an account offers when that is kept already
+  (`antigravity_info`, `antigravity.json`).
 - **Rust-native, custom UI.** `winit` + `wgpu`, and we draw the app's interface ourselves. No UI
   frameworks (egui, iced, Tauri, …).
 - **Beautiful, elegant and fast.** Redraw only when something changes, do minimal work per frame, and keep

@@ -6,10 +6,11 @@
 //! arrives as an [`Event`]. The [`Session`] handle sends the user's input, stops a turn, and answers approvals
 //! and questions.
 //!
-//! The crate never touches authentication: the binary inherits the parent environment (plus [`Options::env`])
-//! and is signed in however the user set it up with `agy`. When the binary says a sign-in is needed the
-//! session ends with [`Event::SignInRequired`]; signing in is `agy acp --login` ([`login_args`]), started by
-//! the caller in a terminal the user sees.
+//! The crate never sees a credential: the binary inherits the parent environment (plus [`Options::env`]) and
+//! is signed in however the user set it up with `agy`. When the binary says a sign-in is needed it is asked
+//! to use the one it has, where the caller allows that ([`Options::authenticate`]), and otherwise the session
+//! ends with [`Event::SignInRequired`]; signing in is `agy acp --login` ([`login_args`]), started by the
+//! caller in a terminal the user sees.
 //!
 //! Blocking I/O and std threads only; the single dependency is `serde_json`.
 
@@ -41,6 +42,10 @@ pub struct Options {
     pub model: Option<String>,
     /// How hard the model thinks, one of the levels the model lists; `None` leaves it as it is.
     pub effort: Option<String>,
+    /// The mode the session works in, as the binary names them: `default` asks before it acts, `auto` has
+    /// Antigravity's own review decide what is safe and asks about the rest. One the session does not offer
+    /// is not asked for: the session then works in `default`. `None` leaves the mode as it is.
+    pub mode: Option<String>,
     /// Instructions for the agent, added to Antigravity's own system prompt where the binary takes them.
     pub instructions: Option<String>,
     /// A session id to continue; `None` starts a new session. When the session cannot be continued a new one
@@ -48,12 +53,23 @@ pub struct Options {
     pub resume: Option<String>,
     /// MCP servers the agent may use in this session.
     pub mcp_servers: Vec<McpServer>,
+    /// A session id to continue could not be continued: what was said in it so far, which the agent is told
+    /// before the first message of the session started in its place. `None` tells it nothing.
+    pub catch_up: Option<String>,
     /// The sign-in method to ask the binary to use (`oauth-personal` is a Google account) when it says a
-    /// session needs one. That lets it use the sign-in it already has; it never shows this crate a credential.
-    /// `None` never asks: a session that needs a sign-in ends with [`Event::SignInRequired`].
+    /// session needs one, as Google's page on `agy acp` has a client do. That lets it use the sign-in it
+    /// already has; where it has none it shows Google's sign-in in the user's browser and waits for it
+    /// ([`Event::SigningIn`]), or says it cannot. It never shows this crate a credential. `None` never asks:
+    /// a session that needs a sign-in ends with [`Event::SignInRequired`].
     pub authenticate: Option<String>,
     /// The caller's version, reported to the binary as `clientInfo.version`; empty reports this crate's.
     pub client_version: String,
+    /// A folder of the caller's for what the binary unpacks each time it starts, about a gigabyte. Every
+    /// process gets a folder of its own in it as its temporary folder, which is removed once the process has
+    /// ended, also when it had to be killed and could not clean up after itself; what an earlier run of the
+    /// caller left there is removed too. `None` leaves the binary the system's temporary folder, and what
+    /// a killed process left in it.
+    pub temp: Option<PathBuf>,
 }
 
 /// An MCP server given to the agent for a session.
@@ -186,6 +202,8 @@ pub enum Event {
     },
     /// The models on offer or the one in use changed, or a model said how hard it can think.
     Catalog(Catalog),
+    /// The mode the session works in (`default`, `auto`, ...), once it is open and whenever it changes.
+    Mode(String),
     /// The slash commands the binary takes, whole, each time they change.
     Commands(Vec<SlashCommand>),
     /// A turn began: the agent works on a message, or went on by itself after something it had started in the
@@ -233,6 +251,9 @@ pub enum Event {
         /// The request, as in [`ApprovalRequest::request_id`] and [`QuestionRequest::request_id`].
         request_id: String,
     },
+    /// The binary was asked to sign in ([`Options::authenticate`]), has no sign-in to use and shows Google's
+    /// in the user's browser: the session opens once the user has signed in there.
+    SigningIn,
     /// The binary is not signed in. The session ends; [`Event::Closed`] follows.
     SignInRequired,
     /// Something the user should know that is not a failure, from the binary or from this crate (a request
@@ -269,6 +290,13 @@ pub struct Tool {
     pub id: String,
     /// What the binary calls it, e.g. `Running run_command`.
     pub title: String,
+    /// The tool's own name where the binary says it (`run_command`), or the name of an MCP server's tool;
+    /// empty otherwise.
+    pub name: String,
+    /// The MCP server whose tool it is, where the binary says.
+    pub server: Option<String>,
+    /// A command the agent started to stay: it goes on after the turn, and no end of it is awaited.
+    pub daemon: bool,
     /// What kind of thing it does.
     pub kind: ToolKind,
     /// How it is doing.
@@ -302,8 +330,10 @@ pub enum ToolKind {
     Delete,
     /// Moves a file.
     Move,
-    /// Searches.
+    /// Searches the files.
     Search,
+    /// Searches the web.
+    WebSearch,
     /// Runs a command.
     Execute,
     /// Thinks.

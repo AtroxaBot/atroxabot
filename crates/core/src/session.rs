@@ -458,9 +458,25 @@ impl Session {
     /// told when it takes it over.
     #[must_use]
     pub fn digest(&self, budget: usize) -> String {
+        Self::digest_of(&self.entries, budget)
+    }
+
+    /// [`Session::digest`] of what was said before the message the user
+    /// sent last, where that is the latest thing in the session: what an
+    /// engine is told that is about to be given that message itself.
+    #[must_use]
+    pub fn digest_before_last(&self, budget: usize) -> String {
+        let earlier = match self.entries.split_last() {
+            Some((Entry::User { .. }, earlier)) => earlier,
+            _ => &self.entries,
+        };
+        Self::digest_of(earlier, budget)
+    }
+
+    fn digest_of(entries: &[Entry], budget: usize) -> String {
         let mut lines = Vec::new();
         let mut used = 0;
-        for entry in self.entries.iter().rev() {
+        for entry in entries.iter().rev() {
             let line = match entry {
                 Entry::User { text, .. } => format!("User: {}", text.trim()),
                 Entry::Summary { text } => format!("Earlier, in summary: {}", text.trim()),

@@ -1,11 +1,14 @@
 //! Finding the Antigravity binary and building its command line.
 
+use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
-use std::io::Read;
+use std::fs;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, PoisonError, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -16,6 +19,108 @@ const VERSION_TIMEOUT: Duration = Duration::from_secs(30);
 /// The folder under an account's own that the binary keeps its sessions and settings in. It is joined to the
 /// account's folder by the binary, also when given as an absolute path.
 const APP_DATA: &str = "antigravity-acp";
+
+/// The folder the binary keeps the same in by itself, in the user's own `~/.gemini`.
+const OWN_APP_DATA: &str = "antigravity-cli";
+
+/// Removes what the binary kept of the conversation `id` in an account's folder (`profile`; `None` is the
+/// user's own `~/.gemini`): one this crate opened only to ask what the account offers, in which nothing was
+/// said and which would otherwise sit in the account's history. Call it once the process has ended. Only what
+/// carries the id in its name is removed, and an id that is not of the binary's making (a UUID) removes
+/// nothing: nothing else in the folder is read or touched.
+pub(crate) fn forget_conversation(profile: Option<&Path>, id: &str) {
+    let made_here = id.len() == 36 && id.bytes().all(|byte| byte.is_ascii_hexdigit() || byte == b'-');
+    let own = || {
+        let named = env::var_os("GEMINI_HOME").filter(|home| !home.is_empty()).map(PathBuf::from);
+        named.or_else(|| env::home_dir().map(|home| home.join(".gemini")))
+    };
+    let (true, Some(home)) = (made_here, profile.map(Path::to_path_buf).or_else(own)) else { return };
+    // Another account's folder is started with the name given here; the user's own goes by either.
+    let kept_in: &[&str] = if profile.is_some() { &[APP_DATA] } else { &[APP_DATA, OWN_APP_DATA] };
+    for data in kept_in.iter().map(|data| home.join(data)) {
+        for suffix in [".db", ".db-wal", ".db-shm", ".db-journal", ".meta"] {
+            let _ = fs::remove_file(data.join("conversations").join(format!("{id}{suffix}")));
+        }
+        let _ = fs::remove_dir_all(data.join("brain").join(id));
+        let _ = fs::remove_file(data.join("annotations").join(format!("{id}.pbtxt")));
+    }
+}
+
+/// What a process's own temporary folder is called, before its number.
+const RUN_PREFIX: &str = "run-";
+/// How often a folder a process has left is tried to be removed, and how long between two tries: on Windows
+/// what the binary started may hold its files open a while after it is gone.
+const RECLAIM_TRIES: u32 = 30;
+const RECLAIM_EVERY: Duration = Duration::from_secs(2);
+
+/// The temporary folders of the processes that run now: never swept away.
+static RUNNING: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+
+/// The temporary folder of one process of the binary, under the caller's `root`. The binary unpacks itself
+/// into its temporary folder at every start and cannot take that away again when it is killed.
+pub(crate) fn run_dir(root: &Path) -> io::Result<PathBuf> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    fs::create_dir_all(root)?;
+    let name = format!("{RUN_PREFIX}{}-{}", std::process::id(), NEXT.fetch_add(1, Ordering::Relaxed));
+    let dir = root.join(name);
+    // One of that name is what an earlier run with this process id left.
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir(&dir)?;
+    let first = RUNNING.lock().unwrap_or_else(PoisonError::into_inner).get_or_insert_default().insert(dir.clone());
+    debug_assert!(first, "every process has a folder of its own");
+    sweep(root);
+    Ok(dir)
+}
+
+/// Removes what earlier runs of the caller left under `root`, off this thread: a gigabyte takes a while.
+fn sweep(root: &Path) {
+    let root = root.to_owned();
+    // Without the thread the folders stay until the next start, no worse.
+    let _ = thread::Builder::new().name("agy-sweep".into()).spawn(move || {
+        let Ok(entries) = fs::read_dir(&root) else { return };
+        for entry in entries.flatten() {
+            let (dir, name) = (entry.path(), entry.file_name());
+            let ours = name.to_string_lossy().starts_with(RUN_PREFIX) && dir.is_dir();
+            let running =
+                RUNNING.lock().unwrap_or_else(PoisonError::into_inner).as_ref().is_some_and(|set| set.contains(&dir));
+            if ours && !running {
+                let _ = fs::remove_dir_all(&dir);
+            }
+        }
+    });
+}
+
+/// Removes the temporary folder `dir` of a process that has ended, trying again for a while off this thread.
+pub(crate) fn reclaim(dir: &Path) {
+    let forget = |dir: &Path| {
+        if let Some(running) = RUNNING.lock().unwrap_or_else(PoisonError::into_inner).as_mut() {
+            running.remove(dir);
+        }
+    };
+    if fs::remove_dir_all(dir).is_ok() || !dir.exists() {
+        return forget(dir);
+    }
+    let again = dir.to_owned();
+    let spawned = thread::Builder::new().name("agy-reclaim".into()).spawn(move || {
+        for _ in 0..RECLAIM_TRIES {
+            thread::sleep(RECLAIM_EVERY);
+            if fs::remove_dir_all(&again).is_ok() || !again.exists() {
+                break;
+            }
+        }
+        // What is left now goes with the next sweep.
+        forget(&again);
+    });
+    if spawned.is_err() {
+        forget(dir);
+    }
+}
+
+/// The environment that makes `dir` a process's temporary folder.
+pub(crate) fn temp_env(dir: &Path) -> Vec<(&'static str, PathBuf)> {
+    let names: &[&str] = if cfg!(windows) { &["TEMP", "TMP"] } else { &["TMPDIR"] };
+    names.iter().map(|name| (*name, dir.to_owned())).collect()
+}
 
 /// Finds the installed Antigravity binary: every `PATH` directory first, then where Google's installer puts
 /// it. On Windows nothing but a native `agy.exe` is returned.
@@ -217,6 +322,34 @@ mod tests {
     }
 
     #[test]
+    fn a_process_has_a_temporary_folder_that_goes_with_it() {
+        let scratch = Scratch::new();
+        let root = scratch.0.join("tmp");
+        // What an earlier run left, and something that is not a process's folder.
+        scratch.file("tmp/run-1-0/_MEI1/python.dll");
+        scratch.file("tmp/keep/file");
+        let dir = run_dir(&root).unwrap();
+        assert!(dir.is_dir() && dir.starts_with(&root));
+        let other = run_dir(&root).unwrap();
+        assert_ne!(dir, other);
+        fs::write(dir.join("unpacked"), "x").unwrap();
+        // The sweep runs off this thread: it takes the leftover, and nothing of a process that runs.
+        for _ in 0..200 {
+            if !root.join("run-1-0").exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!root.join("run-1-0").exists(), "what an earlier run left is removed");
+        assert!(dir.join("unpacked").exists() && other.exists() && root.join("keep").join("file").exists());
+        reclaim(&dir);
+        reclaim(&other);
+        assert!(!dir.exists() && !other.exists());
+        let names: Vec<&str> = temp_env(&dir).iter().map(|(name, _)| *name).collect();
+        assert_eq!(names, if cfg!(windows) { vec!["TEMP", "TMP"] } else { vec!["TMPDIR"] });
+    }
+
+    #[test]
     fn default_options_are_the_bare_subcommand() {
         assert_eq!(strings(&build_args(&Options::default())), ["acp"]);
     }
@@ -293,6 +426,28 @@ mod tests {
         for bad in ["", "agy", "agy 1.5", "agy 1..3", "v2.1.3", "unknown"] {
             assert_eq!(parse_version(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn only_the_conversation_asked_about_is_forgotten() {
+        let (asked, other) = ("0b6f1c2e-5a3d-4c8e-9f10-2b7a6d4e1c90", "9a1b2c3d-4e5f-4a6b-8c7d-0e1f2a3b4c5d");
+        let scratch = Scratch::new();
+        let of = |id: &str| {
+            let files = [".db", ".db-wal", ".meta"].map(|suffix| format!("antigravity-acp/conversations/{id}{suffix}"));
+            let mut kept: Vec<PathBuf> = files.iter().map(|file| scratch.file(file)).collect();
+            kept.push(scratch.file(&format!("antigravity-acp/brain/{id}/plan.md")));
+            kept.push(scratch.file(&format!("antigravity-acp/annotations/{id}.pbtxt")));
+            kept
+        };
+        let (gone, stays) = (of(asked), of(other));
+        let sign_in = scratch.file("antigravity-acp/acp_token.json");
+        // A name that could lead elsewhere removes nothing.
+        forget_conversation(Some(&scratch.0), "../../antigravity-acp/acp_token.json/..");
+        forget_conversation(Some(&scratch.0), "");
+        assert!(gone.iter().chain(&stays).all(|file| file.exists()));
+        forget_conversation(Some(&scratch.0), asked);
+        assert!(gone.iter().all(|file| !file.exists()), "what the check left is gone");
+        assert!(stays.iter().all(|file| file.exists()) && sign_in.exists(), "and nothing else");
     }
 
     #[test]

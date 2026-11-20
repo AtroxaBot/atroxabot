@@ -645,7 +645,7 @@ impl Shell {
         else {
             return y;
         };
-        let stops = self.stops_tasks();
+        let stops = self.stops_tasks() || self.stops_commands();
         p.rect(Rect::new(x - 16.0, y, w + 32.0, 1.0), t.border, 0.0);
         y += 18.0;
         field_label(p, icon::TERMINAL, "IN THE BACKGROUND", x, y);
@@ -683,6 +683,14 @@ impl Shell {
         let Some(thread) = self.thread().filter(|thread| thread.live) else { return false };
         let provider = ran_on(thread, &self.agents);
         self.config.connection(&provider).is_some_and(|connection| connection.kind == ConnectionKind::ClaudeAgent)
+    }
+
+    /// Whether the commands the open session's Antigravity left running can be stopped: between turns
+    /// its stop ends them, all of them at once. While a turn runs it would end the turn.
+    fn stops_commands(&self) -> bool {
+        let Some(thread) = self.thread().filter(|thread| thread.live && !thread.busy) else { return false };
+        let provider = ran_on(thread, &self.agents);
+        self.config.connection(&provider).is_some_and(|connection| connection.kind == ConnectionKind::Antigravity)
     }
 
     /// Stops the task the call `call` of the open session started.

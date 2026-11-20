@@ -4,7 +4,8 @@
 //! as soon as they are done (Claude Code queues it itself; the API engine
 //! takes it from its `Control`). What is left when the turn ends is sent as
 //! the next message. "Send now" stops the step in progress so the agent reads
-//! it at once, with everything it did so far; Stop puts what waits back in the
+//! it at once, with everything it did so far (Antigravity takes it into the
+//! running turn without being stopped); Stop puts what waits back in the
 //! message box. Until it is handed over a message can be edited or removed.
 
 use atroxabot_core::{ConnectionKind, FollowUp, INTERRUPTING};
@@ -76,9 +77,20 @@ impl Shell {
         if thread.stopping {
             return;
         }
-        // Claude Code keeps what it is handed and answers it after the stop. Codex and Antigravity would drop it
-        // with the turn it was put into: there it goes as the next message instead, once the turn has stopped.
         let on = self.config.connection(&thread.sent_on).map(|connection| connection.kind);
+        // Antigravity takes a message into the turn that runs at once, whatever it is doing, and leaves
+        // alone what the turn started: stopping it for the message would end its commands and agents.
+        let waits = |waiting: &Waiting| !is_command(&waiting.message.text);
+        if on == Some(ConnectionKind::Antigravity) && thread.follow_ups.iter().any(waits) {
+            for waiting in thread.follow_ups.iter_mut().filter(|waiting| !waiting.sent && waits(waiting)) {
+                waiting.sent = true;
+                let message = Box::new(waiting.message.clone());
+                actions.push(Action::FollowUp { session: session.to_owned(), message });
+            }
+            return;
+        }
+        // Claude Code keeps what it is handed and answers it after the stop. Codex would drop it with the turn
+        // it was put into: there it goes as the next message instead, once the turn has stopped.
         let kept = !matches!(on, Some(ConnectionKind::Codex | ConnectionKind::Antigravity));
         for waiting in thread.follow_ups.iter_mut().filter(|w| kept && !w.sent && !is_command(&w.message.text)) {
             waiting.sent = true;

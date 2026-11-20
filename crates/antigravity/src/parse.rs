@@ -28,6 +28,10 @@ const SUBAGENT_TITLES: [&str; 5] = [
     "Run invoke_subagent?",
     "Run invoke_subagent",
 ];
+/// What begins a command's output where the binary puts when it ran and how it ended before what it printed.
+const RAN_AT: &str = "Created At:";
+/// What stands before what the command printed, there.
+const PRINTED: &str = "\nCommand output:\n";
 /// The ids of the requests that are a question of the agent, not a tool call to approve, begin with this.
 const QUESTION_PREFIX: &str = "interaction_";
 
@@ -196,6 +200,12 @@ pub(crate) struct Settings {
     pub model_option: Option<String>,
     /// The id of the option that sets the level of thinking; `None` when the model in use has no levels.
     pub effort_option: Option<String>,
+    /// The id of the option that sets the mode; `None` where the binary only takes `session/set_mode`.
+    pub mode_option: Option<String>,
+    /// The mode the session is in; empty when the binary does not say.
+    pub mode: String,
+    /// The modes on offer.
+    pub modes: Vec<String>,
 }
 
 impl Settings {
@@ -207,6 +217,9 @@ impl Settings {
         for model in items(legacy, "availableModels") {
             push_model(&mut settings.catalog.models, &text(model, "modelId"), model);
         }
+        let modes = field(setup, "modes");
+        settings.mode = text(modes, "currentModeId");
+        settings.modes = items(modes, "availableModes").iter().filter_map(|mode| opt_text(mode, "id")).collect();
         settings.update(field(setup, "configOptions"));
         settings
     }
@@ -216,6 +229,12 @@ impl Settings {
     pub(crate) fn update(&mut self, options: &Value) {
         let Some(options) = options.as_array() else { return };
         let select = |option: &&Value| text(option, "type") == "select";
+        if let Some(modes) = options.iter().filter(select).find(|option| is(option, "mode")) {
+            self.mode_option = Some(text(modes, "id"));
+            // One that says no mode leaves the mode as it was.
+            self.mode = opt_text(modes, "currentValue").unwrap_or_else(|| std::mem::take(&mut self.mode));
+            self.modes = choices(modes).into_iter().filter_map(|choice| opt_text(choice, "value")).collect();
+        }
         let models = options.iter().filter(select).find(|option| text(option, "id") == "model" || is(option, "model"));
         let Some(models) = models else { return };
         self.model_option = Some(text(models, "id"));
@@ -340,6 +359,32 @@ fn bounded(text: &str) -> String {
     format!("{CUT}{}", text.get(start..).unwrap_or_default())
 }
 
+/// The tool's own name in a title the binary makes of it: `run_command` of `Running run_command`,
+/// `mcp_files_list` of `Run mcp_files_list?`.
+fn titled(title: &str) -> Option<&str> {
+    let rest = title.strip_prefix("Running ").or_else(|| title.strip_prefix("Run "))?;
+    let name = rest.strip_suffix('?').unwrap_or(rest);
+    (!name.is_empty() && !name.contains(|c: char| c.is_whitespace() || c == '?')).then_some(name)
+}
+
+/// Whether a search called `title` (the tool `name`) looks on the web, not in the files: the binary sorts
+/// both as searches.
+fn searches_web(title: &str, name: &str) -> bool {
+    let title = title.trim().to_lowercase();
+    title.starts_with("web search")
+        || title.starts_with("search the web")
+        || matches!(name, "web_search" | "search_web")
+}
+
+/// What a command printed, of what the binary says it returned: without when it ran and how it ended,
+/// which the binary puts before it and says apart too.
+fn printed(output: &str) -> &str {
+    match output.split_once(PRINTED) {
+        Some((before, printed)) if before.starts_with(RAN_AT) => printed,
+        _ => output,
+    }
+}
+
 /// Takes a `tool_call` or `tool_call_update` into what is known of the call: an update says only what changed.
 /// `None` when it names no call.
 pub(crate) fn tool(known: Option<Tool>, update: &Value) -> Option<Tool> {
@@ -348,6 +393,9 @@ pub(crate) fn tool(known: Option<Tool>, update: &Value) -> Option<Tool> {
     tool.id = id;
     if let Some(title) = opt_text(update, "title") {
         tool.title = bounded(title.trim());
+        if let Some(name) = titled(&tool.title) {
+            name.clone_into(&mut tool.name);
+        }
     }
     if let Some(status) = field(update, "status").as_str() {
         tool.status = match status {
@@ -365,10 +413,25 @@ pub(crate) fn tool(known: Option<Tool>, update: &Value) -> Option<Tool> {
         tool.input = input.clone();
         tool.command = first_text(input, &["CommandLine", "command_line", "commandLine", "command"]).or(tool.command);
         tool.cwd = first_text(input, &["Cwd", "WorkingDirectory", "working_dir", "workingDir", "cwd"]).or(tool.cwd);
+        tool.daemon |= field(input, "IsDaemon").as_bool() == Some(true);
+        let pair = |server: &str, name: &str| opt_text(input, server).zip(opt_text(input, name));
+        if let Some((server, name)) = pair("ServerName", "ToolName") {
+            // A tool of an MCP server that the binary reaches through a tool of its own, as if it ran a
+            // command: the server, the tool and what the tool is given are all in what that one is given.
+            (tool.mcp, tool.server, tool.name) = (true, Some(server.trim().to_owned()), name.trim().to_owned());
+            tool.input = field(input, "Arguments").clone();
+        } else if let Some((server, name)) = pair("server", "tool").filter(|_| tool.mcp) {
+            (tool.server, tool.name) = (Some(server.trim().to_owned()), name.trim().to_owned());
+        }
     }
     if let Some(locations) = field(update, "locations").as_array() {
         let place = |location: &Value| Some((opt_text(location, "path")?, field(location, "line").as_u64()));
         tool.locations = locations.iter().filter_map(place).collect();
+    }
+    if tool.locations.is_empty() && !tool.mcp {
+        // A call that says no place may still be given the file it is about.
+        let given = first_text(&tool.input, &["file_path", "filePath", "TargetFile", "AbsolutePath"]);
+        tool.locations.extend(given.map(|path| (path, None)));
     }
     let mut said = None;
     if let Some(content) = field(update, "content").as_array() {
@@ -391,7 +454,7 @@ pub(crate) fn tool(known: Option<Tool>, update: &Value) -> Option<Tool> {
         output => first_text(output, &["combinedOutput", "combined_output", "output"]),
     };
     if let Some(output) = returned.or(said) {
-        tool.output = Some(bounded(&output));
+        tool.output = Some(bounded(printed(&output)));
     }
     tool.command = tool.command.or_else(|| first_text(output, &["commandLine", "command_line"]));
     tool.cwd = tool.cwd.or_else(|| first_text(output, &["workingDir", "working_dir"]));
@@ -417,6 +480,9 @@ pub(crate) fn tool(known: Option<Tool>, update: &Value) -> Option<Tool> {
         } else if tool.command.is_some() {
             tool.kind = ToolKind::Execute;
         }
+    }
+    if matches!(tool.kind, ToolKind::Search | ToolKind::Other) && !tool.mcp && searches_web(&tool.title, &tool.name) {
+        tool.kind = ToolKind::WebSearch;
     }
     Some(tool)
 }
@@ -678,6 +744,80 @@ mod tests {
         assert!(call.status.is_final());
         assert_eq!(call.command.as_deref(), Some("cargo test"));
         assert_eq!(tool(None, &json!({"title": "nameless"})), None);
+    }
+
+    #[test]
+    fn a_tool_is_known_by_its_own_name_and_a_servers_tool_by_its_server() {
+        let call = |update: Value| tool(None, &update).unwrap();
+        assert_eq!(call(json!({"toolCallId": "t", "title": "Running run_command"})).name, "run_command");
+        assert_eq!(call(json!({"toolCallId": "t", "title": "Run mcp_files_list?"})).name, "mcp_files_list");
+        assert_eq!(call(json!({"toolCallId": "t", "title": "Run invoke_subagent"})).name, "invoke_subagent");
+        for title in ["Editing main.rs", "Run", "Run a test?", "Running", "Run ??"] {
+            assert_eq!(call(json!({"toolCallId": "t", "title": title})).name, "", "{title}");
+        }
+        // A server's tool reached through the binary's own: reported as a command, and none.
+        let proxied = call(json!({"toolCallId": "t", "kind": "execute", "title": "MCP Tool list_pages",
+            "rawInput": {"ServerName": "chrome-devtools", "ToolName": "list_pages", "Arguments": {"page": 2}}}));
+        assert!(proxied.mcp && proxied.command.is_none());
+        assert_eq!((proxied.server.as_deref(), proxied.name.as_str()), (Some("chrome-devtools"), "list_pages"));
+        assert_eq!(proxied.input, json!({"page": 2}));
+        // One the binary marks as a server's says both in what it is given.
+        let marked = call(json!({"toolCallId": "t", "title": "Running list", "_meta": {"is_mcp_tool_call": true},
+            "rawInput": {"server": "files", "tool": "list", "path": "."}}));
+        assert_eq!((marked.server.as_deref(), marked.name.as_str(), marked.mcp), (Some("files"), "list", true));
+        // What is not marked is not taken for one because of how its input is named.
+        let plain = call(json!({"toolCallId": "t", "title": "Running x", "rawInput": {"server": "a", "tool": "b"}}));
+        assert_eq!((plain.server, plain.mcp), (None, false));
+    }
+
+    #[test]
+    fn a_search_of_the_web_a_lasting_command_and_a_file_given_are_told() {
+        let kind = |update: Value| tool(None, &update).unwrap().kind;
+        let search = |title: &str| kind(json!({"toolCallId": "t", "kind": "search", "title": title}));
+        assert_eq!(search("Running search_web"), ToolKind::WebSearch);
+        assert_eq!(search("Web search"), ToolKind::WebSearch);
+        assert_eq!(search("Searching for main"), ToolKind::Search);
+        assert_eq!(kind(json!({"toolCallId": "t", "title": "Running web_search"})), ToolKind::WebSearch);
+        let served = json!({"toolCallId": "t", "title": "Running web_search", "_meta": {"is_mcp_tool_call": true}});
+        assert_eq!(kind(served), ToolKind::Other);
+
+        let stays =
+            json!({"toolCallId": "t", "kind": "execute", "rawInput": {"CommandLine": "serve", "IsDaemon": true}});
+        assert!(tool(None, &stays).unwrap().daemon);
+        let ends =
+            json!({"toolCallId": "t", "kind": "execute", "rawInput": {"CommandLine": "make", "IsDaemon": false}});
+        assert!(!tool(None, &ends).unwrap().daemon);
+
+        // The place a call says counts; without one, the file it is given does.
+        let read = json!({"toolCallId": "t", "kind": "read", "rawInput": {"file_path": "/work/a.rs"}});
+        assert_eq!(tool(None, &read).unwrap().locations, [("/work/a.rs".to_owned(), None)]);
+        let edit = json!({"toolCallId": "t", "kind": "edit", "rawInput": {"TargetFile": "/work/b.rs"},
+            "locations": [{"path": "/work/c.rs"}]});
+        assert_eq!(tool(None, &edit).unwrap().locations, [("/work/c.rs".to_owned(), None)]);
+
+        // What a command printed is given without the binary's lines on when it ran.
+        let wrapped = "Created At: 10:00\nCompleted At: 10:01\nCommand exited with code 0.\n\nCommand output:\nok\n";
+        let done = json!({"toolCallId": "t", "rawOutput": {"output": wrapped, "exit_code": 0}});
+        let done = tool(None, &done).unwrap();
+        assert_eq!((done.output.as_deref(), done.exit_code), (Some("ok\n"), Some(0)));
+        let own = "a line\nCommand output:\nof the command's own";
+        assert_eq!(tool(None, &json!({"toolCallId": "t", "rawOutput": own})).unwrap().output.as_deref(), Some(own));
+    }
+
+    #[test]
+    fn a_session_says_its_mode_in_either_way() {
+        let mut listed = options();
+        listed[0]["options"] = json!([{"value": "default", "name": "Default"}, {"value": "auto", "name": "Auto"}]);
+        let settings = Settings::of(&json!({"sessionId": "s", "configOptions": listed}));
+        assert_eq!(settings.mode_option.as_deref(), Some("mode"));
+        assert_eq!(
+            (settings.mode.as_str(), settings.modes.as_slice()),
+            ("default", ["default".to_owned(), "auto".to_owned()].as_slice())
+        );
+        let older = json!({"sessionId": "s", "modes": {"currentModeId": "auto",
+            "availableModes": [{"id": "default", "name": "Default"}, {"id": "auto"}, {"name": "nameless"}]}});
+        let settings = Settings::of(&older);
+        assert_eq!((settings.mode_option, settings.mode.as_str(), settings.modes.len()), (None, "auto", 2));
     }
 
     #[test]

@@ -2,16 +2,29 @@
 //! (`agy`) the user installed and signed in to themselves.
 //!
 //! AtroxaBot starts that binary as published and talks to it in the Agent
-//! Client Protocol of `agy acp` (the `atroxabot-antigravity` crate). It never
-//! reads, stores or changes how the binary signs in, and never asks it to
-//! sign in: the user does that with Antigravity's own `agy acp --login`, in a
-//! terminal, and its usage is theirs. One process serves one session for as
-//! long as it is open; the conversation itself is Antigravity's, resumed by
-//! its id.
+//! Client Protocol of `agy acp` (the `atroxabot-antigravity` crate). What it
+//! may do with it is Google's to say, not Anthropic's or OpenAI's: the
+//! README's "What Google's terms allow" is the reference, with the pages it
+//! was read from. In short: a person drives every session (nothing here
+//! sends Antigravity a message by itself, and no account is switched by
+//! itself), and the sign-in never leaves the binary. The user signs in with
+//! Antigravity's own `agy acp --login`, in a terminal; a session that is
+//! told it needs a sign-in asks the binary to use the one it has
+//! (`authenticate`), as Google's page on `agy acp` has a client do, and
+//! nothing of it is ever read, copied or sent anywhere. One process serves
+//! one session for as long as it is open; the conversation itself is
+//! Antigravity's, resumed by its id.
 //!
-//! Antigravity has no sandbox or permission mode a client sets: it asks about
-//! a tool call, and the agent's autonomy answers what it settles here
-//! ([`Policy`]); the rest is the user's to decide.
+//! In an account's folder the app puts two things and removes one: the
+//! user's own instructions for every Antigravity ([`share_rules`]), and the
+//! empty conversation its own question about the account left.
+//!
+//! Antigravity asks about a tool call, and the agent's autonomy answers what
+//! it settles here ([`Policy`]); the rest is the user's to decide. An agent
+//! on auto works in Antigravity's own `auto` mode where the session offers
+//! it: Antigravity's review then lets through what it finds safe, and what
+//! it still asks is the user's. Every other level keeps the session in
+//! `default`, where it asks first.
 //!
 //! The binary unpacks itself each time it starts, which takes a while. So
 //! what an account offers is asked once and kept (`antigravity.json`), and
@@ -38,10 +51,24 @@ use crate::session::{Session, ToolUse};
 const INFO_TIMEOUT: Duration = Duration::from_secs(150);
 /// The file what the accounts offer is kept in, in the app's folder.
 const KNOWN_FILE: &str = "antigravity.json";
+/// Antigravity's name for the mode in which its own review decides what is safe to do unasked.
+const AUTO_MODE: &str = "auto";
+/// Its name for the mode in which it asks before it acts.
+const ASKING_MODE: &str = "default";
 /// What a session says while its Antigravity starts.
 const STARTING: &str = "Starting Antigravity: it takes up to a minute";
 /// What a session that needs a sign-in is told.
 const SIGN_IN: &str = "Antigravity is not signed in. Sign in under Settings, Providers.";
+/// What a session says while Antigravity shows Google's sign-in.
+const SIGNING_IN: &str = "Antigravity opened Google's sign-in in your browser: it goes on once you are signed in";
+/// Antigravity's name for signing in with a Google account, which it is asked to use where a session needs one.
+const SIGN_IN_METHOD: &str = "oauth-personal";
+/// Most that is told of a conversation Antigravity no longer has to the one started in its place, in bytes.
+const CATCH_UP: usize = 24_000;
+/// The user's own instructions for every Antigravity, which it reads from the folder of the account.
+const RULES: [&str; 2] = ["AGENTS.md", "GEMINI.md"];
+/// Where an account's folder says which of them the app put there, so that one the user wrote stays theirs.
+const RULES_RECORD: &str = ".atroxabot-rules.json";
 
 /// Where the user's Antigravity binary is, if it is installed.
 #[must_use]
@@ -82,11 +109,65 @@ pub fn antigravity_login(connection: &Connection) -> Option<TerminalCommand> {
     Some(TerminalCommand { program, args, env })
 }
 
+/// Where each Antigravity process unpacks itself: a folder of the app's, so that what a process the app
+/// had to end left there (about a gigabyte) is taken away again.
+fn temp_root() -> Option<PathBuf> {
+    Config::dir().ok().map(|dir| dir.join("cache").join("antigravity"))
+}
+
 /// The folder that selects an Antigravity account: none for Antigravity's
 /// own default, and otherwise where it keeps that account's sign-in, settings
 /// and conversations. What is in it is Antigravity's business.
 fn profile(connection: &Connection) -> Option<PathBuf> {
     Some(connection.config_dir.trim()).filter(|dir| !dir.is_empty()).map(PathBuf::from)
+}
+
+/// The user's own Antigravity folder: `~/.gemini`, or where `GEMINI_HOME` says.
+fn own_gemini() -> Option<PathBuf> {
+    let named = std::env::var_os("GEMINI_HOME").filter(|home| !home.is_empty()).map(PathBuf::from);
+    named.or_else(|| std::env::home_dir().map(|home| home.join(".gemini")))
+}
+
+/// Brings the user's own instructions for every Antigravity ([`RULES`] in `own`, their `~/.gemini`) into the
+/// folder of an account of the app's (`profile`), where Antigravity looks for that account's: without them
+/// such an account would not follow what the first one does. They are copies, made anew at each start, and
+/// what was copied is recorded there ([`RULES_RECORD`]): a file the user wrote or changed in the account's
+/// folder is theirs and stays as it is, and a copy whose original is gone goes too. Nothing else in the
+/// folder is read, and nothing of a sign-in is among these.
+fn share_rules(own: &Path, profile: &Path) {
+    if own == profile {
+        return;
+    }
+    let record = profile.join(RULES_RECORD);
+    let read = |file: &Path| std::fs::read_to_string(file).ok();
+    let kept: Option<Map<String, Value>> = read(&record).and_then(|kept| serde_json::from_str(&kept).ok());
+    let before = kept.unwrap_or_default();
+    let mut copied = before.clone();
+    for name in RULES {
+        let (theirs, ours) = (own.join(name), profile.join(name));
+        let current = read(&ours);
+        let put_here = copied.get(name).and_then(Value::as_str);
+        // One the app did not put there, or that was changed since, is the user's.
+        if ours.exists() && (current.is_none() || current.as_deref() != put_here) {
+            copied.remove(name);
+            continue;
+        }
+        match read(&theirs) {
+            Some(source) if current.as_deref() == Some(source.as_str()) || std::fs::write(&ours, &source).is_ok() => {
+                copied.insert(name.to_owned(), Value::String(source));
+            }
+            // Its original is gone (or could not be copied): so is what was copied of it.
+            _ => {
+                if current.is_some() {
+                    let _ = std::fs::remove_file(&ours);
+                }
+                copied.remove(name);
+            }
+        }
+    }
+    if copied != before {
+        let _ = write_private(&record, Value::Object(copied).to_string().as_bytes());
+    }
 }
 
 /// What Antigravity offers for the account `connection`: its models, how
@@ -113,10 +194,16 @@ pub fn antigravity_info(connection: &Connection, fresh: bool) -> Result<sdk::Inf
     // It leaves folders of its own where it is started: not in a project of the user's.
     let scratch = std::env::temp_dir().join("atroxabot-antigravity");
     let _ = std::fs::create_dir_all(&scratch);
+    let profile = profile(connection);
     let options = sdk::Options {
         cwd: Some(scratch),
-        profile: profile(connection),
+        // An account of the app's is asked to use the sign-in it has: started as it is, Antigravity shows no
+        // sign-in of its own for that. The user's own is not asked here: with no sign-in to use it would open
+        // Google's page in the browser, which only something the user sent may bring about (a session does).
+        authenticate: profile.as_ref().map(|_| SIGN_IN_METHOD.to_owned()),
+        profile,
         client_version: env!("CARGO_PKG_VERSION").to_owned(),
+        temp: temp_root(),
         ..sdk::Options::default()
     };
     let info = sdk::info(&options, INFO_TIMEOUT)?;
@@ -147,6 +234,42 @@ fn keep_info(file: &Path, id: &str, info: Option<&sdk::Info>) {
     }
     // Losing it costs one slow start, no more.
     let _ = write_private(file, Value::Object(kept).to_string().as_bytes());
+}
+
+/// Takes what a session that just opened offers into what is kept of the account `id`: it is the
+/// newest word on the models there are, after the binary updated itself say. The model the account
+/// picks by itself stays the one last asked for, where it is still there: a session continued says the
+/// model it was left with.
+fn refresh_known(file: &Path, id: &str, version: &str, offered: &sdk::Catalog) {
+    if offered.models.is_empty() || id.is_empty() {
+        return;
+    }
+    let known = known_info(file, id);
+    let mut info = known.clone().unwrap_or_else(|| sdk::Info { signed_in: true, ..sdk::Info::default() });
+    if !version.is_empty() {
+        version.clone_into(&mut info.version);
+    }
+    let listed = |model: &str| offered.models.iter().any(|listed| listed.id == model);
+    // Levels are kept for the models that are still there; the one in use says its own anew.
+    info.efforts.retain(|(model, _)| listed(model) && (*model != offered.model || offered.efforts.is_empty()));
+    if !offered.efforts.is_empty() {
+        info.efforts.push((offered.model.clone(), offered.efforts.clone()));
+    }
+    let own = info.catalog.model.clone();
+    info.catalog = if known.is_some() && listed(&own) {
+        let efforts = info.efforts.iter().find(|(of, _)| *of == own).map(|(_, levels)| levels.clone());
+        sdk::Catalog {
+            models: offered.models.clone(),
+            model: own,
+            efforts: efforts.unwrap_or_default(),
+            effort: info.catalog.effort.clone(),
+        }
+    } else {
+        offered.clone()
+    };
+    if known.as_ref() != Some(&info) {
+        keep_info(file, id, Some(&info));
+    }
 }
 
 /// What an account offers, as it is kept.
@@ -224,6 +347,8 @@ struct Policy {
     folder: PathBuf,
     /// Where the agent keeps its notes, which are its own to write too.
     memory: Option<PathBuf>,
+    /// The session is in Antigravity's own `auto` mode: its review has let through what it found safe.
+    reviewed: bool,
 }
 
 impl Policy {
@@ -235,6 +360,8 @@ impl Policy {
         let edits = matches!(tool.kind, Kind::Edit | Kind::Delete | Kind::Move) && !tool.mcp;
         match self.autonomy {
             Autonomy::Full => Some(sdk::Decision::AcceptForSession),
+            // What Antigravity's own review still asks about is the user's to decide.
+            Autonomy::Auto if self.reviewed => None,
             _ if looks => Some(sdk::Decision::Accept),
             Autonomy::ReadOnly => Some(sdk::Decision::Decline),
             Autonomy::Edits | Autonomy::Auto if edits && self.within(tool) => Some(sdk::Decision::Accept),
@@ -321,7 +448,8 @@ impl AntigravityAgent {
         // It unpacks itself before it answers: the wait is said, until the session is open.
         emit(AgentEvent::Status(STARTING.to_owned()));
         let shared: Arc<Mutex<Shared>> = Arc::default();
-        let policy = Policy { autonomy: agent.autonomy, folder: session.folder(), memory: agent.memory_dir() };
+        let mut policy =
+            Policy { autonomy: agent.autonomy, folder: session.folder(), memory: agent.memory_dir(), reviewed: false };
         let mut mapper = Mapper {
             asked_resume: options.resume.is_some(),
             account: connection.id.clone(),
@@ -332,6 +460,9 @@ impl AntigravityAgent {
         let handle: Arc<OnceLock<Weak<sdk::Session>>> = Arc::default();
         let own = Arc::clone(&handle);
         let session = sdk::Session::connect(&options, move |event| {
+            if let sdk::Event::Mode(mode) = &event {
+                policy.reviewed = mode == AUTO_MODE;
+            }
             if let sdk::Event::Approval(request) = &event
                 && let Some(decision) = policy.settles(&request.tool)
                 && let Some(session) = own.get().and_then(Weak::upgrade)
@@ -467,8 +598,13 @@ fn options(
     let profile = profile(connection);
     if let Some(profile) = &profile {
         let _ = std::fs::create_dir_all(profile);
+        // An account of its own follows the user's own instructions for every Antigravity too.
+        if let Some(own) = own_gemini() {
+            share_rules(&own, profile);
+        }
     }
     let folder = session.folder();
+    let resume = some(&session.remote).filter(|_| session.account == connection.id);
     sdk::Options {
         cli_path: None,
         env: Vec::new(),
@@ -476,14 +612,19 @@ fn options(
         profile,
         model: some(&agent.model),
         effort: some(&agent.effort),
+        // Antigravity's own review for an agent on auto; every other level has it ask, and the level answers.
+        mode: Some(if agent.autonomy == Autonomy::Auto { AUTO_MODE } else { ASKING_MODE }.to_owned()),
         // The agent's own instructions, on top of Antigravity's: who it is and how it works here.
         instructions: Some(prompt),
         // Another account keeps its own conversations: only the one that has this one can resume it.
-        resume: some(&session.remote).filter(|_| session.account == connection.id),
+        resume: resume.clone(),
+        // Should Antigravity no longer have it, the one started in its place is told what was said.
+        catch_up: resume.and_then(|_| some(&session.digest_before_last(CATCH_UP))),
         mcp_servers: mcp_servers(mcp),
-        // The binary is never asked to sign in: that is the user's, in a terminal.
-        authenticate: None,
+        // Asked to use the sign-in it has, as Google's page on `agy acp` has a client do; the sign-in stays its own.
+        authenticate: Some(SIGN_IN_METHOD.to_owned()),
         client_version: env!("CARGO_PKG_VERSION").to_owned(),
+        temp: temp_root(),
     }
 }
 
@@ -497,8 +638,14 @@ fn call_of(tool: &sdk::Tool) -> (String, Value) {
     };
     // What it is given says most; where it gives nothing, what it calls itself does.
     let or_given = |shaped: Value| if tool.input.is_object() { tool.input.clone() } else { shaped };
+    // Its own name where it says one: `Running html_render` is what the binary makes of it.
+    let named = || if tool.name.is_empty() { tool.title.clone() } else { tool.name.clone() };
     if tool.mcp {
-        return (tool.title.clone(), tool.input.clone());
+        let name = match &tool.server {
+            Some(server) if !tool.name.is_empty() => format!("mcp__{server}__{}", tool.name),
+            _ => named(),
+        };
+        return (name, tool.input.clone());
     }
     match tool.kind {
         Kind::Execute => {
@@ -511,14 +658,41 @@ fn call_of(tool: &sdk::Tool) -> (String, Value) {
         Kind::Move => ("Move".to_owned(), json!({ "file_path": file() })),
         Kind::Read => ("Read".to_owned(), json!({ "file_path": file() })),
         Kind::Search => ("Search".to_owned(), or_given(json!({ "pattern": tool.title }))),
+        Kind::WebSearch => {
+            let query = given("query").or_else(|| given("Query")).unwrap_or_else(|| tool.title.clone());
+            ("WebSearch".to_owned(), json!({ "query": query }))
+        }
         Kind::Fetch => ("WebFetch".to_owned(), or_given(json!({ "url": tool.title }))),
         Kind::Think => ("Think".to_owned(), json!({ "text": tool.title })),
         Kind::Subagent => {
-            let prompt = given("prompt").or_else(|| given("task")).unwrap_or_default();
-            ("Agent".to_owned(), json!({ "description": tool.title, "prompt": prompt }))
+            let (kind, role, prompt) = launched(&tool.input);
+            let description = if role.is_empty() { named() } else { role };
+            let mut input = json!({ "description": description, "prompt": prompt });
+            if !kind.is_empty() {
+                input["subagent_type"] = kind.into();
+            }
+            ("Agent".to_owned(), input)
         }
-        Kind::Other => (tool.title.clone(), tool.input.clone()),
+        Kind::Other => (named(), tool.input.clone()),
     }
+}
+
+/// The agents a call starts, from what it is given: their kind, what each is there for and what each is
+/// asked. Antigravity starts one with a call (`Role`, `Prompt`), or, in its earlier releases, several
+/// (`Subagents`).
+fn launched(input: &Value) -> (String, String, String) {
+    let text = |of: &Value, keys: &[&str]| {
+        let found = keys.iter().find_map(|key| of.get(key)?.as_str().map(str::trim).filter(|said| !said.is_empty()));
+        found.unwrap_or_default().to_owned()
+    };
+    let several = input.get("Subagents").and_then(Value::as_array).filter(|several| !several.is_empty());
+    let each: Vec<&Value> = several.map_or_else(|| vec![input], |several| several.iter().collect());
+    let said = |keys: &[&str], between: &str| {
+        let all: Vec<String> = each.iter().map(|one| text(one, keys)).filter(|said| !said.is_empty()).collect();
+        all.join(between)
+    };
+    let kind = if each.len() == 1 { text(each[0], &["TypeName"]) } else { String::new() };
+    (kind, said(&["Role"], ", "), said(&["Prompt", "prompt", "task"], "\n\n"))
 }
 
 /// The changes to files as the conversation reads them: one file's as what is replaced by what, a new
@@ -577,6 +751,10 @@ struct Mapper {
     /// The calls reported so far, and those of them answered.
     calls: HashSet<String>,
     answered: HashSet<String>,
+    /// The commands that run, by their call: what each was started as.
+    running: HashMap<String, String>,
+    /// Those of them a turn ended over: they go on in the background, and Antigravity says when one ends.
+    lingering: HashSet<String>,
     /// How many plans the turn made so far.
     plans: u64,
     /// The binary said it is not signed in.
@@ -606,10 +784,14 @@ impl Mapper {
             if !(runs || asked || done) {
                 return;
             }
-            self.begin(out);
+            // No reply is begun for it: what is heard of a call between turns (a command left running
+            // ends) is no turn, and nothing would end one.
             self.text_of = None;
             self.calls.insert(tool.id.clone());
             let (name, input) = call_of(tool);
+            if tool.kind == Kind::Execute && !tool.mcp && !done {
+                self.running.insert(tool.id.clone(), crate::tools::summary(&input));
+            }
             out.push(AgentEvent::ToolCall(ToolUse {
                 id: tool.id.clone(),
                 name,
@@ -617,16 +799,43 @@ impl Mapper {
                 ..ToolUse::default()
             }));
         }
+        // One started to stay is not waited for.
+        if tool.daemon {
+            self.running.remove(&tool.id);
+        }
         if done && self.answered.insert(tool.id.clone()) {
             let failed = tool.status == sdk::ToolStatus::Failed || tool.exit_code.is_some_and(|code| code != 0);
             let output = tool.output.clone().unwrap_or_default();
             out.push(AgentEvent::ToolResult { id: tool.id.clone(), output, is_error: failed });
+            self.running.remove(&tool.id);
+            if self.lingering.remove(&tool.id) {
+                out.push(AgentEvent::Background { id: tool.id.clone(), what: String::new(), ended: true });
+            }
         }
     }
 
-    /// Ends the turn: its reply, what it used, and why it failed if it did.
-    fn end(&mut self, problem: Option<String>, usage: Option<sdk::TokenUsage>, out: &mut Vec<AgentEvent>) {
+    /// Ends the turn: its reply, what it used, and why it failed if it did. The commands it leaves
+    /// running go on in the background where they `linger`; a turn that was stopped, or whose process
+    /// is gone, leaves none.
+    fn end(
+        &mut self,
+        problem: Option<String>,
+        usage: Option<sdk::TokenUsage>,
+        linger: bool,
+        out: &mut Vec<AgentEvent>,
+    ) {
         self.begin(out);
+        if linger {
+            for (id, what) in &self.running {
+                if self.lingering.insert(id.clone()) {
+                    out.push(AgentEvent::Background { id: id.clone(), what: what.clone(), ended: false });
+                }
+            }
+        } else {
+            self.running.clear();
+            let over = self.lingering.drain();
+            out.extend(over.map(|id| AgentEvent::Background { id, what: String::new(), ended: true }));
+        }
         let spent = usage.unwrap_or_default();
         let (held, size) = self.context;
         // What the context holds is what the next request reads: the turn's own count where it says none.
@@ -656,15 +865,20 @@ impl Mapper {
         drop(shared);
         self.replying = false;
         self.text_of = None;
-        self.calls.clear();
+        // A command that goes on is still known: its end answers the call it was.
+        self.calls.retain(|id| self.running.contains_key(id));
         self.answered.clear();
     }
 
     fn map(&mut self, event: sdk::Event) -> Vec<AgentEvent> {
         let mut out = Vec::new();
         match event {
-            sdk::Event::Ready { session_id, resumed, catalog, .. } => {
+            sdk::Event::Ready { session_id, resumed, version, catalog } => {
                 self.ready = true;
+                // What it offers now is what the app's menus show from here on.
+                if let Ok(dir) = Config::dir() {
+                    refresh_known(&dir.join(KNOWN_FILE), &self.account, &version, &catalog);
+                }
                 self.model = catalog.model;
                 out.push(AgentEvent::Remote(session_id));
                 out.push(AgentEvent::Status(String::new()));
@@ -720,7 +934,6 @@ impl Mapper {
                         json!({ "content": step.step, "status": status, "activeForm": step.step })
                     })
                     .collect();
-                self.begin(&mut out);
                 self.text_of = None;
                 self.plans += 1;
                 let id = format!("plan-{}-{}", crate::session::new_id(), self.plans);
@@ -768,6 +981,8 @@ impl Mapper {
                 lock(&self.shared).questions.remove(&request_id);
                 out.push(AgentEvent::PermissionGone(request_id));
             }
+            // It has no sign-in to use and shows Google's own: the wait is said.
+            sdk::Event::SigningIn => out.push(AgentEvent::Status(SIGNING_IN.to_owned())),
             sdk::Event::SignInRequired => {
                 self.signed_out = true;
                 // What was kept of the account says it is signed in: it is asked anew the next time.
@@ -796,7 +1011,8 @@ impl Mapper {
                         ))
                     }
                 };
-                self.end(problem, usage, &mut out);
+                // Stopping a turn stops what it ran; one that ended by itself may leave a command running.
+                self.end(problem, usage, status != sdk::TurnStatus::Interrupted, &mut out);
             }
             sdk::Event::Closed { exit_code, error } => {
                 let why = if self.signed_out {
@@ -811,12 +1027,16 @@ impl Mapper {
                         Some(why) => format!("Antigravity stopped unexpectedly: {why}."),
                         None => "Antigravity stopped unexpectedly.".to_owned(),
                     };
-                    self.end(Some(problem), None, &mut out);
+                    self.end(Some(problem), None, false, &mut out);
                 }
+                // What it left running is the app's to say of now: its process is gone.
+                self.running.clear();
+                self.lingering.clear();
                 out.push(AgentEvent::Disconnected(why));
             }
-            // Its own prompt coming back, and what the binary writes to its standard error.
-            sdk::Event::UserMessage { .. } | sdk::Event::Stderr(_) => {}
+            // Its own prompt coming back, the mode it works in (which the answers above go by), and
+            // what the binary writes to its standard error.
+            sdk::Event::UserMessage { .. } | sdk::Event::Mode(_) | sdk::Event::Stderr(_) => {}
         }
         out
     }
@@ -857,8 +1077,79 @@ mod tests {
         }
         let commands: Vec<&str> = info.commands.iter().map(|command| command.name.as_str()).collect();
         eprintln!("commands: {commands:?}");
+        // Asking Antigravity's own `/usage` when the user looks is what Google allows for plan limits.
+        let usage = commands.iter().any(|command| command.trim_start_matches('/') == "usage");
+        eprintln!("`/usage` over ACP: {}", if usage { "offered" } else { "NOT OFFERED" });
         assert!(!info.version.is_empty(), "the handshake names a version");
         assert!(!info.signed_in || !info.catalog.models.is_empty(), "a signed-in account has models");
+        if info.signed_in {
+            eprintln!("VERDICT: a session opens without `authenticate`: the settings' check is right as it is.");
+            return;
+        }
+        // The open question: a session asks Antigravity to use its sign-in (`authenticate`) when told it
+        // needs one, and the settings' check of the user's own account does not, lest a browser opens.
+        // Signed in with `agy acp --login` and still "not signed in" here means that check has to.
+        eprintln!("NOT SIGNED IN without `authenticate`. If `agy` IS signed in on this machine, set");
+        eprintln!("ATROXABOT_AGY_AUTHENTICATE=1 and run this again: it then asks agy to use its sign-in.");
+        eprintln!("(Signed out, that makes agy open Google's sign-in in the browser and wait.)");
+        if std::env::var_os("ATROXABOT_AGY_AUTHENTICATE").is_none() {
+            return;
+        }
+        let asked = sdk::Options { authenticate: Some("oauth-personal".into()), ..options };
+        let info = sdk::info(&asked, INFO_TIMEOUT).expect("Antigravity answers");
+        eprintln!("with `authenticate`: signed in: {}, {} models", info.signed_in, info.catalog.models.len());
+        if info.signed_in {
+            eprintln!("VERDICT: agy needs `authenticate` to use the sign-in it has: the check must send it too.");
+        }
+    }
+
+    #[test]
+    fn an_account_of_the_apps_gets_the_users_own_instructions() {
+        let root = std::env::temp_dir().join(format!("atroxabot-agy-rules-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (own, profile) = (root.join("own"), root.join("account"));
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::create_dir_all(&profile).unwrap();
+        let read = |file: PathBuf| std::fs::read_to_string(file).ok();
+        std::fs::write(own.join("AGENTS.md"), "Be brief.").unwrap();
+        std::fs::write(own.join("oauth_creds.json"), "secret").unwrap();
+        share_rules(&own, &profile);
+        assert_eq!(read(profile.join("AGENTS.md")).as_deref(), Some("Be brief."));
+        assert!(!profile.join("GEMINI.md").exists() && !profile.join("oauth_creds.json").exists());
+        // What the user changes there is followed, and one they write in the account's folder is theirs.
+        std::fs::write(own.join("AGENTS.md"), "Be thorough.").unwrap();
+        std::fs::write(profile.join("GEMINI.md"), "This account's own.").unwrap();
+        std::fs::write(own.join("GEMINI.md"), "For all of them.").unwrap();
+        share_rules(&own, &profile);
+        assert_eq!(read(profile.join("AGENTS.md")).as_deref(), Some("Be thorough."));
+        assert_eq!(read(profile.join("GEMINI.md")).as_deref(), Some("This account's own."));
+        // A copy the user changed in the account's folder is theirs from then on.
+        std::fs::write(profile.join("AGENTS.md"), "Changed here.").unwrap();
+        std::fs::write(own.join("AGENTS.md"), "Changed there.").unwrap();
+        share_rules(&own, &profile);
+        assert_eq!(read(profile.join("AGENTS.md")).as_deref(), Some("Changed here."));
+        // A copy whose original is gone goes too; the user's own stays.
+        std::fs::remove_file(profile.join("AGENTS.md")).unwrap();
+        share_rules(&own, &profile);
+        assert_eq!(read(profile.join("AGENTS.md")).as_deref(), Some("Changed there."));
+        std::fs::remove_file(own.join("AGENTS.md")).unwrap();
+        share_rules(&own, &profile);
+        assert!(!profile.join("AGENTS.md").exists());
+        assert_eq!(read(profile.join("GEMINI.md")).as_deref(), Some("This account's own."));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Says whether the Antigravity installed here knows the flag the app passes for an MCP server
+    /// reached over HTTP. Starts the binary for its help, nothing else.
+    #[test]
+    #[ignore = "live: needs the Antigravity CLI installed"]
+    fn live_antigravity_knows_the_flags_the_app_passes() {
+        let program = sdk::find_cli().expect("agy is installed");
+        let help = std::process::Command::new(program).args(["acp", "--help"]).output().expect("agy starts");
+        let said = format!("{}{}", String::from_utf8_lossy(&help.stdout), String::from_utf8_lossy(&help.stderr));
+        for flag in ["--gemini-dir", "--app-data-dir", "--login", "--process-per-session"] {
+            eprintln!("{flag}: {}", if said.contains(flag) { "known" } else { "NOT IN ITS HELP" });
+        }
     }
 
     fn tool(id: &str, kind: sdk::ToolKind, status: sdk::ToolStatus) -> sdk::Tool {
@@ -1059,7 +1350,7 @@ mod tests {
         let folder = std::env::temp_dir().join("atroxabot-agy-work");
         let inside = folder.join("src").join("a.rs").display().to_string();
         let outside = std::env::temp_dir().join("elsewhere").join("a.rs").display().to_string();
-        let policy = |autonomy| Policy { autonomy, folder: folder.clone(), memory: None };
+        let policy = |autonomy| Policy { autonomy, folder: folder.clone(), memory: None, reviewed: false };
         let edit = |path: &str| sdk::Tool {
             diffs: vec![sdk::Diff { path: path.into(), old_text: None, new_text: "x".into() }],
             ..tool("e", sdk::ToolKind::Edit, sdk::ToolStatus::Pending)
@@ -1083,7 +1374,8 @@ mod tests {
         }
         // Its notes are its own too.
         let notes = std::env::temp_dir().join("atroxabot-agy-notes");
-        let keeps = Policy { autonomy: Autonomy::Edits, folder: folder.clone(), memory: Some(notes.clone()) };
+        let keeps =
+            Policy { autonomy: Autonomy::Edits, folder: folder.clone(), memory: Some(notes.clone()), reviewed: false };
         assert_eq!(keeps.settles(&edit(&notes.join("notes.md").display().to_string())), accept);
         // Looking only: whatever else is asked is refused. Full autonomy: nothing is asked twice.
         let looks = policy(Autonomy::ReadOnly);
@@ -1093,8 +1385,173 @@ mod tests {
         );
         assert_eq!(policy(Autonomy::Full).settles(&run), Some(sdk::Decision::AcceptForSession));
         // A server's tool is never taken at its word.
-        let served = sdk::Tool { mcp: true, ..read };
+        let served = sdk::Tool { mcp: true, ..read.clone() };
         assert_eq!((ask.settles(&served), looks.settles(&served)), (None, decline));
+        // Going online is asked about, short of full autonomy.
+        let web = tool("w", sdk::ToolKind::WebSearch, sdk::ToolStatus::Pending);
+        assert_eq!(
+            (ask.settles(&web), policy(Autonomy::Edits).settles(&web), looks.settles(&web)),
+            (None, None, decline)
+        );
+        // In Antigravity's own auto mode its review has spoken: what it still asks is the user's, a read too.
+        let reviewed = Policy { reviewed: true, ..policy(Autonomy::Auto) };
+        assert_eq!(
+            (reviewed.settles(&read), reviewed.settles(&edit(&inside)), reviewed.settles(&run)),
+            (None, None, None)
+        );
+        // The mode is another level's business only as far as that level goes.
+        let edits = Policy { reviewed: true, ..policy(Autonomy::Edits) };
+        assert_eq!(edits.settles(&read), accept);
+    }
+
+    #[test]
+    fn calls_are_named_as_the_app_knows_their_like() {
+        let named = |tool: &sdk::Tool| call_of(tool);
+        // A server's tool by its server and its own name; one that says no server by its name alone.
+        let served = sdk::Tool {
+            mcp: true,
+            server: Some("chrome-devtools".into()),
+            name: "list_pages".into(),
+            input: json!({ "page": 2 }),
+            ..tool("m", sdk::ToolKind::Execute, sdk::ToolStatus::InProgress)
+        };
+        assert_eq!(named(&served), ("mcp__chrome-devtools__list_pages".into(), json!({ "page": 2 })));
+        let unsorted = sdk::Tool { mcp: true, name: "mcp_files_list".into(), ..served.clone() };
+        assert_eq!(named(&sdk::Tool { server: None, ..unsorted }).0, "mcp_files_list");
+        // A tool of Antigravity's own that the app has no word for keeps its name, not the binary's sentence.
+        let own = sdk::Tool {
+            title: "Running html_render".into(),
+            name: "html_render".into(),
+            ..tool("o", sdk::ToolKind::Other, sdk::ToolStatus::InProgress)
+        };
+        assert_eq!(named(&own).0, "html_render");
+        assert_eq!(named(&tool("o", sdk::ToolKind::Other, sdk::ToolStatus::InProgress)).0, "Running a tool");
+        // A search of the web says what it looks for.
+        let web = sdk::Tool {
+            input: json!({ "query": "rust 2024" }),
+            ..tool("w", sdk::ToolKind::WebSearch, sdk::ToolStatus::InProgress)
+        };
+        assert_eq!(named(&web), ("WebSearch".into(), json!({ "query": "rust 2024" })));
+        // Another agent: what it is there for and what it is asked, one or several.
+        let one = sdk::Tool {
+            name: "invoke_subagent".into(),
+            input: json!({ "TypeName": "research", "Role": "Codebase Researcher", "Prompt": "Find the parser." }),
+            ..tool("a", sdk::ToolKind::Subagent, sdk::ToolStatus::InProgress)
+        };
+        let expected =
+            json!({ "description": "Codebase Researcher", "prompt": "Find the parser.", "subagent_type": "research" });
+        assert_eq!(named(&one), ("Agent".into(), expected));
+        let several =
+            json!({ "Subagents": [{ "Role": "Reader", "Prompt": "Read." }, { "Role": "Writer", "Prompt": "Write." }] });
+        let (_, input) = named(&sdk::Tool { input: several, ..one.clone() });
+        assert_eq!(input, json!({ "description": "Reader, Writer", "prompt": "Read.\n\nWrite." }));
+        let (_, input) = named(&sdk::Tool { input: Value::Null, ..one });
+        assert_eq!(input["description"], "invoke_subagent");
+    }
+
+    #[test]
+    fn a_command_left_running_goes_on_in_the_background() {
+        let mut mapper = Mapper::default();
+        mapper.map(sdk::Event::TurnStarted);
+        let mut build = sdk::Tool {
+            command: Some("cargo build".into()),
+            ..tool("c1", sdk::ToolKind::Execute, sdk::ToolStatus::InProgress)
+        };
+        let serve = sdk::Tool {
+            command: Some("serve".into()),
+            daemon: true,
+            ..tool("c2", sdk::ToolKind::Execute, sdk::ToolStatus::InProgress)
+        };
+        mapper.map(sdk::Event::Tool(build.clone()));
+        mapper.map(sdk::Event::Tool(serve));
+        // The turn ends over the build: it is said to go on. What was started to stay is not waited for.
+        let ended = mapper.map(completed(sdk::TurnStatus::Completed, "end_turn", None));
+        let going = AgentEvent::Background { id: "c1".into(), what: "cargo build".into(), ended: false };
+        assert!(
+            ended.contains(&going)
+                && !ended.iter().any(|e| matches!(e, AgentEvent::Background { id, .. } if id == "c2"))
+        );
+        assert_eq!(ended.last(), Some(&AgentEvent::TurnEnded { problem: None }));
+        // Its end answers the call it was, with no turn begun for it: nothing would end one.
+        (build.status, build.output, build.exit_code) = (sdk::ToolStatus::Completed, Some("done".into()), Some(0));
+        assert_eq!(
+            mapper.map(sdk::Event::Tool(build.clone())),
+            [
+                AgentEvent::ToolResult { id: "c1".into(), output: "done".into(), is_error: false },
+                AgentEvent::Background { id: "c1".into(), what: String::new(), ended: true }
+            ]
+        );
+        assert!(mapper.map(sdk::Event::Tool(build)).is_empty());
+        // The agent then goes on by itself, which is a turn like any other.
+        assert_eq!(mapper.map(sdk::Event::TurnStarted), [AgentEvent::Working, AgentEvent::ReplyStarted]);
+        let ended = mapper.map(completed(sdk::TurnStatus::Completed, "", None));
+        assert!(!ended.iter().any(|e| matches!(e, AgentEvent::Background { .. })));
+
+        // A turn that is stopped takes what it ran with it, also what an earlier turn left running.
+        mapper.map(sdk::Event::TurnStarted);
+        let test = sdk::Tool {
+            command: Some("cargo test".into()),
+            ..tool("c3", sdk::ToolKind::Execute, sdk::ToolStatus::InProgress)
+        };
+        mapper.map(sdk::Event::Tool(test.clone()));
+        assert!(
+            mapper.map(completed(sdk::TurnStatus::Completed, "end_turn", None)).contains(&AgentEvent::Background {
+                id: "c3".into(),
+                what: "cargo test".into(),
+                ended: false
+            })
+        );
+        mapper.map(sdk::Event::TurnStarted);
+        let stopped = mapper.map(completed(sdk::TurnStatus::Interrupted, "cancelled", None));
+        assert!(stopped.contains(&AgentEvent::Background { id: "c3".into(), what: String::new(), ended: true }));
+        assert!(mapper.running.is_empty() && mapper.lingering.is_empty());
+    }
+
+    #[test]
+    fn a_session_that_opens_says_what_the_account_offers_now() {
+        let dir = std::env::temp_dir().join(format!("atroxabot-agy-fresh-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let file = dir.join(KNOWN_FILE);
+        let level = |id: &str| sdk::Effort { id: id.into(), name: id.into() };
+        let model = |id: &str| sdk::Model { id: id.into(), name: id.to_uppercase(), description: String::new() };
+        let kept = sdk::Info {
+            version: "1.5.4".into(),
+            signed_in: true,
+            catalog: sdk::Catalog {
+                models: vec![model("pro"), model("old")],
+                model: "pro".into(),
+                efforts: vec![level("low"), level("high")],
+                effort: "high".into(),
+            },
+            efforts: vec![("pro".into(), vec![level("low"), level("high")]), ("old".into(), vec![level("low")])],
+            commands: Vec::new(),
+        };
+        keep_info(&file, "a", Some(&kept));
+        // After an update: a model went, one came, and the session (a continued one) is on the new one.
+        let now = sdk::Catalog {
+            models: vec![model("pro"), model("ultra")],
+            model: "ultra".into(),
+            efforts: vec![level("medium")],
+            effort: "medium".into(),
+        };
+        refresh_known(&file, "a", "1.5.12", &now);
+        let known = known_info(&file, "a").unwrap();
+        assert_eq!(known.version, "1.5.12");
+        let ids: Vec<&str> = known.catalog.models.iter().map(|model| model.id.as_str()).collect();
+        assert_eq!(ids, ["pro", "ultra"]);
+        assert_eq!(
+            (known.catalog.model.as_str(), known.catalog.effort.as_str()),
+            ("pro", "high"),
+            "its own pick stays"
+        );
+        let levels = |of: &str| known.efforts.iter().find(|(model, _)| model == of).map(|(_, levels)| levels.len());
+        assert_eq!((levels("pro"), levels("ultra"), levels("old")), (Some(2), Some(1), None));
+        // An account never asked is known from its first session; one that lists nothing changes nothing.
+        refresh_known(&file, "b", "1.5.12", &now);
+        assert_eq!(known_info(&file, "b").map(|info| info.catalog.model), Some("ultra".to_owned()));
+        refresh_known(&file, "a", "1.6.0", &sdk::Catalog::default());
+        assert_eq!(known_info(&file, "a"), Some(known));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -97,6 +97,15 @@ impl Shell {
         OutOfLimits::from_key(self.config.out_of_limits.as_deref())
     }
 
+    /// Whether a person has to send every message of a session on the
+    /// provider `connection`: an Antigravity account, by Google's terms
+    /// (the README's "What Google's terms allow"). Such a session never goes
+    /// on by itself after a usage limit, and never changes accounts by
+    /// itself: it stops there, and the user sends it on or moves it.
+    pub(super) fn hands_on(&self, connection: &str) -> bool {
+        self.config.connection(connection).is_some_and(|connection| connection.kind == ConnectionKind::Antigravity)
+    }
+
     /// Whether the providers `a` and `b` offer the same models: they are
     /// one, or two accounts (or Anthropic keys) of the same kind.
     pub(super) fn kin(&self, a: &str, b: &str) -> bool {
@@ -296,11 +305,13 @@ impl Shell {
         let Some(agent) = self.agent_of(session) else { return };
         // It was moved to another provider while the turn ran: the user chose
         // where it goes on, so it goes on there at once, whatever the settings say.
-        if agent.connection != account && self.out_until(&agent.connection).is_none() && tries <= TRIES {
+        let moved = agent.connection != account && !self.hands_on(&agent.connection);
+        if moved && self.out_until(&agent.connection).is_none() && tries <= TRIES {
             self.go_on(session, actions);
             return;
         }
-        if mode == OutOfLimits::Stop {
+        // An Antigravity account's is the user's to send on, whatever the settings say.
+        if mode == OutOfLimits::Stop || self.hands_on(&agent.connection) {
             return;
         }
         if tries > TRIES {
@@ -404,6 +415,10 @@ impl Shell {
             return;
         }
         let Some(agent) = self.agent_of(session) else { return };
+        // Moved to an Antigravity account while it waited: only the user sends it on there.
+        if self.hands_on(&agent.connection) {
+            return;
+        }
         let switching = self.out_of_limits() == OutOfLimits::Switch;
         if switching && self.fresh_account(&agent).is_some() {
             self.go_on(session, actions);
@@ -841,6 +856,40 @@ mod tests {
         shell.send("Try again", false, Vec::new(), &mut actions);
         shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
         assert_eq!(shell.threads[&session].tries, 0);
+    }
+
+    #[test]
+    fn an_antigravity_session_never_goes_on_or_changes_accounts_by_itself() {
+        for mode in OutOfLimits::ALL {
+            // Two Antigravity accounts, the second with usage left.
+            let first = Connection::antigravity("Antigravity");
+            let second = Connection { id: "agy-work".into(), name: "Work".into(), ..first.clone() };
+            let mut config = Config::default();
+            config.connections.extend([first.clone(), second.clone()]);
+            config.out_of_limits = Some(mode.key().to_owned());
+            let agent = Agent { connection: first.id.clone(), ..Agent::new("Scout") };
+            let mut shell = Shell::new(config, vec![agent], Vec::new());
+            let mut actions = Vec::new();
+            shell.start(&mut actions);
+            for account in [&first, &second] {
+                let offer = atroxabot_core::AntigravityInfo { signed_in: true, ..Default::default() };
+                shell.antigravity_info(&account.id, Ok(offer));
+            }
+            shell.send("Fix the bug", false, Vec::new(), &mut actions);
+            let session = shell.current.clone().expect("a session");
+            shell.agent_event(&session, AgentEvent::Remote("r1".into()), &mut actions);
+            actions.clear();
+            // Antigravity only refuses the turn, without saying until when.
+            shell.agent_event(&session, AgentEvent::LimitReached, &mut actions);
+            shell.agent_event(&session, AgentEvent::TurnEnded { problem: Some("refused".into()) }, &mut actions);
+            let thread = &shell.threads[&session];
+            assert!(sent(&actions).is_empty() && thread.resume.is_none(), "{mode:?}: it stops there");
+            assert_eq!(shell.agent_of(&session).map(|agent| agent.connection), Some(first.id.clone()), "{mode:?}");
+            assert_eq!(shell.next_wake(), None, "{mode:?}: nothing is tried again later");
+            // The user sends it on, or moves it, by hand.
+            shell.send("Go on", false, Vec::new(), &mut actions);
+            assert_eq!(sent(&actions), ["Go on"], "{mode:?}");
+        }
     }
 
     #[test]

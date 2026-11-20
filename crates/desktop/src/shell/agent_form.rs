@@ -373,8 +373,12 @@ pub(super) fn autonomy_hint(level: Autonomy, connection: Option<&Connection>) ->
         (Autonomy::Ask, Some(ConnectionKind::Antigravity)) => {
             "Reads freely; asks before it changes a file, runs a command or goes online."
         }
-        (Autonomy::Edits | Autonomy::Auto, Some(ConnectionKind::Antigravity)) => {
+        (Autonomy::Edits, Some(ConnectionKind::Antigravity)) => {
             "Also edits files in its folder without asking; asks for commands and for what reaches beyond it."
+        }
+        (Autonomy::Auto, Some(ConnectionKind::Antigravity)) => {
+            "Antigravity's own review lets through what is safe and asks about the rest; where the account \
+             has no such review, as Edit freely."
         }
         (Autonomy::Auto, _) => "With a Claude account. Here it edits freely and asks for the rest.",
         _ => level.hint(),

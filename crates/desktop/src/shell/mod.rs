@@ -413,9 +413,10 @@ impl Shell {
     /// How the Codex or Antigravity account `connection` stands.
     pub(super) fn standing(&self, connection: &Connection) -> Standing {
         let (answered, missing) = if connection.kind == ConnectionKind::Antigravity {
+            // One that is signed out says so; one that could not be asked (it crashed, or took too
+            // long) is not offered a sign-in for it.
             let state = self.antigravity.get(&connection.id);
-            let answered = matches!(state, Some(AntigravityAccount::Ready(_) | AntigravityAccount::Failed(_)));
-            (answered, matches!(state, Some(AntigravityAccount::Missing)))
+            (matches!(state, Some(AntigravityAccount::Ready(_))), matches!(state, Some(AntigravityAccount::Missing)))
         } else {
             let state = self.codex.get(&connection.id);
             let answered = matches!(state, Some(CodexAccount::Ready(_) | CodexAccount::Failed(_)));
@@ -1335,7 +1336,21 @@ impl Shell {
             AgentEvent::LimitReached => thread.limited = true,
             AgentEvent::Status(status) => thread.status = status,
             AgentEvent::Summarized(_) => thread.invalidate(),
-            AgentEvent::Remote(_) => actions.push(Action::SaveSession(Box::new(thread.session.clone()))),
+            AgentEvent::Remote(_) => {
+                actions.push(Action::SaveSession(Box::new(thread.session.clone())));
+                // An Antigravity that opened a session said what the account offers now (its models,
+                // after an update say), and that it is signed in: what is kept of it is read again.
+                let account = thread.session.account.clone();
+                let antigravity = self
+                    .config
+                    .connection(&account)
+                    .filter(|connection| connection.kind == ConnectionKind::Antigravity);
+                if let Some(connection) = antigravity
+                    && self.antigravity_asked.insert(account)
+                {
+                    actions.push(Action::ProbeAntigravity { connection: Box::new(connection), fresh: false });
+                }
+            }
             // Claude Code says what its context holds after the turn, which saved the session already.
             AgentEvent::Context(_) if !thread.busy => {
                 actions.push(Action::SaveSession(Box::new(thread.session.clone())));
@@ -3717,6 +3732,9 @@ mod tests {
         actions.clear();
         shell.focused(&mut actions);
         assert_eq!(asked(&actions, true), 1, "signed in since, perhaps");
+        // One that could not be asked is not offered a sign-in for it: only asking again helps.
+        shell.antigravity_info(&account.id, Err(AntigravityError::NoInfo("it did not answer in time".into())));
+        assert_eq!(shell.standing(&account), Standing::Unknown);
         shell.antigravity_info(&account.id, Ok(antigravity_offer()));
         assert_eq!(shell.standing(&account), Standing::SignedIn);
         actions.clear();
@@ -3740,6 +3758,23 @@ mod tests {
         assert_eq!(sent, Some((String::new(), "high".into(), ConnectionKind::Antigravity)));
         // Its limits are not the app's to ask about: Antigravity says nothing of them to a client.
         assert!(!shell.can_check(&account));
+        // The session that opens says what the account offers now: what is kept of it is read again,
+        // which starts nothing.
+        let session = shell.current.clone().unwrap();
+        actions.clear();
+        shell.agent_event(&session, AgentEvent::Remote("s1".into()), &mut actions);
+        assert_eq!((asked(&actions, false), asked(&actions, true)), (1, 0));
+        shell.antigravity_info(&account.id, Ok(antigravity_offer()));
+        // "Send now" puts what waits into the turn that runs and stops nothing: Antigravity takes it at
+        // once, and what the turn started (a build, another agent) goes on.
+        shell.agent_event(&session, AgentEvent::Working, &mut actions);
+        shell.agent_event(&session, AgentEvent::ReplyStarted, &mut actions);
+        shell.send("use pnpm", false, Vec::new(), &mut actions);
+        actions.clear();
+        shell.hurry(&session, &mut actions);
+        assert!(matches!(&actions[..], [Action::FollowUp { message, .. }] if message.text == "use pnpm"));
+        assert!(!shell.threads[&session].stopping);
+        shell.agent_event(&session, AgentEvent::TurnEnded { problem: None }, &mut actions);
         // The refresh icon starts it to ask anew.
         actions.clear();
         shell.read_anew(&account, &mut actions);

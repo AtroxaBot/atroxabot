@@ -261,7 +261,8 @@ pub enum Action {
     /// Ask the Claude Agent process of this session, if it has one, what its context holds.
     AskContext(String),
     /// Stop the subagent, or the command in the background, that the tool call `call` of the session's
-    /// Claude Agent process started; the turn and every other task go on.
+    /// Claude Agent process started; the turn and every other task go on. Of an Antigravity process,
+    /// between turns: the commands it left running, all of them.
     StopTask {
         /// The session.
         session: String,
@@ -1054,13 +1055,21 @@ impl App {
                     live.ask_context();
                 }
             }
-            Action::StopTask { session, call } => {
-                if let Some(Live::Claude(agent)) = self.live.get(&session)
-                    && !agent.stop_task(&call)
-                {
-                    crate::log::error(format!("session {session}: Claude Code named no task for the call {call}"));
+            Action::StopTask { session, call } => match self.live.get(&session) {
+                Some(Live::Claude(agent)) => {
+                    if !agent.stop_task(&call) {
+                        crate::log::error(format!("session {session}: Claude Code named no task for the call {call}"));
+                    }
                 }
-            }
+                // Between turns Antigravity's stop ends the commands it left running, all of them: it
+                // has none for one alone. The one asked about is taken off the list here; the others
+                // as Antigravity says their end.
+                Some(Live::Antigravity(agent)) => {
+                    agent.interrupt();
+                    self.emitter(&session)(AgentEvent::Background { id: call, what: String::new(), ended: true });
+                }
+                Some(Live::Codex(_)) | None => {}
+            },
             Action::LoadSession(session) => {
                 if let Some(store) = self.sessions_dir.clone().map(SessionStore::at) {
                     self.spawn(move || WorkerEvent::SessionLoaded {

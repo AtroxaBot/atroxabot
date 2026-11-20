@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::cli::{build_args, command, profile_env};
+use crate::cli::{build_args, command, forget_conversation, profile_env, reclaim, run_dir, temp_env};
 use crate::machine::{Command, Machine, Message, NOT_SIGNED_IN, Output, Part, initialize_params, request_line};
 use crate::parse::{self, Incoming, Refusal, Settings, field, opt_text};
 use crate::{Decision, Effort, Error, Event, Info, Input, Options, SlashCommand, find_cli};
@@ -60,6 +60,8 @@ struct Shared {
     closed: AtomicBool,
     /// The end of what the binary wrote to stderr, to say why it stopped.
     said: Mutex<VecDeque<String>>,
+    /// The process's own temporary folder, removed once it has ended.
+    temp: Mutex<Option<PathBuf>>,
 }
 
 /// Locks `mutex`; a panic in the caller's callback must not take the session down with it.
@@ -67,8 +69,11 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Starts `agy acp` for `options`, its input and output piped, and says which folder the session works in.
-fn launch(options: &Options, stderr: Stdio) -> Result<(Child, String), Error> {
+/// A started `agy acp`: the process, the folder its session works in, and its own temporary folder.
+type Launched = (Child, String, Option<PathBuf>);
+
+/// Starts `agy acp` for `options`, its input and output piped.
+fn launch(options: &Options, stderr: Stdio) -> Result<Launched, Error> {
     let path = match &options.cli_path {
         Some(path) => path.clone(),
         None => find_cli().ok_or(Error::NotFound)?,
@@ -93,8 +98,23 @@ fn launch(options: &Options, stderr: Stdio) -> Result<(Child, String), Error> {
     };
     // The protocol wants the folder named in full.
     let cwd = std::path::absolute(&cwd).unwrap_or(cwd);
-    let child = command.spawn().map_err(Error::Spawn)?;
-    Ok((child, cwd.to_string_lossy().into_owned()))
+    // What it unpacks at its start goes where it can be taken away again, whatever becomes of the process.
+    let temp = match &options.temp {
+        Some(root) => Some(run_dir(root).map_err(Error::Io)?),
+        None => None,
+    };
+    if let Some(temp) = &temp {
+        command.envs(temp_env(temp));
+    }
+    match command.spawn() {
+        Ok(child) => Ok((child, cwd.to_string_lossy().into_owned(), temp)),
+        Err(error) => {
+            if let Some(temp) = &temp {
+                reclaim(temp);
+            }
+            Err(Error::Spawn(error))
+        }
+    }
 }
 
 impl Session {
@@ -113,7 +133,7 @@ impl Session {
     /// [`Error::InvalidOption`] for a refused option, [`Error::Spawn`] when the binary cannot be started, and
     /// [`Error::Io`] when the first write or a reader thread fails.
     pub fn connect(options: &Options, on_event: impl FnMut(Event) + Send + 'static) -> Result<Self, Error> {
-        let (mut child, cwd) = launch(options, Stdio::piped())?;
+        let (mut child, cwd, temp) = launch(options, Stdio::piped())?;
         let (stdin, stdout, stderr) = (child.stdin.take(), child.stdout.take(), child.stderr.take());
         let callback: Callback = Box::new(on_event);
         let mut machine = Machine::new(options, cwd);
@@ -127,6 +147,7 @@ impl Session {
             failure: Mutex::new(None),
             closed: AtomicBool::new(false),
             said: Mutex::new(VecDeque::new()),
+            temp: Mutex::new(temp),
         });
         // From here on an early return drops the session, which stops the process.
         let session = Self { shared };
@@ -396,6 +417,10 @@ impl Shared {
         }
         while !self.wait_exit(Duration::MAX) {}
         let exit_code = lock(&self.child).try_wait().ok().flatten().and_then(|status| status.code());
+        // It is gone: so is what it unpacked, which a killed one leaves behind.
+        if let Some(temp) = lock(&self.temp).take() {
+            reclaim(&temp);
+        }
         // Let the last error lines through first; bounded, because a grandchild may keep that pipe open.
         let _ = stderr_closed.recv_timeout(Duration::from_secs(1));
         let failure = lock(&self.failure).take();
@@ -497,12 +522,12 @@ fn base64(bytes: &[u8]) -> String {
 /// [`Error::Spawn`], [`Error::Io`]), or ended first, refused or did not answer in time ([`Error::NoInfo`]). An
 /// account that is not signed in is no error: [`Info::signed_in`] says so.
 pub fn info(options: &Options, timeout: Duration) -> Result<Info, Error> {
-    let (mut child, cwd) = launch(options, Stdio::null())?;
+    let (mut child, cwd, temp) = launch(options, Stdio::null())?;
     let (stdin, stdout) = (child.stdin.take(), child.stdout.take());
     let (sender, heard) = mpsc::channel();
     // Ends the process when dropped, however this function returns.
-    let mut probe =
-        Probe { child, stdin, heard, next_id: 1, deadline: Instant::now().checked_add(timeout), commands: Vec::new() };
+    let deadline = Instant::now().checked_add(timeout);
+    let mut probe = Probe { child, stdin, heard, next_id: 1, deadline, commands: Vec::new(), temp, opened: None };
     let spawned = thread::Builder::new().name("agy-info".into()).spawn(move || {
         let Some(stdout) = stdout else { return };
         let mut reader = BufReader::new(stdout);
@@ -554,6 +579,10 @@ struct Probe {
     deadline: Option<Instant>,
     /// The slash commands the binary said it takes.
     commands: Vec<SlashCommand>,
+    /// The process's own temporary folder, removed once it has ended.
+    temp: Option<PathBuf>,
+    /// The session it opened to ask, and the account's folder it is kept in: forgotten once it has ended.
+    opened: Option<(Option<PathBuf>, String)>,
 }
 
 impl Probe {
@@ -578,6 +607,8 @@ impl Probe {
             Err(refusal) => return Err(said(refusal)),
         };
         let session = opt_text(&opened, "sessionId").ok_or("it opened a session without naming it")?;
+        // Nothing is said in it: it is not left in the account's history.
+        self.opened = Some((options.profile.clone(), session.clone()));
         let mut settings = Settings::of(&opened);
         let catalog = settings.catalog.clone();
         let mut efforts: Vec<(String, Vec<Effort>)> = Vec::new();
@@ -658,6 +689,12 @@ impl Drop for Probe {
         }
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(temp) = self.temp.take() {
+            reclaim(&temp);
+        }
+        if let Some((profile, session)) = self.opened.take() {
+            forget_conversation(profile.as_deref(), &session);
+        }
     }
 }
 
@@ -817,6 +854,7 @@ mod tests {
             failure: Mutex::new(None),
             closed: AtomicBool::new(false),
             said: Mutex::new(VecDeque::new()),
+            temp: Mutex::new(None),
         }))
     }
 

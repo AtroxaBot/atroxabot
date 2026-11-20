@@ -324,9 +324,12 @@ page lists every worktree on disk, with what it holds and how much room it takes
   | *Read only* | Looks but never touches: what would need approval is refused. | Refuses what would change something. |
 
   An Antigravity account asks about what it does, and the level answers for you: reading and searching
-  at every level; changes to files in the session's folder (and the agent's notes) from *Edit freely*
-  on; everything at *Full autonomy*; and at *Read only* whatever is not reading is refused. What is
-  left is asked. A tool of an MCP server is always asked about, short of *Full autonomy*.
+  files at every level; changes to files in the session's folder (and the agent's notes) from *Edit
+  freely* on; everything at *Full autonomy*; and at *Read only* whatever is not reading is refused. What
+  is left is asked: commands, going online (a web search too), and a tool of an MCP server. *Auto* uses
+  Antigravity's own Auto mode where the account offers it (Antigravity 1.5.4 and later, not on every
+  account): its review lets through edits and what it finds safe, and whatever it still asks about is
+  yours to decide, a read included. Where it is not offered, *Auto* is *Edit freely*.
 
   The app's own data folder, which holds your API keys, is off limits to every agent's file tools.
 - **Questions.** When an agent asks you something (Claude's `AskUserQuestion`, or an API agent's `ask`:
@@ -409,6 +412,10 @@ Each session has its own provider, model and effort.
     the conversation. The agent's next sessions start there too; its other sessions stay where they are.
     With none left, it waits for the first to lift.
   - *Stop*.
+
+  An Antigravity account's session always stops, whatever is chosen here: Google's terms want a person
+  to send every message, and forbid changing accounts automatically (see
+  [Antigravity accounts](#antigravity-accounts)).
 
   A session you moved to another account while its turn ran goes on there at once when the old one
   runs out, whichever of these is chosen; with that one out too, the choice above goes for that one.
@@ -748,49 +755,152 @@ are written from Codex's own protocol types and were not run against a signed-in
 
 ## Antigravity accounts
 
-An Antigravity account is the Antigravity CLI (`agy`) you installed, driven the way an editor drives it:
+An Antigravity account is the Antigravity CLI (`agy`) you installed, driven the way an editor drives it.
+What an app may do with it is Google's to say, and Google's rules are not Anthropic's or OpenAI's:
+[What Google's terms allow](#what-googles-terms-allow) below says what they are, where they are written,
+and what the app does and leaves alone because of them. **Read it before you connect a Google account:
+the terms name suspension of the account as what a breach costs.**
 
 - AtroxaBot **starts the Antigravity binary you installed, as published** (`agy acp`, which speaks the
   Agent Client Protocol over its standard input and output), found on your `PATH` or where Google's
   installer puts it (`%LOCALAPPDATA%\agy\bin` on Windows, `~/.local/bin` elsewhere). Only the native
-  binary is run, never a `.cmd` launcher. It tells Antigravity it is AtroxaBot, nothing else; an older
-  Antigravity may offer such a client fewer models.
+  binary is run, never a `.cmd` launcher. It tells Antigravity it is AtroxaBot, nothing else. Google
+  offers other makers' models only to the editors it lists (JetBrains' IDEs, Android Studio, Zed, Xcode);
+  the app does not say it is one of them, so it is offered what any client is: the Gemini models.
 - **Installing** is Google's own installer (`irm https://antigravity.google/cli/install.ps1 | iex` on
   Windows, `curl -fsSL https://antigravity.google/cli/install.sh | bash` elsewhere), started by *Install*
   in a terminal you see. The app never downloads or places Antigravity itself.
-- AtroxaBot **never handles your sign-in**. *Sign in* opens Antigravity's own `agy acp --login` in a
-  terminal; the app never asks Antigravity to sign in (it sends no `authenticate`), and never reads or
-  stores its credentials. That is also why an Antigravity account shows **no plan limits**: Antigravity
-  tells a client none, and reading them the way its own app does takes the sign-in itself.
+- **Signing in** is Antigravity's own. *Sign in* opens its `agy acp --login` in a terminal. A session
+  that Antigravity tells it needs a sign-in asks it to use the one it has (the protocol's `authenticate`,
+  with `oauth-personal`, which is what Google's page on `agy acp` has a client do): signed in, nothing
+  more happens; not signed in, Antigravity opens Google's sign-in in your browser and the session goes
+  on once you are through with it, or the session says that you are not signed in. The check in
+  Settings asks that only of an account you added, which cannot open a browser; your first account is
+  never asked there, so that looking at the settings opens no page you did not ask for. The sign-in
+  itself never leaves Antigravity: the app never reads, copies, stores or sends it.
+- **No plan limits.** Antigravity tells a client none. Other apps show them by taking the sign-in out of
+  Antigravity's files and asking Google with it, which Google's terms forbid, so the app does not. What
+  Google allows is asking Antigravity's own `/usage` when you look, never on a timer; the app does not
+  do that yet.
 - **Several accounts**: the first is whoever `agy` is signed in as in your terminal, with its settings
   (`~/.gemini`). Each account you add is a folder of its own (`--gemini-dir`, under
   `~/.atroxabot/antigravity/<id>/`), with its own sign-in, settings and conversations. Antigravity keeps
   the Google sign-in of every folder in one entry of the system's keyring, and keeps it in the folder
   only when it takes itself to be reached over SSH, so an added account is started with `SSH_CONNECTION`
   set. Google documents no way to keep two accounts apart: this one may stop working with a later
-  Antigravity. The first account is started plainly.
-- A session is an Antigravity session, resumed by its id; the agent's instructions are added to
-  Antigravity's own system prompt where it takes them. The app's MCP servers are given to Antigravity for
-  the run; the skill library is not (Antigravity has no way to be shown one for a run). Nothing is
-  written to an account's own configuration.
-- **Approvals.** Antigravity has no sandbox or permission mode a client sets: it asks about what it does,
-  and the agent's autonomy answers what it settles (see *Autonomy*). What is left is asked on the
-  approval card.
+  Antigravity. The first account is started plainly. Which account a session uses is yours to choose:
+  the app never changes it by itself.
+- **What the app touches in an account's folder** is two things, and nothing of a sign-in. An account
+  you added gets copies of your own instructions for every Antigravity (`AGENTS.md` and `GEMINI.md` from
+  your `~/.gemini`), where Antigravity looks for that account's; they are brought up to date each time a
+  session starts, and one you wrote or changed in the account's folder is yours and stays as it is
+  (`.atroxabot-rules.json` there says which are copies). And the empty conversation that asking what an
+  account offers leaves behind is removed again, by its id, in your first account too. Nothing else in
+  an account's folder is read or written.
+- A session is an Antigravity session, resumed by its id. When Antigravity no longer has the
+  conversation, the one started in its place is told what was said so far, with your next message. The
+  agent's instructions are added to Antigravity's own system prompt where it takes them. The app's MCP
+  servers are given to Antigravity for the run (one reached over HTTP has it started with
+  `--process-per-session`, as Google's page says it must be); the skill library is not (Antigravity has
+  no way to be shown one for a run).
+- **Approvals.** Antigravity asks about what it does, and the agent's autonomy answers what it settles
+  (see *Autonomy*); what is left is asked on the approval card. An agent on *Auto* has its session put
+  in Antigravity's own `auto` mode where that is offered; every other level keeps it in `default`.
 - A message sent while Antigravity works is put into the running turn, where it reads it at its next
-  step; one it does not take in is sent again as the next message. *Send now* stops the turn and sends it
-  right after.
-- **It starts slowly.** Antigravity unpacks itself every time it starts, which can take a minute: a
-  session's first message says so while it waits, and the session's process is kept a while after you
-  look elsewhere, as every account's is. What an account offers (its models and their levels) is asked
-  once and kept in `antigravity.json`, so opening the app starts nothing; the refresh icon on its row in
-  Settings, Providers asks anew.
-- When an account's quota is used up Antigravity only refuses the turn, without saying until when: the
-  session then does what *When an account runs out* says, trying again every 15 minutes.
+  step; one it does not take in is sent again as the next message. *Send now* puts it in at once and
+  stops nothing: Antigravity takes it up right away, and the commands and agents the turn started go on.
+- **What it leaves running.** A command that outlives its turn (a build, a test run) is listed in the
+  side panel under *In the background* until Antigravity says it ended; the session's process is kept
+  for it, and Antigravity goes on by itself when it is done. Between turns its stop icon there ends what
+  runs, all of it at once (Antigravity has no way to end one alone). A command started to stay (a
+  server) is not waited for.
+- **Its tools by their names.** A tool of an MCP server shows as that server's tool, also when
+  Antigravity reaches it through its own `call_mcp_tool`; a web search shows as one; another agent it
+  starts shows what it is there for and what it was asked.
+- **It starts slowly.** Antigravity unpacks itself every time it starts, about a gigabyte, which can
+  take a minute: a session's first message says so while it waits, and the session's process is kept a
+  while after you look elsewhere, as every account's is. It unpacks into a folder of the app's
+  (`cache/antigravity/`, one folder per process), which is removed when the process has ended: a process
+  that had to be ended cannot clean up after itself, and would leave that gigabyte in your temporary
+  folder each time. What an earlier run left there is removed at the next start.
+- **What an account offers** (its models and their levels) is asked once and kept in
+  `antigravity.json`, so opening the app starts nothing. Every session that opens brings the list up to
+  date (after Antigravity updated itself, say), and the refresh icon on the account's row in Settings,
+  Providers asks anew.
+- **When an account's quota is used up** Antigravity refuses the turn, and the session stops there and
+  says so, whatever *When an account runs out* is set to. It neither tries again later nor moves to
+  another account by itself: Google's terms want a person to send every message and forbid changing
+  accounts automatically. You send it on, or move it to another provider, yourself.
 
-`crates/antigravity` is the transport. It is written from the Agent Client Protocol and from how other
-clients drive `agy acp`, and **has not been run against the real binary yet**: expect rough edges. We know
-of no page of Google's on how other apps may drive `agy acp`; read Antigravity's terms yourself before
-distributing the app.
+### What Google's terms allow
+
+Read on 2026-11-20; they change, so read them again before you rely on this. Nobody at Google has
+looked at AtroxaBot or approved it.
+
+**What is written.**
+
+- [Antigravity's Additional Terms](https://antigravity.google/terms), section 6, forbid "using the
+  Service in connection with products not provided by us", and say: "Using third party software, tools,
+  or services to access the Service (e.g. using OpenClaw with Antigravity OAuth) is a breach of this
+  Agreement", for which an Antigravity or Gemini CLI account may be suspended or ended. The terms do not
+  mention `agy acp`, editors or the Agent Client Protocol.
+- [Antigravity's FAQ](https://antigravity.google/docs/faq) says the same of other coding agents used
+  with an Antigravity login, says that wrapping `agy` inside another coding agent or app and switching
+  accounts automatically are not supported on consumer plans, and names an API key (Google AI Studio or
+  Gemini Enterprise) as the way to use Gemini from another maker's agent.
+- Google's page on [`agy acp`](https://antigravity.google/docs/ide/extensions/acp/) says "Any ACP client
+  can launch Antigravity CLI", that it uses the sign-in you made with `agy` or `agy acp --login`, and
+  that without one "the client can ask you to sign in" with `oauth-personal` (a Google account in the
+  browser), a Gemini API key (`GEMINI_API_KEY`) and others. It lists the flags the app passes, and the
+  editors that are offered other makers' models. See also
+  [the CLI's page](https://antigravity.google/docs/cli/acp/).
+
+**How these have been explained.** Read to the letter, section 6 forbids every app that is not
+Google's; the page on `agy acp` invites any client. People answering for the project on
+[its issue tracker](https://github.com/google-antigravity/antigravity-cli/issues/1493) and on
+[Google's developer forum](https://discuss.ai.google.dev/t/personal-app-using-the-official-agy-acp-binary-with-google-ai-pro-permitted/198889)
+([more](https://discuss.ai.google.dev/t/is-a-desktop-app-that-runs-the-official-agy-acp-for-several-supervised-coding-tasks-allowed-on-a-personal-plan/199703),
+[more](https://discuss.ai.google.dev/t/an-acp-service-compliance-question/200200),
+[more](https://discuss.ai.google.dev/t/is-a-desktop-plugin-allowed-to-launch-the-official-agy-acp-server-with-the-users-own-google-sign-in/200702))
+drew the line in October and November 2026 as below. Those answers are not part of the terms, the
+pages do not show who their authors work for, and an older answer was contradicted by later ones.
+
+The two that say most are about another app, T3 Code
+([the first](https://discuss.ai.google.dev/t/tos-clarification-is-t3-code-official-antigravity-acp-agent-permitted-under-the-antigravity-terms-of-service/192027),
+[the second](https://discuss.ai.google.dev/t/conflicting-guidance-on-using-t3-code-with-personal-google-ai-subscriptions/197131)).
+They call it permitted for one person's own interactive work, and give the reason as how it is built,
+not who built it: it talks to Google's unmodified ACP agent over the protocol, and that agent signs in
+by itself, "rather than scraping credentials or driving the desktop app externally". That is how
+AtroxaBot is built too. They name the agent as the ACP Registry's `antigravity-acp`; a later answer
+says an installed `agy acp` stands the same. They add that such a client is offered only the Gemini
+models of your plan, that posts on social media are not policy, and that a breach costs the Antigravity
+and Gemini CLI access, not the whole Google account. Whether this holds for every client built this
+way, or only for those named, was asked there twice and not answered.
+
+| | Said to be | AtroxaBot |
+| --- | --- | --- |
+| One person's own app starting the unmodified `agy acp` and talking to it, with that person driving each session | Allowed; no approval or listing needed | This is what it does |
+| The sign-in: `agy acp --login`, or the client asking for `oauth-personal` | Allowed | Both, see *Signing in* above |
+| Reading Antigravity's stored sign-in, or using it outside the binary (how other apps read plan limits) | Forbidden | Never |
+| Asking Antigravity's own `/usage` | Allowed when the user looks, not on a timer | Not done yet |
+| Several sessions at once, each started by the user | Allowed; they share one quota | Yes |
+| Messages nobody sent: a session that goes on by itself, a loop, something that runs unattended | Forbidden with a Google account sign-in | An Antigravity session never goes on by itself, see *When an account's quota is used up* |
+| Changing accounts automatically | Forbidden | Never: you choose the account |
+| Antigravity as the engine behind another coding agent | Forbidden | Nothing in the app does this |
+| An agent that works without asking each time (auto mode, permission rules) | Allowed in a session of your own | The agent's autonomy, see *Approvals* |
+| A commercial plugin for another kind of program that downloads `agy` and uses it as its engine | Forbidden, also with the binary unmodified | The app is free and open source, installs nothing itself, and is for the same work `agy` is: but it is not a code editor, which is what `agy acp` was said to be for |
+| Instructions of the app's added to Antigravity's system prompt | Asked, not answered | The agent's own instructions are added |
+| Saying the client is another one, to be offered more models | Not asked | Never: it says AtroxaBot |
+| Keeping two accounts apart with `SSH_CONNECTION` | Not documented, not asked | Done for accounts you add |
+
+**What that leaves.** The app is built to stay on the allowed side of that line, and the rows that
+nobody answered are real doubts. Using a Google account through AtroxaBot is your own decision and at
+your own risk. The way Google names for apps that are not its own carries none: add Gemini as an API
+provider, with a key from Google AI Studio.
+
+`crates/antigravity` is the transport. It is written from the Agent Client Protocol, from Google's pages
+above and from how other clients drive `agy acp`, and **has not been run against the real binary yet**:
+expect rough edges.
 
 ## For developers
 
@@ -879,11 +989,12 @@ Everything lives in `~/.atroxabot/`:
 | `icons/` | Your own pictures of providers (see *Provider marks*). The app only reads it. |
 | `attachments/` | Pictures you pasted into a message, one PNG each. |
 | `library/` | The installed skills (`skills/<name>/`), laid out as a Claude Code plugin (`.claude-plugin/plugin.json`), and `library.json`: the repositories you look in and where each skill came from. A skill folder you put in `skills/` yourself works too. |
+| `cache/antigravity/run-*/` | What each running Antigravity process unpacked, removed when it ends; leftovers are removed at the next start. |
 | `cache/repositories/` | The last download of each repository looked at, read again on the next look. |
 | `worktrees/<repository>-<session id>/` | The git worktree of each session that works in one. The app makes and removes them; agents' file tools may work in them as in any folder. |
 | `claude/<id>/` | The Claude Code configuration folder of each extra Claude account. Claude Code owns what is in it. Removing an account in Settings leaves the folder, and so its sign-in, where it is. |
 | `codex/<id>/` | The Codex home of each extra Codex account. Codex owns what is in it. Removing an account in Settings leaves the folder, and so its sign-in, where it is. |
-| `antigravity/<id>/` | The folder of each extra Antigravity account. Antigravity owns what is in it. Removing an account in Settings leaves the folder, and so its sign-in, where it is. |
+| `antigravity/<id>/` | The folder of each extra Antigravity account. Antigravity owns what is in it, but for the copies of your own `AGENTS.md` and `GEMINI.md` the app keeps there (`.atroxabot-rules.json` says which they are). Removing an account in Settings leaves the folder, and so its sign-in, where it is. |
 | `antigravity.json` | What each Antigravity account offered when it was last asked (its models, their levels, its commands), so that starting the app starts no Antigravity. Nothing of a sign-in is in it. |
 | `desktop.log`, `desktop-crash.log`, `desktop.lock` | The app's log (every time an agent's process ended unexpectedly is in it, with the last thing it said about why), crash reports, and what keeps it to one running copy. |
 
@@ -948,11 +1059,15 @@ Deliberate, for now.
   `/compact` is not sent to Codex (it summarises by itself), the context's breakdown and a reply's cost
   are not known for it, and its sign-in status is read when the app starts and when you come back to the
   settings.
-- **Antigravity accounts**: not run against the real binary yet (see
-  [Antigravity accounts](#antigravity-accounts)). Its plan limits, who is signed in, a reply's cost and
-  the context's breakdown are not known for it; its sub-agents show as one call with what they returned;
-  the skill library is not given to it; and it takes up to a minute to start. Whether it is signed in is
-  read when you come back to the settings or click the account's refresh icon.
+- **Antigravity accounts**: not run against the real binary yet, and what Google's terms allow an app
+  like this one is not settled (see [Antigravity accounts](#antigravity-accounts)). Its plan limits, who
+  is signed in, a reply's cost and the context's breakdown are not known for it; its sub-agents show as
+  one call with what they returned; the skill library is not given to it; it takes up to a minute to
+  start; and a session a used-up quota stopped never goes on by itself. Whether it is signed in is read
+  when you come back to the settings or click the account's refresh icon, and for your first account
+  that check does not ask Antigravity to use its sign-in: should it say "not signed in" although you
+  are, send a message, which does. An error of the model's provider that Antigravity writes as its
+  reply is shown as a reply, not as a failed turn.
 - **Worktrees**: merged work is recognised from what your repository knows, so a pull request merged on
   the server counts once you have fetched or pulled (the app does not fetch); until then the
   unused-worktree rule cleans it up. What git ignores in a worktree (build output, a local `.env`) goes

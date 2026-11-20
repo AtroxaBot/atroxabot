@@ -17,8 +17,13 @@ const CLIENT_TITLE: &str = "AtroxaBot";
 const PROTOCOL: u64 = 1;
 /// JSON-RPC's code for a method the receiver does not have.
 const METHOD_NOT_FOUND: i64 = -32601;
+/// The mode a session works in when the one chosen is not on offer: the binary asks before it acts.
+const DEFAULT_MODE: &str = "default";
 /// What a session that needs a sign-in ends with.
 pub(crate) const NOT_SIGNED_IN: &str = "Antigravity is not signed in";
+/// What comes before and after what was said in a conversation the binary could not continue.
+const CATCH_UP: &str = "(You are taking over a conversation. What was said so far:)";
+const CATCH_UP_END: &str = "(Now the user says:)";
 
 /// One piece of a message, read and ready to send.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,6 +109,8 @@ enum Awaiting {
     Model(String),
     /// The answer to setting this level of thinking.
     Effort(String),
+    /// The answer to setting this mode.
+    Mode(String),
     /// The answer to `session/prompt`: the agent is done with that message.
     Prompt,
 }
@@ -144,10 +151,14 @@ pub(crate) struct Machine {
     /// The models and levels the binary would not take. They are not asked for again until the caller chooses
     /// anew.
     refused: Vec<String>,
+    /// The modes the binary would not take: not asked for again.
+    no_mode: Vec<String>,
     /// A sign-in was asked of the binary already.
     authenticated: bool,
     /// A session is being continued by having its history told again, which is not reported.
     loading: bool,
+    /// The conversation to continue could not be: the next message says what was said in it.
+    catching_up: bool,
     /// A turn runs.
     turn: bool,
     /// The messages the agent has not answered yet. A turn with none is one the agent began by itself.
@@ -183,8 +194,10 @@ impl Machine {
             model: String::new(),
             tuning: false,
             refused: Vec::new(),
+            no_mode: Vec::new(),
             authenticated: false,
             loading: false,
+            catching_up: false,
             turn: false,
             prompts: 0,
             stopping: false,
@@ -211,6 +224,10 @@ impl Machine {
         }
         match parse::parse_line(line) {
             Incoming::Nothing => {}
+            // Asked to sign in, it shows Google's page and answers once the user is through with it.
+            Incoming::SignInLink if self.awaiting.values().any(|asked| matches!(asked, Awaiting::Authenticate)) => {
+                out.events.push(Event::SigningIn);
+            }
             Incoming::SignInLink => self.signed_out(&mut out),
             Incoming::Response { id, outcome } => {
                 if let Some(awaiting) = self.awaiting.remove(&id) {
@@ -345,6 +362,7 @@ impl Machine {
         };
         if !self.can.resume && !self.can.load {
             self.options.resume = None;
+            self.catching_up = true;
             out.events.push(Event::Warning(
                 "this Antigravity cannot continue a conversation: a new one is started".to_owned(),
             ));
@@ -379,6 +397,7 @@ impl Machine {
             (Awaiting::Open { resume: true }, Err(refusal)) => {
                 self.loading = false;
                 self.options.resume = None;
+                self.catching_up = true;
                 let why = refusal.message;
                 out.events.push(Event::Warning(format!(
                     "the conversation could not be continued ({why}): a new one is started"
@@ -425,6 +444,26 @@ impl Machine {
                 }
                 self.flush(out);
             }
+            (Awaiting::Mode(mode), outcome) => {
+                self.tuning = false;
+                match outcome {
+                    Ok(answer) => {
+                        self.settings.mode.clone_from(&mode);
+                        self.settings.update(field(&answer, "configOptions"));
+                        if self.settings.mode != mode {
+                            // It said yes and kept its own: asking again would go on for ever.
+                            self.no_mode.push(mode);
+                        }
+                        out.events.push(Event::Mode(self.settings.mode.clone()));
+                    }
+                    Err(refusal) => {
+                        let why = refusal.message;
+                        out.events.push(Event::Warning(format!("Antigravity did not take the mode {mode}: {why}")));
+                        self.no_mode.push(mode);
+                    }
+                }
+                self.flush(out);
+            }
             (Awaiting::Prompt, outcome) => self.prompted(outcome, out),
         }
     }
@@ -453,12 +492,15 @@ impl Machine {
             version: self.can.version.clone(),
             catalog: self.settings.catalog.clone(),
         });
+        if !self.settings.mode.is_empty() {
+            out.events.push(Event::Mode(self.settings.mode.clone()));
+        }
         self.session = Some(session);
         self.flush(out);
     }
 
-    /// Sets the model and the level the caller chose, where they are not in force: one request at a time, the
-    /// level after the model, whose levels it is one of. Says whether a request went out.
+    /// Sets the model, the level and the mode the caller chose, where they are not in force: one request at
+    /// a time, the level after the model, whose levels it is one of. Says whether a request went out.
     fn tune(&mut self, out: &mut Output) -> bool {
         let session = self.session.clone().unwrap_or_default();
         let model = filled(self.options.model.as_ref()).filter(|model| *model != self.model);
@@ -480,6 +522,22 @@ impl Machine {
         if let Some((effort, option)) = wanted {
             let params = json!({"sessionId": session, "configId": option, "value": effort});
             out.lines.push(self.request("session/set_config_option", params, Awaiting::Effort(effort)));
+            self.tuning = true;
+            return true;
+        }
+        // The mode chosen where the session offers it, and the one that asks first where it does not.
+        let offered = |mode: &String| self.settings.modes.contains(mode);
+        let mode = filled(self.options.mode.as_ref())
+            .map(|mode| if offered(&mode) { mode } else { DEFAULT_MODE.to_owned() })
+            .filter(|mode| *mode != self.settings.mode && offered(mode) && !self.no_mode.contains(mode));
+        if let Some(mode) = mode {
+            let (method, params) = match &self.settings.mode_option {
+                Some(option) => {
+                    ("session/set_config_option", json!({"sessionId": session, "configId": option, "value": mode}))
+                }
+                None => ("session/set_mode", json!({"sessionId": session, "modeId": mode})),
+            };
+            out.lines.push(self.request(method, params, Awaiting::Mode(mode)));
             self.tuning = true;
             return true;
         }
@@ -512,7 +570,14 @@ impl Machine {
 
     /// Gives the agent a message. While a turn runs the binary puts it into that turn.
     fn prompt(&mut self, message: &Message, out: &mut Output) {
-        let params = json!({"sessionId": self.session, "prompt": message.blocks(self.can.images)});
+        let mut blocks = message.blocks(self.can.images);
+        // The conversation it was to continue is gone: the first message says what was said in it.
+        let earlier = filled(self.options.catch_up.as_ref()).filter(|_| mem::take(&mut self.catching_up));
+        if let (Some(earlier), Some(blocks)) = (earlier, blocks.as_array_mut()) {
+            let told = format!("{CATCH_UP}\n\n{earlier}\n\n{CATCH_UP_END}");
+            blocks.insert(0, json!({"type": "text", "text": told}));
+        }
+        let params = json!({"sessionId": self.session, "prompt": blocks});
         out.lines.push(self.request("session/prompt", params, Awaiting::Prompt));
         self.prompts += 1;
         self.begin(out);
@@ -560,6 +625,8 @@ impl Machine {
                 }
             }
             Err(refusal) if refusal.needs_sign_in() => self.failure = Some(NOT_SIGNED_IN.to_owned()),
+            // The answer to a message another took the place of: the turn goes on under that one.
+            Err(_) if self.prompts > 0 => {}
             Err(refusal) => self.failure = Some(refusal.message),
         }
         if self.prompts > 0 || !self.turn {
@@ -643,10 +710,20 @@ impl Machine {
             "plan" => out.events.push(Event::Plan { steps: parse::plan(update) }),
             "available_commands_update" => out.events.push(Event::Commands(parse::commands(update))),
             "config_option_update" => {
-                let before = self.settings.catalog.clone();
+                let (before, mode) = (self.settings.catalog.clone(), self.settings.mode.clone());
                 self.settings.update(field(update, "configOptions"));
                 if self.settings.catalog != before {
                     out.events.push(Event::Catalog(self.settings.catalog.clone()));
+                }
+                if self.settings.mode != mode {
+                    out.events.push(Event::Mode(self.settings.mode.clone()));
+                }
+            }
+            "current_mode_update" => {
+                let mode = opt_text(update, "currentModeId").filter(|mode| *mode != self.settings.mode);
+                if let Some(mode) = mode {
+                    self.settings.mode.clone_from(&mode);
+                    out.events.push(Event::Mode(mode));
                 }
             }
             "usage_update" => {
@@ -912,8 +989,15 @@ mod tests {
         waiting.hello();
         answer(&mut waiting, 1, CAN);
         refuse(&mut waiting, 2, -32000, "Authentication required");
-        let out =
-            waiting.receive("Open the following link to authenticate the ACP server: https://accounts.google.com/x");
+        let link = "Open the following link to authenticate the ACP server: https://accounts.google.com/x";
+        // Asked to sign in it shows Google's page, and the session opens once the user is through with it.
+        let out = waiting.receive(link);
+        assert_eq!((out.events, out.fatal.as_deref()), (vec![Event::SigningIn], None));
+        assert_eq!(methods(&answer(&mut waiting, 3, "{}")), ["session/new"]);
+        // A link nobody asked for is a session that cannot open.
+        let mut unasked = machine(&Options::default());
+        unasked.hello();
+        let out = unasked.receive(link);
         assert_eq!((out.events, out.fatal.as_deref()), (vec![Event::SignInRequired], Some(NOT_SIGNED_IN)));
         // Asked again after the sign-in was used, it is not asked a second time.
         let mut again = machine(&options);
@@ -939,6 +1023,7 @@ mod tests {
             matches!(out.events.as_slice(), [Event::Ready { session_id, resumed: true, .. }] if session_id == "old")
         );
 
+        let options = Options { catch_up: Some("User: hello\n\nYou: hi".into()), ..options };
         let mut gone = super::Machine::new(&options, "/work".to_owned());
         gone.hello();
         answer(&mut gone, 1, CAN);
@@ -950,6 +1035,28 @@ mod tests {
         assert!(
             matches!(out.events.as_slice(), [Event::Ready { session_id, resumed: false, .. }] if session_id == "new")
         );
+        // The one started in its place is told what was said, with its first message only.
+        let out = gone.command(say("and now?", "m1"));
+        let told = out.lines[0]["params"]["prompt"].as_array().expect("the blocks").clone();
+        assert_eq!(told.len(), 2);
+        let earlier = text(&told[0], "text");
+        assert!(earlier.starts_with(CATCH_UP) && earlier.contains("You: hi") && earlier.ends_with(CATCH_UP_END));
+        assert_eq!(told[1], json!({"type": "text", "text": "and now?"}));
+        answer(&mut gone, 4, r#"{"stopReason":"end_turn"}"#);
+        let out = gone.command(say("again", "m2"));
+        assert_eq!(out.lines[0]["params"]["prompt"], json!([{"type": "text", "text": "again"}]));
+    }
+
+    #[test]
+    fn a_conversation_that_is_continued_is_told_nothing_again() {
+        let options =
+            Options { resume: Some("old".into()), catch_up: Some("User: hello".into()), ..Options::default() };
+        let mut machine = machine(&options);
+        machine.hello();
+        answer(&mut machine, 1, CAN);
+        answer(&mut machine, 2, "{}");
+        let out = machine.command(say("and now?", "m1"));
+        assert_eq!(out.lines[0]["params"]["prompt"], json!([{"type": "text", "text": "and now?"}]));
     }
 
     #[test]
@@ -1081,6 +1188,85 @@ mod tests {
         // Nothing is set again for the next message.
         answer(&mut machine, 5, r#"{"stopReason":"end_turn"}"#);
         assert_eq!(methods(&machine.command(say("again", "m2"))), ["session/prompt"]);
+    }
+
+    /// A machine whose session offers the modes `default` and `auto` and is in `current`.
+    fn open_in(options: &Options, current: &str) -> Machine {
+        let mut machine = machine(options);
+        machine.hello();
+        answer(&mut machine, 1, CAN);
+        let mut listed = options_json();
+        listed.as_array_mut().unwrap().push(json!({"id": "mode", "category": "mode", "type": "select",
+            "currentValue": current, "options": [{"value": "default"}, {"value": "auto"}]}));
+        let out = answer(&mut machine, 2, &json!({"sessionId": "s1", "configOptions": listed}).to_string());
+        assert_eq!(out.events.last(), Some(&Event::Mode(current.to_owned())), "{out:?}");
+        machine
+    }
+
+    #[test]
+    fn the_mode_chosen_is_set_where_the_session_offers_it() {
+        let auto = Options { mode: Some("auto".into()), ..Options::default() };
+        let mut machine = open_in(&auto, "default");
+        let out = machine.command(say("hi", "m1"));
+        assert_eq!(methods(&out), ["session/set_config_option"]);
+        assert_eq!(out.lines[0]["params"], json!({"sessionId": "s1", "configId": "mode", "value": "auto"}));
+        let out = answer(&mut machine, 3, "{}");
+        assert_eq!(out.events.first(), Some(&Event::Mode("auto".into())));
+        assert_eq!(methods(&out), ["session/prompt"]);
+        answer(&mut machine, 4, r#"{"stopReason":"end_turn"}"#);
+        assert_eq!(methods(&machine.command(say("again", "m2"))), ["session/prompt"], "set once");
+
+        // A session left in `auto` is put back for an agent that asks first.
+        let asks = Options { mode: Some("default".into()), ..Options::default() };
+        let mut machine = open_in(&asks, "auto");
+        let out = machine.command(say("hi", "m1"));
+        assert_eq!(out.lines[0]["params"]["value"], "default");
+        // The binary says itself when the mode changes.
+        answer(&mut machine, 3, "{}");
+        let out = update(&mut machine, json!({"sessionUpdate": "current_mode_update", "currentModeId": "auto"}));
+        assert_eq!(out.events, [Event::Mode("auto".into())]);
+
+        // One that is not offered is not asked for: the session stays where it asks first.
+        let mut machine = open(&auto);
+        assert_eq!(methods(&machine.command(say("hi", "m1"))), ["session/prompt"]);
+        // A refusal is said once, and the message goes on.
+        let mut machine = open_in(&auto, "default");
+        machine.command(say("hi", "m1"));
+        let out = refuse(&mut machine, 3, -32602, "Auto mode is not available");
+        assert!(matches!(&out.events[0], Event::Warning(said) if said.contains("did not take the mode auto")));
+        assert_eq!(methods(&out), ["session/prompt"]);
+        answer(&mut machine, 4, r#"{"stopReason":"end_turn"}"#);
+        machine.retune(None, None);
+        assert_eq!(methods(&machine.command(say("again", "m2"))), ["session/prompt"], "not asked again");
+    }
+
+    #[test]
+    fn an_older_binary_takes_its_mode_the_older_way() {
+        let options = Options { mode: Some("auto".into()), ..Options::default() };
+        let mut machine = machine(&options);
+        machine.hello();
+        answer(&mut machine, 1, CAN);
+        let setup = json!({"sessionId": "s1", "modes": {"currentModeId": "default",
+            "availableModes": [{"id": "default"}, {"id": "auto"}]}});
+        answer(&mut machine, 2, &setup.to_string());
+        let out = machine.command(say("hi", "m1"));
+        assert_eq!(methods(&out), ["session/set_mode"]);
+        assert_eq!(out.lines[0]["params"], json!({"sessionId": "s1", "modeId": "auto"}));
+    }
+
+    #[test]
+    fn a_message_put_in_the_place_of_another_decides_how_the_turn_ends() {
+        let mut machine = open(&Options::default());
+        machine.command(say("hi", "m1"));
+        machine
+            .command(Command::Steer(Message { parts: vec![Part::Text("wait".into())], client_id: Some("m2".into()) }));
+        // The first is answered as broken off, in whatever way: the turn goes on under the second.
+        assert!(refuse(&mut machine, 3, -32603, "superseded").events.is_empty());
+        let out = answer(&mut machine, 4, r#"{"stopReason":"end_turn"}"#);
+        assert!(matches!(
+            out.events.as_slice(),
+            [Event::TurnCompleted { status: TurnStatus::Completed, error: None, .. }]
+        ));
     }
 
     #[test]
