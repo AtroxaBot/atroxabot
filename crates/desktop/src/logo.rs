@@ -36,6 +36,41 @@ pub enum Logo {
     Ollama,
 }
 
+/// A platform's mark that one colour cannot say: its owner's own picture,
+/// in its own colours, drawn as an image ([`Painter::mark`]) instead of
+/// from an outline.
+///
+/// [`Painter::mark`]: crate::paint::Painter::mark
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Picture {
+    /// Antigravity's arch, in its gradient.
+    Antigravity,
+}
+
+impl Picture {
+    /// The picture of the platform called (or filed under) `name`, if its mark is one.
+    #[must_use]
+    pub fn named(name: &str) -> Option<Self> {
+        name.to_lowercase().contains("antigravity").then_some(Self::Antigravity)
+    }
+
+    /// What its thumbnails are kept under in the image atlas: a name no file has.
+    #[must_use]
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Antigravity => "logo:antigravity",
+        }
+    }
+
+    /// The picture itself, a PNG on a clear ground, square, the mark filling it.
+    #[must_use]
+    pub fn bytes(self) -> &'static [u8] {
+        match self {
+            Self::Antigravity => include_bytes!("../assets/logos/antigravity.png"),
+        }
+    }
+}
+
 impl Logo {
     /// Every mark, for the tests.
     #[cfg(test)]

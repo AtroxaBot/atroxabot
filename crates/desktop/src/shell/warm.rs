@@ -1,9 +1,9 @@
-//! How long an account's process (Claude Code, Codex) outlives the look at
-//! its session.
+//! How long an account's process (Claude Code, Codex, Antigravity) outlives
+//! the look at its session.
 //!
 //! A process that is up answers the next message at once; one that has to
 //! start first takes a few seconds to come up and to read its conversation
-//! again. So a session's process is not closed the moment the user opens
+//! again (Antigravity, which unpacks itself at every start, up to a minute). So a session's process is not closed the moment the user opens
 //! another session: it stays for [`KEEP`] after they left it with nothing to
 //! do, and of those that wait like this only the [`MOST`] left last are kept
 //! (each holds a few hundred megabytes). One that is open, at work, or

@@ -2,7 +2,8 @@
 
 AtroxaBot is a native desktop app for agents the user chats with and calls. It is a Cargo workspace:
 `crates/claude-agent` (the Rust port of the Claude Agent SDK's transport), `crates/codex` (the transport
-for the installed Codex CLI's app server), `crates/mcp` (a small MCP client), `crates/core` (agents, sessions, API client, agent loop and tools, usage statistics, git, the sessions' worktrees, updating the app; no GUI), `crates/voice` (Fish
+for the installed Codex CLI's app server), `crates/antigravity` (the transport for the installed
+Antigravity CLI's `agy acp`), `crates/mcp` (a small MCP client), `crates/core` (agents, sessions, API client, agent loop and tools, usage statistics, git, the sessions' worktrees, updating the app; no GUI), `crates/voice` (Fish
 Audio and ElevenLabs, the call loop, audio devices) and `crates/desktop` (the app; package and binary
 `atroxabot`). `README.md` describes every feature, the crate layout and the storage format: read it before
 changing behaviour, and keep it current when you do.
@@ -20,8 +21,8 @@ cargo fmt --all --check
   never bundle, modify or wrap it, and never pass `--bare`. Never read, store, set, strip or forward its
   credentials (no credentials files, no `ANTHROPIC_API_KEY`, no OAuth tokens), and never add a Claude
   sign-in to the app: signing in is `claude auth login`, started in a terminal the user sees, and installing
-  is Anthropic's own installer (`CLAUDE_INSTALL`), started the same way: the app never downloads or places
-  the binary itself. The app
+  is Anthropic's own installer (`CLAUDE_INSTALL`), started the same way, and updating is its own
+  `claude update`, the same way again: the app never downloads or places the binary itself. The app
   sets `CLAUDE_CONFIG_DIR` to select an extra account's configuration folder, which is how Anthropic
   documents using several accounts (the app never looks inside that folder), and, as the official Agent
   SDK does, `CLAUDE_CODE_SDK_READS_SESSION_STATE`. Whatever else the official SDK does is fine to do when
@@ -33,10 +34,32 @@ cargo fmt --all --check
 - **Codex accounts, the same way.** Run the user's installed Codex binary as published (`codex
   app-server`), never a `.cmd` shim. Never read, store or forward its credentials, never send
   `account/login/start`, and refuse its requests for tokens: signing in is `codex login`, started in a
-  terminal the user sees, and installing is OpenAI's own installer (`CODEX_INSTALL`), the same way. The
-  app sets `CODEX_HOME` to select an extra account's folder and never looks
+  terminal the user sees, installing is OpenAI's own installer (`CODEX_INSTALL`) and updating its own
+  `codex update`, the same way. The app
+  sets `CODEX_HOME` to select an extra account's folder and never looks
   inside it. What the app gives Codex (MCP servers, the skill library) is for the run only: nothing is
   written to an account's configuration.
+- **Antigravity accounts, by Google's terms**, which are not Anthropic's: the README's "What Google's
+  terms allow" is the reference, with the pages it was read from. Read them again before changing how
+  the binary is started, how it signs in, or what a session does by itself, and never take a rule over
+  from Claude or Codex without checking it there. Run the user's installed Antigravity binary as
+  published (`agy acp`), never a `.cmd` launcher, and say the app is AtroxaBot, never another client.
+  **A person drives every session**: nothing sends Antigravity a message by itself and no account is
+  changed by itself (`Shell::hands_on`: a session a quota stopped stops there, whatever the settings
+  say), and Antigravity is never made the engine of another agent or of anything that runs unattended.
+  **The sign-in never leaves the binary**: never read, copy, store or forward its tokens, and never call
+  Google with them, which is why its plan limits are not shown (asking its own `/usage` when the user
+  looks is the allowed way, never on a timer). Asking the binary to use the sign-in it has is fine
+  (`authenticate` with `oauth-personal`): a session does when it is told it needs one, and the
+  settings' check does only for an added account, never where it could open a browser the user did not
+  ask for. Signing in is `agy acp --login`, started in a terminal the user sees, and installing is
+  Google's own installer (`ANTIGRAVITY_INSTALL`), the same way; no update is offered, since Google documents
+  no command for one. The app gives an extra account a folder
+  of its own (`--gemini-dir`, with `SSH_CONNECTION` so that Antigravity keeps the sign-in there); in an
+  account's folder it only puts copies of the user's global `AGENTS.md` and `GEMINI.md` (`share_rules`)
+  and removes the empty conversation its own check left (`forget_conversation`). It unpacks itself at
+  every start: never start it only to ask what an account offers when that is kept already
+  (`antigravity_info`, `antigravity.json`).
 - **Rust-native, custom UI.** `winit` + `wgpu`, and we draw the app's interface ourselves. No UI
   frameworks (egui, iced, Tauri, …).
 - **Beautiful, elegant and fast.** Redraw only when something changes, do minimal work per frame, and keep
@@ -85,7 +108,8 @@ face (`orb.rs`) and, faintly, washed down the top of its canvas; everything else
 The exceptions are what a diff adds and removes (`Palette::positive`, `Palette::danger`), how a branch's
 pull request stands in the side panel (open green, merged `Palette::merged`, closed red) and a provider's
 mark: its platform's logo (`logo.rs`, drawn from an outline through the glyph atlas with `Painter::logo`,
-in `theme::provider_color` where the platform has a colour), or a picture the user put in
+in `theme::provider_color` where the platform has a colour; or, for a mark one colour cannot say, its
+owner's own picture, `logo::Picture`, drawn with `Painter::mark`), or a picture the user put in
 `~/.atroxabot/icons/`. The owner decided the logos are fine to show as nominative use: they only say
 which platform a provider is. Never use one as the app's own branding.
 
@@ -98,6 +122,11 @@ which platform a provider is. Never use one as the app's own branding.
   the composer float on `Palette::surface` with a soft shadow. The top bar holds only what belongs to
   the session; the sidebar holds the app's as icons: search and a new agent over the agents, settings
   and statistics at its foot. Under the message box: the paperclip at the left, the model at the right.
+- The tools the accounts run (Claude Code, Codex, Antigravity) are known without an account (`shell/tools.rs`):
+  one row each says whether it is installed, in the settings' General page with its version and *Update*, and
+  over its accounts in Providers while it is missing, with *Install*. Nothing is added to a tool that is not
+  installed; adding an account is a choice between the one in the user's terminal and one kept apart. Say
+  what a provider is with rows and buttons: one short note under the accounts is all the page explains.
 - Whether a session works in a worktree of its own is a switch in the folder menu of the top bar, the
   session's until its worktree is made; what is on disk is listed in the settings (`shell/worktrees.rs`).
 - A tool call that changes a file shows as the lines of a diff (`shell/change.rs`), and a turn that

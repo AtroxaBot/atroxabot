@@ -15,7 +15,7 @@ use winit::window::CursorIcon;
 
 use super::menu::{Menu, effort_label, folder_name};
 use super::question::{self, QuestionForm};
-use super::{Account, Shell};
+use super::{Account, AntigravityAccount, Shell};
 use crate::app::Action;
 use crate::editor::Editor;
 use crate::paint::{Painter, Rect, fade, mix};
@@ -564,6 +564,28 @@ impl Shell {
                 (skill.name.clone(), line.chars().take(160).collect())
             }));
         }
+        // What Antigravity takes as a message: as the session's own process says, or else the account.
+        if let Some(connection) = connection.as_ref().filter(|c| c.kind == ConnectionKind::Antigravity) {
+            let listed: Vec<(String, String)> = match self.thread().and_then(|thread| thread.commands.clone()) {
+                Some(listed) => listed,
+                None => match self.antigravity.get(&connection.id) {
+                    Some(AntigravityAccount::Ready(info)) => info
+                        .commands
+                        .iter()
+                        .map(|command| {
+                            let line = command.description.lines().next().unwrap_or_default();
+                            (command.name.clone(), line.chars().take(160).collect())
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                },
+            };
+            for (name, line) in listed {
+                if !commands.iter().any(|(known, _)| *known == name) {
+                    commands.push((name, line));
+                }
+            }
+        }
         if let Some(connection) = connection.filter(|connection| connection.kind == ConnectionKind::ClaudeAgent) {
             commands.push(("compact".to_owned(), "Summarise the conversation to free up its context".to_owned()));
             // What the session's own process offers (its folder's commands and skills too), or else the account's.
@@ -942,8 +964,8 @@ impl Shell {
 
     /// Says no to the waiting approval. What is written in the message box
     /// goes to the agent as the reason, so it knows what to do instead, and
-    /// is taken out of the box. Codex takes no reason with a no: there it
-    /// is sent as a message, which the agent reads at its next step.
+    /// is taken out of the box. Codex and Antigravity take no reason with a
+    /// no: there it is sent as a message, which the agent reads at its next step.
     pub(super) fn deny(&mut self, actions: &mut Vec<Action>) {
         let Some(asked) = self.thread().and_then(|thread| thread.asks.first()) else { return };
         // An MCP server is only told no: what is written stays for the agent.
@@ -952,10 +974,11 @@ impl Shell {
             return;
         }
         let why = self.reason().to_owned();
-        let codex = self.agent_in_use().is_some_and(|agent| {
-            self.config.connection(&agent.connection).is_some_and(|c| c.kind == ConnectionKind::Codex)
+        let wordless = self.agent_in_use().is_some_and(|agent| {
+            let kind = self.config.connection(&agent.connection).map(|connection| connection.kind);
+            matches!(kind, Some(ConnectionKind::Codex | ConnectionKind::Antigravity))
         });
-        if why.is_empty() || !codex {
+        if why.is_empty() || !wordless {
             if !why.is_empty() {
                 self.composer.editor.take();
             }

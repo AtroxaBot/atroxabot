@@ -5,9 +5,10 @@
 //! * [`Config`]: settings and the [`Connection`]s agents think through.
 //! * Engines: [`ClaudeAgent`] drives the user's own Claude Code installation
 //!   (see the `atroxabot-claude-agent` crate), [`CodexAgent`] the user's own
-//!   Codex (the `atroxabot-codex` crate); [`ApiEngine`] runs the agent
+//!   Codex (the `atroxabot-codex` crate), [`AntigravityAgent`] the user's own
+//!   Antigravity (the `atroxabot-antigravity` crate); [`ApiEngine`] runs the agent
 //!   loop over Anthropic's Messages API or any OpenAI-compatible gateway
-//!   with the tools in [`tools`]. Both report a turn as [`AgentEvent`]s.
+//!   with the tools in [`tools`]. All report a turn as [`AgentEvent`]s.
 //!
 //! * [`skills`]: the skills every agent has, and the repositories they come from.
 //! * [`worktree`]: a git worktree of its own for a session, and the cleaning up after it.
@@ -16,6 +17,7 @@
 //! All network calls and tools are blocking; run them off the UI thread.
 
 mod agent;
+mod antigravity;
 pub mod attach;
 mod claude;
 mod client;
@@ -42,6 +44,13 @@ pub mod update;
 pub mod worktree;
 
 pub use agent::{Agent, AgentVoice, Autonomy, CALL_ENDED, CALL_STARTED, FOLLOW_UP, INTERRUPTING, Records};
+pub use antigravity::{
+    ANTIGRAVITY_INSTALL, AntigravityAgent, antigravity_info, antigravity_install, antigravity_login, find_antigravity,
+};
+pub use atroxabot_antigravity::{
+    Catalog as AntigravityCatalog, Effort as AntigravityEffort, Error as AntigravityError, Info as AntigravityInfo,
+    Model as AntigravityModel,
+};
 pub use atroxabot_claude_agent::{
     Error as ClaudeError, Info as ClaudeInfo, McpServerStatus as ClaudeMcpServer, ModelInfo as ClaudeModel,
     SlashCommand as ClaudeCommand,
@@ -51,11 +60,12 @@ pub use atroxabot_codex::{
 };
 pub use claude::{
     CLAUDE_INSTALL, ClaudeAgent, PlanCheck, TerminalCommand, claude_connectors, claude_info, claude_install,
-    claude_login, claude_usage, find_claude,
+    claude_login, claude_update, claude_usage, find_claude,
 };
 pub use client::{Client, Model};
 pub use codex::{
-    CODEX_INSTALL, CodexAgent, codex_info, codex_install, codex_limits, codex_login, codex_mcp_config, find_codex,
+    CODEX_INSTALL, CodexAgent, codex_info, codex_install, codex_limits, codex_login, codex_mcp_config, codex_update,
+    find_codex,
 };
 pub use config::{Config, Connection, ConnectionKind, McpServer, VoiceSettings, lock_instance};
 pub use engine::{AgentEvent, ApiEngine, Ask, Control, DISMISSED, FollowUp, Inbox, LimitWindow, Limits, Verdict};

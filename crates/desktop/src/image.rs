@@ -120,6 +120,19 @@ impl ImageAtlas {
         Some(uv)
     }
 
+    /// The thumbnail `key` of a picture the app carries itself (`bytes`, a
+    /// platform's mark), decoded here and now when it is not in the atlas:
+    /// it is small, and a mark must not appear a frame after its row.
+    /// `None` when it cannot be decoded or the atlas has no room this frame.
+    pub fn carried(&mut self, key: &ImageKey, bytes: &[u8]) -> Option<[f32; 4]> {
+        if !self.entries.contains_key(key) && !self.failed.contains(&key.path) {
+            self.insert(key.clone(), scaled(bytes, key));
+        }
+        let &(uv, row) = self.entries.get(key)?;
+        self.shelves.touch(row);
+        Some(uv)
+    }
+
     /// Thumbnails to decode, each handed out once.
     pub fn take_wanted(&mut self) -> Vec<ImageKey> {
         std::mem::take(&mut self.wanted)
@@ -179,7 +192,15 @@ pub fn thumbnail(key: &ImageKey) -> Result<Pixels, String> {
     if bytes.len() as u64 > MAX_FILE {
         return Err("the file is too large".into());
     }
-    let (rgba, w, h, orientation) = decode(&bytes)?;
+    scaled(&bytes, key)
+}
+
+/// Decodes the image in `bytes` and scales it as `key` asks ([`thumbnail`]).
+///
+/// # Errors
+/// A human-readable reason: not a PNG, JPEG or WebP.
+pub fn scaled(bytes: &[u8], key: &ImageKey) -> Result<Pixels, String> {
+    let (rgba, w, h, orientation) = decode(bytes)?;
     // Orientations 5–8 swap the axes: scale for the transposed size.
     let swap = orientation >= 5;
     let (tw, th) = if swap { (key.h, key.w) } else { (key.w, key.h) };
@@ -200,6 +221,26 @@ mod tests {
         encoder.set_depth(png::BitDepth::Eight);
         encoder.write_header().unwrap().write_image_data(pixels).unwrap();
         out
+    }
+
+    #[test]
+    fn a_mark_the_app_carries_is_there_at_once() {
+        let picture = crate::logo::Picture::Antigravity;
+        let key = ImageKey { path: picture.key().into(), w: 32, h: 32, whole: false };
+        // In its own colours, on a clear ground: the corners are empty, the arch is not.
+        let (pixels, w, h) = scaled(picture.bytes(), &key).expect("it decodes");
+        assert_eq!((w, h, pixels.len()), (32, 32, 32 * 32 * 4));
+        let alpha = |x: usize, y: usize| pixels[(y * 32 + x) * 4 + 3];
+        assert_eq!((alpha(0, 0), alpha(31, 0)), (0, 0));
+        assert!(alpha(16, 6) > 200 && alpha(2, 29) > 0, "the top of the arch and a foot");
+        let mut atlas = ImageAtlas::default();
+        let uv = atlas.carried(&key, picture.bytes()).expect("no frame's wait");
+        assert_eq!(&uv[2..], [32.0, 32.0]);
+        assert!(atlas.take_wanted().is_empty(), "no worker is asked");
+        assert_eq!((atlas.carried(&key, picture.bytes()), atlas.uploads.len()), (Some(uv), 1), "decoded once");
+        // What is no picture is said once, and not decoded at every frame.
+        let broken = ImageKey { path: "logo:broken".into(), ..key };
+        assert_eq!((atlas.carried(&broken, b"no png"), atlas.carried(&broken, b"no png")), (None, None));
     }
 
     #[test]

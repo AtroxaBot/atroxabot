@@ -21,9 +21,10 @@ use atroxabot_core::tools::{Jobs, Workspace};
 use atroxabot_core::update;
 use atroxabot_core::worktree;
 use atroxabot_core::{
-    Agent, AgentEvent, ApiEngine, ClaudeAgent, ClaudeError, ClaudeInfo, ClaudeMcpServer, Client, CodexAgent,
-    CodexError, CodexInfo, Config, Connection, ConnectionKind, Control, Error, FollowUp, Limits, McpHub, McpServer,
-    Model, PlanCheck, Records, SearchHit, Session, SessionStore, SessionSummary, Verdict,
+    Agent, AgentEvent, AntigravityAgent, AntigravityError, AntigravityInfo, ApiEngine, ClaudeAgent, ClaudeError,
+    ClaudeInfo, ClaudeMcpServer, Client, CodexAgent, CodexError, CodexInfo, Config, Connection, ConnectionKind,
+    Control, Error, FollowUp, Limits, McpHub, McpServer, Model, PlanCheck, Records, SearchHit, Session, SessionStore,
+    SessionSummary, Verdict,
 };
 use atroxabot_voice::{Call, CallEvent, CallOptions, VoiceConfig};
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -38,6 +39,7 @@ use crate::log;
 use crate::paint::{Painter, Rect};
 use crate::platform;
 use crate::shell::{Cli, Shell};
+use crate::sight::{self, Sight};
 use crate::text::{Fonts, GlyphAtlas};
 use crate::theme::{Palette, Scheme};
 use crate::titlebar::{self, Command, Grab};
@@ -61,6 +63,15 @@ const GPU_RETRY: Duration = Duration::from_secs(2);
 const SKIPPED_RETRY: Duration = Duration::from_millis(100);
 /// How often a working agent's face is drawn at the least, in frames a second, when nothing else moves.
 const BUSY_FPS: f64 = 60.0;
+/// The least time between two frames while the window does not have the keyboard and the mouse is elsewhere:
+/// whoever looks at it then watches, and thirty frames a second show what an agent does.
+const UNFOCUSED_FRAME: Duration = Duration::from_millis(33);
+/// The same while other windows cover it all. Nothing would be drawn at all, were it not that a window
+/// wrongly taken for covered would then stand still for good.
+const COVERED_FRAME: Duration = Duration::from_secs(1);
+/// How long it is believed what was seen of the window, and how soon a covered one is looked at again:
+/// nothing says when it is uncovered.
+const LOOK: Duration = Duration::from_millis(250);
 
 /// Results delivered from other threads.
 pub enum WorkerEvent {
@@ -108,6 +119,13 @@ pub enum WorkerEvent {
         connection: String,
         /// Its models and who is signed in, or why it could not be asked.
         result: Result<CodexInfo, CodexError>,
+    },
+    /// Antigravity said (or could not say) what an Antigravity account offers.
+    AntigravityInfo {
+        /// The account's connection id.
+        connection: String,
+        /// Its models and whether it is signed in, or why it could not be asked.
+        result: Result<AntigravityInfo, AntigravityError>,
     },
     /// Claude Code said (or could not say) where a Claude account's plan limits stand.
     LimitsChecked {
@@ -172,6 +190,8 @@ pub enum WorkerEvent {
     Problem(String),
     /// Whether the system asks for less motion ([`platform::reduce_motion`]).
     Motion(bool),
+    /// Which of the accounts' tools are on disk.
+    Tools([(Cli, bool); 3]),
     /// The tray icon was clicked, or another start of the app asks for the window.
     Tray(TrayEvent),
     /// What looking for an update or downloading one came to, or how far a download is.
@@ -236,14 +256,15 @@ pub enum Action {
         /// The session.
         session: Box<Session>,
     },
-    /// End the agent's process (Claude Code, Codex) of this session, if it has one.
+    /// End the agent's process (Claude Code, Codex, Antigravity) of this session, if it has one.
     CloseLive(String),
     /// Stop the commands an API session's agent left running in the background.
     StopJobs(String),
     /// Ask the Claude Agent process of this session, if it has one, what its context holds.
     AskContext(String),
     /// Stop the subagent, or the command in the background, that the tool call `call` of the session's
-    /// Claude Agent process started; the turn and every other task go on.
+    /// Claude Agent process started; the turn and every other task go on. Of an Antigravity process,
+    /// between turns: the commands it left running, all of them.
     StopTask {
         /// The session.
         session: String,
@@ -276,8 +297,21 @@ pub enum Action {
     ProbeCodex(Box<Connection>),
     /// Open Codex's own sign-in for a Codex account, in a terminal.
     CodexLogin(Box<Connection>),
-    /// Open the maker's own installer of Claude Code or Codex, in a terminal.
+    /// Say what an Antigravity account offers: what is kept of it, or `fresh`, by starting Antigravity.
+    ProbeAntigravity {
+        /// The account.
+        connection: Box<Connection>,
+        /// Whether to start Antigravity and ask it, whatever is kept.
+        fresh: bool,
+    },
+    /// Open Antigravity's own sign-in for an Antigravity account, in a terminal.
+    AntigravityLogin(Box<Connection>),
+    /// Open the maker's own installer of Claude Code, Codex or Antigravity, in a terminal.
     Install(Cli),
+    /// Have Claude Code or Codex update itself, with its own command, in a terminal.
+    UpdateTool(Cli),
+    /// Look on disk for Claude Code, Codex and Antigravity.
+    FindTools,
     /// Search every session's messages.
     Search {
         /// The text to find.
@@ -386,6 +420,14 @@ pub struct App {
     gpu_retry: Option<Instant>,
     /// When to draw again: after a frame that could not be shown, or the next frame of a working agent's face.
     redraw_at: Option<Instant>,
+    /// What could be seen of the window when it was last looked at, without the keyboard ([`sight::look`]).
+    sight: Option<(Instant, Sight)>,
+    /// Other windows cover the window, so the last frame asked for was not drawn.
+    covered: bool,
+    /// When to look again whether a covered window still is.
+    look_at: Option<Instant>,
+    /// A frame was put off until then, the window being watched at most: nothing on screen is due sooner.
+    hold: Option<Instant>,
     /// The refresh rate of the window's screen in millihertz, when the platform says.
     refresh: Option<u32>,
     fonts: Fonts,
@@ -404,7 +446,7 @@ pub struct App {
     agents: Option<Records>,
     /// Performs every file write, in order, off the UI thread.
     writer: Writer,
-    /// The agent's process (Claude Code, Codex) of each session that has one.
+    /// The agent's process (Claude Code, Codex, Antigravity) of each session that has one.
     live: HashMap<String, Live>,
     /// The running API turn of each session that has one.
     turns: HashMap<String, Control>,
@@ -553,6 +595,10 @@ impl App {
             renderer: Some(renderer),
             gpu_retry: None,
             redraw_at: None,
+            sight: None,
+            covered: false,
+            look_at: None,
+            hold: None,
             refresh,
             fonts: Fonts::load(),
             atlas: GlyphAtlas::default(),
@@ -697,14 +743,23 @@ impl App {
                     self.spawn(|| WorkerEvent::Motion(platform::reduce_motion()));
                 }
                 self.ui.focused = focused;
+                // What was seen of it without the keyboard says nothing of now.
+                self.sight = None;
             }
             // A file dragged onto the window goes along with the next message.
             WindowEvent::DroppedFile(path) => self.spawn(move || WorkerEvent::FilesPicked(attachable(vec![path]))),
             WindowEvent::ModifiersChanged(mods) => self.ui.mods = mods.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui.mouse = (position.x as f32 / scale, position.y as f32 / scale);
+                // The mouse is over it: it is seen, and drawn as often as when it has the keyboard.
+                if !self.ui.focused {
+                    self.sight = Some((Instant::now(), Sight::Pointed));
+                }
             }
-            WindowEvent::CursorLeft { .. } => self.ui.mouse = (f32::MIN, f32::MIN),
+            WindowEvent::CursorLeft { .. } => {
+                self.ui.mouse = (f32::MIN, f32::MIN);
+                self.sight = None;
+            }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 if state == ElementState::Pressed {
                     let now = self.start.elapsed().as_secs_f32();
@@ -881,6 +936,12 @@ impl App {
                 }
                 self.shell.codex_info(&connection, result, &mut actions);
             }
+            WorkerEvent::AntigravityInfo { connection, result } => {
+                if let Err(e) = &result {
+                    log::error(format!("Antigravity could not be asked about an account: {e}"));
+                }
+                self.shell.antigravity_info(&connection, result);
+            }
             WorkerEvent::LimitsChecked { connection, result } => {
                 match &result {
                     Err(e) => log::error(format!("Claude Code could not say where a plan's limits stand: {e}")),
@@ -933,6 +994,7 @@ impl App {
             }
             WorkerEvent::Problem(text) => self.shell.notify(text),
             WorkerEvent::Motion(still) => self.ui.still = still,
+            WorkerEvent::Tools(found) => self.shell.tools_found(found, &mut actions),
         }
         self.apply(actions);
         self.window.request_redraw();
@@ -1000,13 +1062,21 @@ impl App {
                     live.ask_context();
                 }
             }
-            Action::StopTask { session, call } => {
-                if let Some(Live::Claude(agent)) = self.live.get(&session)
-                    && !agent.stop_task(&call)
-                {
-                    crate::log::error(format!("session {session}: Claude Code named no task for the call {call}"));
+            Action::StopTask { session, call } => match self.live.get(&session) {
+                Some(Live::Claude(agent)) => {
+                    if !agent.stop_task(&call) {
+                        crate::log::error(format!("session {session}: Claude Code named no task for the call {call}"));
+                    }
                 }
-            }
+                // Between turns Antigravity's stop ends the commands it left running, all of them: it
+                // has none for one alone. The one asked about is taken off the list here; the others
+                // as Antigravity says their end.
+                Some(Live::Antigravity(agent)) => {
+                    agent.interrupt();
+                    self.emitter(&session)(AgentEvent::Background { id: call, what: String::new(), ended: true });
+                }
+                Some(Live::Codex(_)) | None => {}
+            },
             Action::LoadSession(session) => {
                 if let Some(store) = self.sessions_dir.clone().map(SessionStore::at) {
                     self.spawn(move || WorkerEvent::SessionLoaded {
@@ -1073,17 +1143,55 @@ impl App {
                     self.shell.notify(format!("The sign-in could not be opened: {e}"));
                 }
             }
+            Action::ProbeAntigravity { connection, fresh } => self.spawn(move || WorkerEvent::AntigravityInfo {
+                result: atroxabot_core::antigravity_info(&connection, fresh),
+                connection: connection.id.clone(),
+            }),
+            Action::AntigravityLogin(connection) => {
+                // Antigravity's own sign-in, in a terminal the user sees: the app only starts it.
+                match atroxabot_core::antigravity_login(&connection) {
+                    Some(login) => {
+                        if let Err(e) = in_terminal("Sign in to Antigravity", &login) {
+                            self.shell.notify(format!("The sign-in could not be opened: {e}"));
+                        }
+                    }
+                    // Its row says so, and offers the installer.
+                    None => self.shell.antigravity_info(&connection.id, Err(AntigravityError::NotFound)),
+                }
+            }
             Action::Install(cli) => {
                 // The maker's own installer, in a terminal the user sees and answers: the app only starts it.
                 let (title, installer) = match cli {
                     Cli::Claude => ("Install Claude Code", atroxabot_core::claude_install()),
                     Cli::Codex => ("Install Codex", atroxabot_core::codex_install()),
+                    Cli::Antigravity => ("Install Antigravity", atroxabot_core::antigravity_install()),
                 };
                 match in_terminal(title, &installer) {
                     Ok(()) => self.shell.installing(cli),
                     Err(e) => self.shell.notify(format!("The installer could not be opened: {e}")),
                 }
             }
+            Action::UpdateTool(cli) => {
+                // The tool's own command, in a terminal the user sees: the app only starts it. Google
+                // documents none for Antigravity, so nothing offers it.
+                let updater = match cli {
+                    Cli::Claude => atroxabot_core::claude_update().map(|update| ("Update Claude Code", update)),
+                    Cli::Codex => atroxabot_core::codex_update().map(|update| ("Update Codex", update)),
+                    Cli::Antigravity => None,
+                };
+                match updater.map(|(title, update)| in_terminal(title, &update)) {
+                    Some(Ok(())) => self.shell.updating(cli),
+                    Some(Err(e)) => self.shell.notify(format!("The update could not be opened: {e}")),
+                    None => {}
+                }
+            }
+            Action::FindTools => self.spawn(|| {
+                WorkerEvent::Tools([
+                    (Cli::Claude, atroxabot_core::find_claude().is_some()),
+                    (Cli::Codex, atroxabot_core::find_codex().is_some()),
+                    (Cli::Antigravity, atroxabot_core::find_antigravity().is_some()),
+                ])
+            }),
             Action::Search { query, generation } => {
                 if let Some(store) = self.sessions_dir.clone().map(SessionStore::at) {
                     self.spawn(move || WorkerEvent::SearchResults {
@@ -1293,12 +1401,13 @@ impl App {
                 self.renew(&id);
             }
             let mut emit = self.emitter(&id);
-            let codex = connection.kind == ConnectionKind::Codex;
             // One process serves the session until it is closed or its agent changes. Another model or
-            // effort is no reason to start one again: Codex takes both with every turn, and a running
-            // Claude Code is asked to change, the message going once it has (`retuned`).
+            // effort is no reason to start one again: Codex takes both with every turn, Antigravity sets
+            // them as a turn starts, and a running Claude Code is asked to change, the message going once
+            // it has (`retuned`).
             match self.live.get(&id) {
                 Some(Live::Codex(live)) => live.retune(&agent.model, &agent.effort),
+                Some(Live::Antigravity(live)) => live.retune(&agent.model, &agent.effort),
                 Some(Live::Claude(live)) if !live.runs_with(&agent.model, &agent.effort) => {
                     let (proxy, changed) = (self.proxy.clone(), id.clone());
                     let asked = live.retune(&agent.model, &agent.effort, move |outcome| {
@@ -1324,15 +1433,24 @@ impl App {
             let sent = if let Some(live) = self.live.get(&id) {
                 live.send(text, &files)
             } else {
-                let started = if codex {
-                    CodexAgent::connect(agent, connection, &session, servers, self.emitter(&id))
-                        .map(Live::Codex)
-                        .map_err(|e| e.to_string())
-                } else {
-                    let mcp = atroxabot_core::claude_mcp_config(servers);
-                    ClaudeAgent::connect(agent, connection, &session, mcp, self.shell.suggesting(), self.emitter(&id))
-                        .map(Live::Claude)
-                        .map_err(|e| e.to_string())
+                let started = match connection.kind {
+                    ConnectionKind::Codex => {
+                        CodexAgent::connect(agent, connection, &session, servers, self.emitter(&id))
+                            .map(Live::Codex)
+                            .map_err(|e| e.to_string())
+                    }
+                    ConnectionKind::Antigravity => {
+                        AntigravityAgent::connect(agent, connection, &session, servers, self.emitter(&id))
+                            .map(Live::Antigravity)
+                            .map_err(|e| e.to_string())
+                    }
+                    _ => {
+                        let mcp = atroxabot_core::claude_mcp_config(servers);
+                        let suggest = self.shell.suggesting();
+                        ClaudeAgent::connect(agent, connection, &session, mcp, suggest, self.emitter(&id))
+                            .map(Live::Claude)
+                            .map_err(|e| e.to_string())
+                    }
                 };
                 started.and_then(|live| {
                     let sent = live.send(text, &files);
@@ -1344,7 +1462,11 @@ impl App {
                 if let Some(live) = self.live.remove(&id) {
                     retire(live, self.leases.remove(&id));
                 }
-                let who = if codex { "Codex" } else { "The Claude Agent" };
+                let who = match connection.kind {
+                    ConnectionKind::Codex => "Codex",
+                    ConnectionKind::Antigravity => "Antigravity",
+                    _ => "The Claude Agent",
+                };
                 fail(&mut emit, format!("{who} could not be reached: {e}"));
             }
             return;
@@ -1488,13 +1610,16 @@ impl App {
         if self.renderer.as_ref().is_none_or(Renderer::is_lost) {
             self.recover_gpu();
         }
-        self.redraw_at = None;
+        (self.redraw_at, self.look_at, self.hold) = (None, None, None);
         // What cannot be seen is not drawn, and nothing asks for the next frame: showing the window again
         // (restoring it, from the tray, or uncovered) draws it.
         if self.unseen() {
             return;
         }
         let now = Instant::now();
+        if self.put_off(now) {
+            return;
+        }
         let dt = (now - self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         self.ui.begin(dt, (now - self.start).as_secs_f32());
@@ -1618,6 +1743,38 @@ impl App {
         }
     }
 
+    /// Whether the frame asked for now waits, the window not having the keyboard: under other windows it is
+    /// drawn once in a long while, and looked at again soon; seen with the mouse elsewhere, at a watcher's
+    /// pace. With the mouse over it nothing waits. A working agent otherwise has the whole window drawn many
+    /// times a second for nobody.
+    fn put_off(&mut self, now: Instant) -> bool {
+        self.covered = false;
+        if !self.shown || self.ui.focused {
+            return false;
+        }
+        let sight = match self.sight {
+            Some((at, sight)) if now.saturating_duration_since(at) < LOOK => sight,
+            _ => {
+                let sight = sight::look(&self.window, self.ui.mouse.0 > f32::MIN);
+                self.sight = Some((now, sight));
+                sight
+            }
+        };
+        let since = now.saturating_duration_since(self.last_frame);
+        match sight {
+            Sight::Covered if since < COVERED_FRAME => {
+                (self.covered, self.look_at) = (true, Some(now + LOOK));
+                true
+            }
+            Sight::Open if since < UNFOCUSED_FRAME => {
+                let next = self.last_frame + UNFOCUSED_FRAME;
+                (self.redraw_at, self.hold) = (Some(next), Some(next));
+                true
+            }
+            Sight::Covered | Sight::Open | Sight::Pointed => false,
+        }
+    }
+
     /// Whether the window cannot be seen: minimised, in the tray, or (where the platform says) covered.
     /// The first frame is drawn regardless: it is what shows the window.
     fn unseen(&self) -> bool {
@@ -1628,7 +1785,7 @@ impl App {
     /// tooltip shows, or something the shell waits for is due.
     pub fn control_flow(&self) -> ControlFlow {
         // Unseen, nothing on screen is due: the caret, a tooltip and the next frame wait until it is seen.
-        let seen = !self.unseen();
+        let seen = !self.unseen() && !self.covered;
         let blink = (seen && self.ui.focused)
             .then(|| self.last_frame + Duration::from_secs_f32(self.ui.next_blink().max(0.01)));
         // A tooltip shows once the mouse has rested a moment, with nothing else moving.
@@ -1641,7 +1798,10 @@ impl App {
             Instant::now() + Duration::from_secs(left)
         });
         let next_frame = self.redraw_at.filter(|_| seen);
-        match blink.into_iter().chain(tip).chain(self.gpu_retry).chain(next_frame).chain(due).min() {
+        // While a frame is put off, waking for the screen any sooner would only spin.
+        let screen = blink.into_iter().chain(tip).chain(next_frame).min();
+        let screen = screen.map(|at| self.hold.map_or(at, |hold| at.max(hold)));
+        match screen.into_iter().chain(self.gpu_retry).chain(self.look_at).chain(due).min() {
             Some(at) => ControlFlow::WaitUntil(at),
             None => ControlFlow::Wait,
         }
@@ -1706,10 +1866,11 @@ fn provider_icons() -> HashMap<String, String> {
     pictures.filter_map(|path| Some((path.file_stem()?.to_str()?.to_lowercase(), path.display().to_string()))).collect()
 }
 
-/// The agent's process of a session: the Claude Code or the Codex the user installed.
+/// The agent's process of a session: the Claude Code, the Codex or the Antigravity the user installed.
 enum Live {
     Claude(ClaudeAgent),
     Codex(CodexAgent),
+    Antigravity(AntigravityAgent),
 }
 
 impl Live {
@@ -1718,6 +1879,7 @@ impl Live {
         match self {
             Self::Claude(agent) => agent.send(text, files).map_err(|e| e.to_string()),
             Self::Codex(agent) => agent.send(text, files).map_err(|e| e.to_string()),
+            Self::Antigravity(agent) => agent.send(text, files).map_err(|e| e.to_string()),
         }
     }
 
@@ -1727,15 +1889,17 @@ impl Live {
         match self {
             Self::Claude(agent) => drop(agent.follow_up(message)),
             Self::Codex(agent) => drop(agent.follow_up(message)),
+            Self::Antigravity(agent) => drop(agent.follow_up(message)),
         }
     }
 
     /// Stops the turn in progress; what was handed over and not read yet is
-    /// dropped when `cancel_queued`. (Codex keeps none: the app sends it again.)
+    /// dropped when `cancel_queued`. (Codex and Antigravity keep none: the app sends it again.)
     fn interrupt(&self, cancel_queued: bool) {
         match self {
             Self::Claude(agent) => agent.interrupt(cancel_queued),
             Self::Codex(agent) => agent.interrupt(),
+            Self::Antigravity(agent) => agent.interrupt(),
         }
     }
 
@@ -1744,6 +1908,7 @@ impl Live {
         match self {
             Self::Claude(agent) => agent.decide(id, verdict),
             Self::Codex(agent) => agent.decide(id, verdict),
+            Self::Antigravity(agent) => agent.decide(id, verdict),
         }
     }
 
@@ -1759,6 +1924,7 @@ impl Live {
         match self {
             Self::Claude(agent) => agent.close(),
             Self::Codex(agent) => agent.close(),
+            Self::Antigravity(agent) => agent.close(),
         }
     }
 }

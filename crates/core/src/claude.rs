@@ -193,6 +193,15 @@ pub fn claude_install() -> TerminalCommand {
     TerminalCommand::shell_line(CLAUDE_INSTALL.0, CLAUDE_INSTALL.1)
 }
 
+/// The command that updates Claude Code now: its own `update`, which
+/// Anthropic's setup page gives for not waiting until it updates itself in
+/// the background. The app only starts it, in a terminal the user sees.
+/// `None` when Claude Code is not installed.
+#[must_use]
+pub fn claude_update() -> Option<TerminalCommand> {
+    Some(TerminalCommand { program: sdk::find_cli()?, args: vec!["update".to_owned()], env: Vec::new() })
+}
+
 /// The command that signs the user in to the Claude account `connection`:
 /// Claude Code's own `auth login`, which opens Anthropic's sign-in in the
 /// browser. The app only starts it, in a terminal the user sees. `None`
@@ -875,7 +884,14 @@ impl Mapper {
                 out.push(AgentEvent::Note(format!("{} declined this request", model_name(&model))));
             }
             // The process's own list: the commands and skills of the session's folder are in it.
-            sdk::Event::Ready(info) => out.push(AgentEvent::Commands(commands(&info.commands))),
+            sdk::Event::Ready(info) => {
+                out.push(AgentEvent::Commands(commands(&info.commands)));
+                // And the account's models as Claude Code lists them now, which is not always as it did
+                // when the app last asked.
+                if !info.models.is_empty() {
+                    out.push(AgentEvent::Offer { models: info.models, version: info.version });
+                }
+            }
             sdk::Event::Commands(listed) => out.push(AgentEvent::Commands(commands(&listed))),
             sdk::Event::WritesLost { error_code, transcript } => {
                 let why = match error_code.as_str() {
@@ -1874,7 +1890,17 @@ mod probe {
     #[test]
     #[ignore = "starts the real Claude Code binary (without using any usage)"]
     fn claude_code_says_what_it_offers() {
-        let info = claude_info(&Connection::claude_agent()).unwrap();
+        // Another account's with `ATROXABOT_TEST_CLAUDE_DIR`: the folder of one the app added.
+        let mut account = Connection::claude_agent();
+        account.config_dir = std::env::var("ATROXABOT_TEST_CLAUDE_DIR").unwrap_or_default();
+        let info = claude_info(&account).unwrap();
+        println!("Claude Code {}", info.version);
+        for model in &info.models {
+            println!(
+                "{} = {} · {} · {} · {:?}",
+                model.value, model.resolved, model.display_name, model.description, model.efforts
+            );
+        }
         assert!(info.models.len() > 1 && info.models[0].value == "default", "{:?}", info.models);
         assert!(info.models.iter().all(|model| !model.resolved.is_empty()));
         assert!(!info.version.is_empty());

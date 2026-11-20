@@ -177,6 +177,15 @@ pub enum AgentEvent {
     /// The commands and skills a message can start with, as the agent's process offers them in the
     /// session's folder: each its name and a line on it. Not kept in the session.
     Commands(Vec<(String, String)>),
+    /// What a Claude account's process says the account offers as it starts: its models as Claude Code
+    /// lists them now, and its version. Newer than what the app was told when it last asked: Claude
+    /// Code's list changes while the app runs. Not kept in the session.
+    Offer {
+        /// The models, the default first.
+        models: Vec<crate::ClaudeModel>,
+        /// Claude Code's version.
+        version: String,
+    },
     /// The Claude Agent's own session id, to resume it later.
     Remote(String),
     /// The turn took in a message the user sent while it ran: the model
@@ -427,6 +436,7 @@ impl Session {
             }
             AgentEvent::Queued(_)
             | AgentEvent::Commands(_)
+            | AgentEvent::Offer { .. }
             | AgentEvent::Background { .. }
             | AgentEvent::Suggestion(_)
             | AgentEvent::Warning(_)

@@ -83,9 +83,11 @@ impl Shell {
     }
 
     /// Whether the plan limits of `connection` can be asked about: it is a
-    /// Claude or Codex account that is signed in.
+    /// Claude or Codex account that is signed in. Antigravity says nothing
+    /// of an account's limits to a client, and reading them the way its own
+    /// app does would take its sign-in, which is never the app's to touch.
     pub(super) fn can_check(&self, connection: &Connection) -> bool {
-        connection.kind.is_account() && self.signed_in(connection)
+        matches!(connection.kind, ConnectionKind::ClaudeAgent | ConnectionKind::Codex) && self.signed_in(connection)
     }
 
     /// The window has the user's attention again: limits on screen that may

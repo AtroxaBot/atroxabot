@@ -62,6 +62,15 @@ pub fn codex_install() -> TerminalCommand {
     TerminalCommand::shell_line(CODEX_INSTALL.0, CODEX_INSTALL.1)
 }
 
+/// The command that updates Codex: its own `update`, which checks for a
+/// newer release and puts it in place where the way it was installed lets
+/// it. The app only starts it, in a terminal the user sees. `None` when
+/// Codex is not installed.
+#[must_use]
+pub fn codex_update() -> Option<TerminalCommand> {
+    Some(TerminalCommand { program: sdk::find_cli()?, args: vec!["update".to_owned()], env: Vec::new() })
+}
+
 /// The command that signs the user in to the Codex account `connection`:
 /// Codex's own `login`, which opens OpenAI's sign-in in the browser. The app
 /// only starts it, in a terminal the user sees. `None` when Codex is not
