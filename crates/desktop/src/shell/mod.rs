@@ -1337,7 +1337,7 @@ impl Shell {
             let spent = Session {
                 id: thread.session.id.clone(),
                 agent: thread.session.agent.clone(),
-                entries: vec![atroxabot_core::Entry::Reply(reply)],
+                entries: vec![atroxabot_core::Entry::from(reply)],
                 ..Session::default()
             };
             if let Some(mut record) = Ledger::collect(std::slice::from_ref(&spent)).records.pop()

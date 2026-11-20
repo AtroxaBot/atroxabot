@@ -1000,7 +1000,8 @@ Everything lives in `~/.atroxabot/`:
 | `config.json` | Providers (with their API keys), voice providers (with theirs), MCP servers, recent folders, the theme, window and zoom, what closing the window does, whether email addresses are hidden, whether Claude accounts suggest the next message, whether the side panel is open, the order you dragged the sessions into, when unused worktrees are cleaned up, the repositories worktrees were made in, and what a session does when its account runs out. |
 | `agents/<id>.json` | One file per agent. |
 | `memory/<id>/notes.md` | An agent's notes. |
-| `sessions/<id>.json` | One file per session: its folder (and worktree, if any), the provider, model and effort it keeps, and for an API session the system prompt it began with, its replies as they arrived and the pictures its tools showed. |
+| `sessions/<id>.json` | A session: its folder (and worktree, if any), the provider, model and effort it keeps, for an API session the system prompt it began with, and what was said and done in its latest turn (its replies as they arrived and the pictures its tools showed), with a count of the entries before those. |
+| `sessions/<id>.log` | The session's earlier entries, a line of JSON each, as many as its `.json` counts. A session with only one turn has none. |
 | `sessions/.index.json` | What the sidebar and an opening session need: titles, and each session's provider, model and effort. |
 | `usage.jsonl` | What every reply used (when, which agent and session, the provider its turn ran on, the model, its tokens, cost and tool calls), a line each. The statistics are counted from it; it is started once from the saved sessions and only added to after that. |
 | `limits.json` | Each account's plan limits as last reported or checked, with the model a week of its own counts. |
@@ -1018,6 +1019,16 @@ Everything lives in `~/.atroxabot/`:
 
 Files the app writes are written atomically, `0600` on Unix. An API key is only sent to the address it was
 saved for.
+
+A session is not written again whole each time it is saved: a long one would be tens of megabytes, after
+every turn. Its `.json` is replaced atomically and holds the turn that still changes; the turns before it
+are added to its `.log`, which is otherwise left alone (cut back only where an earlier entry changed after
+all: a task in the background that answered late, `/clear`). Whatever the log holds beyond the lines the
+`.json` counts is not read, so a crash in the middle of a save leaves the session as it was before the save
+or as it is after it. A session saved this way says so (its `version` is 2): an AtroxaBot from before the
+log lists it and leaves it closed, where it would otherwise read the last turn alone and save over the rest.
+A session from before is read as it always was, and saved this way from then on. `core/src/session.rs`
+says how a save decides what to write.
 
 ### Releases
 

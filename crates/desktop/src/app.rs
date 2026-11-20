@@ -6,7 +6,7 @@
 //! [`WorkerEvent`]s posted to the event loop, and every file the app writes
 //! goes through one [`Writer`] thread, so the UI never blocks.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
@@ -23,8 +23,8 @@ use atroxabot_core::worktree;
 use atroxabot_core::{
     Agent, AgentEvent, AntigravityAgent, AntigravityError, AntigravityInfo, ApiEngine, ClaudeAgent, ClaudeError,
     ClaudeInfo, ClaudeMcpServer, Client, CodexAgent, CodexError, CodexInfo, Config, Connection, ConnectionKind,
-    Control, Error, FollowUp, Limits, McpHub, McpServer, Model, PlanCheck, Records, SearchHit, Session, SessionStore,
-    SessionSummary, Verdict,
+    Control, Error, FollowUp, Kept, Limits, McpHub, McpServer, Model, PlanCheck, Records, SearchHit, Session,
+    SessionStore, SessionSummary, Verdict,
 };
 use atroxabot_voice::{Call, CallEvent, CallOptions, VoiceConfig};
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -102,8 +102,9 @@ pub enum WorkerEvent {
     SessionLoaded {
         /// The session's id.
         session: String,
-        /// The session (boxed: it dwarfs the other events), or why it could not be read.
-        result: Result<Box<Session>, Error>,
+        /// The session (boxed: it dwarfs the other events) with what the writer needs to add to its
+        /// files rather than write them again, or why it could not be read.
+        result: Result<Box<(Session, Kept)>, Error>,
     },
     /// Something happened on the voice call.
     Call(CallEvent),
@@ -282,7 +283,10 @@ pub enum Action {
     LoadSession(String),
     /// Write a session to disk.
     SaveSession(Box<Session>),
-    /// Delete a session's file.
+    /// Have the writer let go of what it keeps of a session's files, and with that of its hold on
+    /// the session's replies: for a session whose messages the shell no longer holds.
+    ForgetSession(String),
+    /// Delete a session's files.
     DeleteSession(String),
     /// Write an agent to disk.
     SaveAgent(Box<Agent>),
@@ -924,7 +928,14 @@ impl App {
                 self.shell.models_loaded(&connection, result);
             }
             WorkerEvent::SessionLoaded { session, result } => {
-                self.shell.session_loaded(&session, result.map(|s| *s), &mut actions);
+                // The writer is told what the files hold before the shell has the session: whatever
+                // save the shell then asks for is queued after it, and adds to the files.
+                let result = result.map(|found| {
+                    let (loaded, kept) = *found;
+                    self.writer.send(Job::AdoptSession(session.clone(), kept));
+                    loaded
+                });
+                self.shell.session_loaded(&session, result, &mut actions);
             }
             WorkerEvent::Call(event) => {
                 if matches!(event, CallEvent::Ended(_)) {
@@ -1102,13 +1113,19 @@ impl App {
             },
             Action::LoadSession(session) => {
                 if let Some(store) = self.sessions_dir.clone().map(SessionStore::at) {
-                    self.spawn(move || WorkerEvent::SessionLoaded {
-                        result: store.load(&session).map(Box::new),
-                        session,
+                    // Read once the writes queued so far are done: a session that was just let go of
+                    // (`shell/warm.rs`) may have its last save still waiting, and would be read without it.
+                    let (written, wait) = mpsc::channel();
+                    self.writer.send(Job::Written(written));
+                    self.spawn(move || {
+                        // An error is the writer gone, with the app.
+                        let _ = wait.recv();
+                        WorkerEvent::SessionLoaded { result: store.load_kept(&session).map(Box::new), session }
                     });
                 }
             }
             Action::SaveSession(session) => self.writer.send(Job::SaveSession(session)),
+            Action::ForgetSession(session) => self.writer.send(Job::ForgetSession(session)),
             Action::DeleteSession(session) => {
                 self.preparing.remove(&session);
                 self.retuning.remove(&session);
@@ -2077,6 +2094,10 @@ fn window_state(saved: Option<&str>) -> ((u32, u32), bool) {
 /// A file write for the [`Writer`] thread.
 enum Job {
     SaveSession(Box<Session>),
+    /// Take what reading a session found of its files, so its next save adds to them.
+    AdoptSession(String, Kept),
+    /// Let go of what is kept of a session's files.
+    ForgetSession(String),
     DeleteSession(String),
     SaveConfig(Box<Config>),
     SaveAgent(Records, Box<Agent>),
@@ -2090,19 +2111,61 @@ enum Job {
     /// List the saved sessions and send them back, with how many files
     /// could not be read.
     ListSessions(mpsc::Sender<(Vec<SessionSummary>, usize)>),
+    /// Say that everything queued before this is written: what waits to read a session goes on.
+    Written(mpsc::Sender<()>),
 }
 
 /// Tells the user about a write that failed; called on the writer thread.
 type Report = Arc<dyn Fn(String) + Send + Sync>;
 
 impl Job {
+    /// Whether the job reads or writes the files of the session `id`, or what the store keeps of them.
+    fn touches(&self, id: &str) -> bool {
+        match self {
+            Self::SaveSession(session) => session.id == id,
+            Self::AdoptSession(session, _) | Self::ForgetSession(session) | Self::DeleteSession(session) => {
+                session == id
+            }
+            // Both read every session, and whoever waits for what is written reads one.
+            Self::StartUsageLog | Self::ListSessions(_) | Self::Written(_) => true,
+            Self::SaveConfig(_)
+            | Self::SaveAgent(..)
+            | Self::DeleteAgent(..)
+            | Self::LogUsage(_)
+            | Self::SaveLimits(_) => false,
+        }
+    }
+
+    /// Whether this is a save that need not be written, since `queued` (the jobs after it, in
+    /// order) saves the same session again before anything else touches it: the newer save holds
+    /// all this one does.
+    fn superseded(&self, queued: &VecDeque<Self>) -> bool {
+        let Self::SaveSession(session) = self else { return false };
+        queued.iter().find(|job| job.touches(&session.id)).is_some_and(|job| matches!(job, Self::SaveSession(_)))
+    }
+
     /// Performs the job against `store` (`None`: sessions are not saved).
     /// A failure is logged and handed to `report`, for the user.
     fn run(self, store: Option<&mut SessionStore>, report: &dyn Fn(String)) {
         let result = match (self, store) {
             (Self::SaveSession(session), Some(store)) => store.save(&session).map_err(|e| ("save the session", e)),
+            (Self::AdoptSession(id, kept), Some(store)) => {
+                store.adopt(&id, kept);
+                Ok(())
+            }
+            (Self::ForgetSession(id), Some(store)) => {
+                store.forget(&id);
+                Ok(())
+            }
             (Self::DeleteSession(id), Some(store)) => store.delete(&id).map_err(|e| ("delete the session", e)),
-            (Self::SaveSession(_) | Self::DeleteSession(_) | Self::StartUsageLog, None) => Ok(()),
+            (
+                Self::SaveSession(_)
+                | Self::AdoptSession(..)
+                | Self::ForgetSession(_)
+                | Self::DeleteSession(_)
+                | Self::StartUsageLog,
+                None,
+            ) => Ok(()),
             (Self::SaveConfig(config), _) => config.save().map_err(|e| ("save the settings", e)),
             (Self::SaveAgent(agents, agent), _) => agents.save(&agent.id, &*agent).map_err(|e| ("save the agent", e)),
             (Self::DeleteAgent(agents, id), _) => agents.delete(&id).map_err(|e| ("delete the agent", e)),
@@ -2116,6 +2179,11 @@ impl Job {
                 Ledger::path().and_then(|path| Ledger::append(&path, &record)).map_err(|e| ("log what was used", e))
             }
             (Self::SaveLimits(limits), _) => stats::save_limits(&limits).map_err(|e| ("keep the plan limits", e)),
+            (Self::Written(done), _) => {
+                // Whoever waited is gone only if the app is closing.
+                let _ = done.send(());
+                Ok(())
+            }
             (Self::ListSessions(reply), store) => {
                 let listed = match store.map(SessionStore::list) {
                     Some(Ok((sessions, errors))) => {
@@ -2144,6 +2212,8 @@ impl Job {
 
 /// Owns the session store on a background thread and performs every file
 /// write in the order it was queued, so the UI never waits on the disk.
+/// Of several saves of one session waiting together it writes the newest,
+/// where nothing else of that session lies between them ([`Job::superseded`]).
 /// Dropping it finishes the queue first, so nothing is lost on exit.
 struct Writer {
     queue: Option<mpsc::Sender<Job>>,
@@ -2163,8 +2233,14 @@ impl Writer {
         let (fallback, theirs) = (dir.clone(), Arc::clone(&report));
         let spawned = std::thread::Builder::new().name("atroxabot-writer".into()).spawn(move || {
             let mut store = dir.map(SessionStore::at);
-            for job in jobs {
-                job.run(store.as_mut(), &*theirs);
+            let mut waiting = VecDeque::new();
+            // Ends once the queue is closed and everything sent before that is done.
+            while let Some(job) = waiting.pop_front().or_else(|| jobs.recv().ok()) {
+                // What came in meanwhile is looked at with it, to see whether a newer save follows.
+                waiting.extend(jobs.try_iter());
+                if !job.superseded(&waiting) {
+                    job.run(store.as_mut(), &*theirs);
+                }
             }
         });
         match spawned {
@@ -2351,6 +2427,87 @@ mod tests {
         assert_eq!(window_state(Some("1440x900 maximized")), ((1440, 900), true));
         assert_eq!(window_state(Some("10x99999")), ((MIN_WINDOW_SIZE.0, 16_384), false), "clamped");
         assert_eq!(window_state(Some("nonsense")), (WINDOW_SIZE, false));
+    }
+
+    #[test]
+    fn of_several_saves_waiting_only_the_newest_is_written() {
+        let save = |id: &str| Job::SaveSession(Box::new(Session { id: id.into(), ..Session::default() }));
+        let forget = |id: &str| Job::ForgetSession(id.into());
+        let delete = |id: &str| Job::DeleteSession(id.into());
+        // Whether the first of `jobs` is left out for what waits behind it.
+        let superseded = |jobs: Vec<Job>| {
+            let mut waiting = VecDeque::from(jobs);
+            waiting.pop_front().is_some_and(|first| first.superseded(&waiting))
+        };
+        assert!(superseded(vec![save("a"), save("a")]));
+        let usage = Job::LogUsage(Box::default());
+        assert!(
+            superseded(vec![save("a"), save("b"), usage, delete("b"), save("a")]),
+            "another session's are no matter"
+        );
+        assert!(!superseded(vec![save("a")]), "the newest is written");
+        assert!(!superseded(vec![save("a"), save("b")]));
+        // What else touches the session between them is done in its place, after the save before it.
+        assert!(!superseded(vec![save("a"), forget("a"), save("a")]));
+        assert!(!superseded(vec![save("a"), delete("a"), save("a")]));
+        let (reply, _listed) = mpsc::channel();
+        assert!(!superseded(vec![save("a"), Job::ListSessions(reply), save("a")]), "a listing reads every session");
+        assert!(!superseded(vec![save("a"), Job::StartUsageLog, save("a")]));
+        let (written, _wait) = mpsc::channel();
+        assert!(!superseded(vec![save("a"), Job::Written(written), save("a")]), "a read waits for the first");
+        assert!(!superseded(vec![delete("a"), save("a")]), "only a save is ever left out");
+    }
+
+    #[test]
+    fn the_writer_adds_to_a_session_it_was_told_of_and_ends_with_the_newest() {
+        let dir = std::env::temp_dir().join(format!("atroxabot-writer-{}", std::process::id())).join("sessions");
+        let _ = std::fs::remove_dir_all(&dir);
+        let turn = |session: &mut Session, prompt: &str| {
+            session.prompt(prompt, "");
+            session.apply(&AgentEvent::Text(format!("Done with {prompt}.")));
+        };
+        let sealed = |session: &Session| {
+            let file = std::fs::read(dir.join(format!("{}.json", session.id))).unwrap();
+            serde_json::from_slice::<serde_json::Value>(&file).unwrap()["sealed"].as_u64()
+        };
+        let failed = Arc::new(Mutex::new(Vec::new()));
+        let start = || {
+            let failed = Arc::clone(&failed);
+            Writer::start(Some(dir.clone()), move |problem| failed.lock().unwrap().push(problem))
+        };
+        // Saved by an earlier run of the app, and opened in this one.
+        let mut session = Session::new("scout");
+        turn(&mut session, "one");
+        turn(&mut session, "two");
+        SessionStore::at(dir.clone()).save(&session).unwrap();
+        assert_eq!(sealed(&session), Some(0));
+        let (mut session, kept) = SessionStore::at(dir.clone()).load_kept(&session.id).unwrap();
+
+        // Told what the read found, the writer's first save seals what was read: it adds a turn to the
+        // files, where a writer that knows nothing of them writes every entry again.
+        let mut writer = start();
+        writer.send(Job::AdoptSession(session.id.clone(), kept));
+        turn(&mut session, "three");
+        writer.send(Job::SaveSession(Box::new(session.clone())));
+        drop(writer);
+        assert_eq!(sealed(&session), Some(4));
+        assert_eq!(SessionStore::at(dir.clone()).load(&session.id).unwrap(), session);
+
+        // However many saves wait together, what is on disk in the end is the newest.
+        let mut writer = start();
+        for number in 0..50 {
+            turn(&mut session, &format!("turn {number}"));
+            writer.send(Job::SaveSession(Box::new(session.clone())));
+        }
+        writer.send(Job::ForgetSession(session.id.clone()));
+        drop(writer);
+        assert_eq!(SessionStore::at(dir.clone()).load(&session.id).unwrap(), session);
+        writer = start();
+        writer.send(Job::DeleteSession(session.id.clone()));
+        drop(writer);
+        assert!(std::fs::read_dir(&dir).unwrap().flatten().all(|file| file.file_name() == ".index.json"));
+        assert!(failed.lock().unwrap().is_empty(), "{failed:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

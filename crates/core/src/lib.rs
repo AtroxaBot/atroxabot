@@ -75,7 +75,7 @@ pub use responses::{
     Completion, InputItem, Picture, ResponseRequest, Role, StreamEvent, ToolCall, ToolChoice, ToolSpec, Usage, Wire,
 };
 pub use session::{
-    Block, ContextPart, Entry, Reply, SearchHit, Session, SessionStore, SessionSummary, Todo, TodoState, ToolUse,
+    Block, ContextPart, Entry, Kept, Reply, SearchHit, Session, SessionStore, SessionSummary, Todo, TodoState, ToolUse,
     new_id, unix_now,
 };
 pub use worktree::Worktree;
