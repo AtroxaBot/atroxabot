@@ -165,6 +165,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "atroxabot-antigravity"
+version = "0.1.13"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "atroxabot-claude-agent"
 version = "0.1.13"
 dependencies = [
@@ -182,6 +189,7 @@ dependencies = [
 name = "atroxabot-core"
 version = "0.1.13"
 dependencies = [
+ "atroxabot-antigravity",
  "atroxabot-claude-agent",
  "atroxabot-codex",
  "atroxabot-mcp",

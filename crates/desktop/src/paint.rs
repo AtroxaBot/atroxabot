@@ -2,7 +2,7 @@
 
 use crate::gpu::Instance;
 use crate::image::{ImageAtlas, ImageKey, Lookup, MAX_WHOLE};
-use crate::logo::Logo;
+use crate::logo::{Logo, Picture};
 use crate::text::{Align, Fonts, GlyphAtlas, Style, TextLayout};
 use crate::theme::Palette;
 
@@ -354,6 +354,24 @@ impl<'a> Painter<'a> {
             uv: [f32::from(entry.x), f32::from(entry.y), w, h],
             params: [0.0, 0.0, 0.0, KIND_GLYPH],
         });
+    }
+
+    /// Draws a platform's mark that is a picture, `size` logical pixels
+    /// square, centred on `center`, in its own colours at `alpha`. It is
+    /// there at once ([`ImageAtlas::carried`]), like a mark from an outline.
+    pub fn mark(&mut self, picture: Picture, center: (f32, f32), size: f32, alpha: f32) {
+        let s = self.scale;
+        let px = (size * s).round().max(1.0);
+        let (left, top) = ((center.0 * s - px * 0.5).round(), (center.1 * s - px * 0.5).round());
+        let rect = Rect::new(left / s, top / s, px / s, px / s);
+        // Don't decode what is scrolled out of view.
+        if self.clip.intersect(rect).w <= 0.0 || self.clip.intersect(rect).h <= 0.0 {
+            return;
+        }
+        let key = ImageKey { path: picture.key().to_owned(), w: px as u32, h: px as u32, whole: false };
+        if let Some(uv) = self.images.carried(&key, picture.bytes()) {
+            self.push(rect, [1.0, 1.0, 1.0, alpha], [1.0; 4], [0.0, 0.0, 0.0, KIND_IMAGE], uv);
+        }
     }
 
     /// Lays out and draws a single line; returns its width.

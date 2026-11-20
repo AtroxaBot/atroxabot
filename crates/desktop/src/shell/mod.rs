@@ -39,9 +39,9 @@ use std::time::Instant;
 use arboard::Clipboard;
 use atroxabot_core::stats::Ledger;
 use atroxabot_core::{
-    Agent, AgentEvent, CALL_ENDED, CALL_STARTED, ClaudeError, ClaudeInfo, ClaudeMcpServer, CodexError, CodexInfo,
-    Config, Connection, ConnectionKind, Error, LimitWindow, Limits, Model, SearchHit, Session, SessionSummary, Verdict,
-    unix_now,
+    Agent, AgentEvent, AntigravityError, AntigravityInfo, CALL_ENDED, CALL_STARTED, ClaudeError, ClaudeInfo,
+    ClaudeMcpServer, CodexError, CodexInfo, Config, Connection, ConnectionKind, Error, LimitWindow, Limits, Model,
+    SearchHit, Session, SessionSummary, Verdict, unix_now,
 };
 use atroxabot_voice::CallEvent;
 use winit::event::KeyEvent;
@@ -113,16 +113,18 @@ pub(super) enum Connectors {
     Failed(String),
 }
 
-/// A command-line agent the app runs as installed: Claude Code or Codex.
+/// A command-line agent the app runs as installed: Claude Code, Codex or Antigravity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Cli {
     /// Claude Code, for Claude accounts.
     Claude,
     /// The Codex CLI, for Codex accounts.
     Codex,
+    /// The Antigravity CLI (`agy`), for Antigravity accounts.
+    Antigravity,
 }
 
-/// What a Claude or Codex account says while its tool's installer is open and the tool is not found yet.
+/// What an account says while its tool's installer is open and the tool is not found yet.
 const INSTALLING: &str = "Installing: finish in the installer's window";
 
 /// What is known of a Claude account: what Claude Code said when asked.
@@ -149,6 +151,32 @@ enum CodexAccount {
     Failed(String),
     /// Its models and who is signed in.
     Ready(Box<CodexInfo>),
+}
+
+/// What is known of an Antigravity account: what Antigravity said when asked.
+#[derive(Debug, Clone)]
+enum AntigravityAccount {
+    /// Being asked, or not asked yet.
+    Checking,
+    /// Antigravity is not installed.
+    Missing,
+    /// It could not be asked; why.
+    Failed(String),
+    /// Its models and whether it is signed in.
+    Ready(Box<AntigravityInfo>),
+}
+
+/// How an account of Codex or of Antigravity stands, for its row in the settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Standing {
+    /// Signed in.
+    SignedIn,
+    /// Its tool answered, and no one is signed in.
+    SignedOut,
+    /// Its tool is not installed.
+    Missing,
+    /// Not known yet.
+    Unknown,
 }
 
 /// Something the user is told, on a card under the top bar, until they dismiss it.
@@ -187,6 +215,11 @@ pub struct Shell {
     claude: HashMap<String, Account>,
     /// What Codex says of each Codex account, by connection id.
     codex: HashMap<String, CodexAccount>,
+    /// What Antigravity says of each Antigravity account, by connection id.
+    antigravity: HashMap<String, AntigravityAccount>,
+    /// The Antigravity accounts being asked about now: starting Antigravity takes a while, so none is
+    /// asked twice at once.
+    antigravity_asked: HashSet<String>,
     /// The tools whose installer was opened and that have not been found since.
     installing: HashSet<Cli>,
     /// Problems to tell the user about, oldest first.
@@ -267,6 +300,8 @@ impl Shell {
             models: HashMap::new(),
             claude: HashMap::new(),
             codex: HashMap::new(),
+            antigravity: HashMap::new(),
+            antigravity_asked: HashSet::new(),
             installing: HashSet::new(),
             notices: Vec::new(),
             warned: HashSet::new(),
@@ -328,7 +363,7 @@ impl Shell {
         self.limits = limits;
     }
 
-    /// Asks Claude Code (or Codex) what the account `connection` offers.
+    /// Asks Claude Code (or Codex, or Antigravity) what the account `connection` offers.
     fn probe(&mut self, connection: &Connection, actions: &mut Vec<Action>) {
         match connection.kind {
             ConnectionKind::ClaudeAgent => {
@@ -339,8 +374,88 @@ impl Shell {
                 self.codex.entry(connection.id.clone()).or_insert(CodexAccount::Checking);
                 actions.push(Action::ProbeCodex(Box::new(connection.clone())));
             }
+            // What is kept of it, where anything is: starting Antigravity to ask takes a while.
+            ConnectionKind::Antigravity => {
+                self.antigravity.entry(connection.id.clone()).or_insert(AntigravityAccount::Checking);
+                self.ask_antigravity(connection, false, actions);
+            }
             ConnectionKind::ClaudeApi | ConnectionKind::OpenAi => {}
         }
+    }
+
+    /// Asks Antigravity what the account `connection` offers, unless it is being asked already: what
+    /// is kept of it, or (`fresh`) by starting Antigravity, which takes it a while.
+    fn ask_antigravity(&mut self, connection: &Connection, fresh: bool, actions: &mut Vec<Action>) {
+        if self.antigravity_asked.insert(connection.id.clone()) {
+            actions.push(Action::ProbeAntigravity { connection: Box::new(connection.clone()), fresh });
+        }
+    }
+
+    /// Antigravity answered (or could not) about the Antigravity account `connection`.
+    pub fn antigravity_info(&mut self, connection: &str, result: Result<AntigravityInfo, AntigravityError>) {
+        self.antigravity_asked.remove(connection);
+        let account = match result {
+            Ok(info) => {
+                self.installing.remove(&Cli::Antigravity);
+                AntigravityAccount::Ready(Box::new(info))
+            }
+            Err(AntigravityError::NotFound) => AntigravityAccount::Missing,
+            Err(e) => AntigravityAccount::Failed(e.to_string()),
+        };
+        self.antigravity.insert(connection.to_owned(), account);
+    }
+
+    /// Whether the Antigravity account `connection` is known to be signed in.
+    fn antigravity_signed_in(&self, connection: &str) -> bool {
+        matches!(self.antigravity.get(connection), Some(AntigravityAccount::Ready(info)) if info.signed_in)
+    }
+
+    /// How the Codex or Antigravity account `connection` stands.
+    pub(super) fn standing(&self, connection: &Connection) -> Standing {
+        let (answered, missing) = if connection.kind == ConnectionKind::Antigravity {
+            let state = self.antigravity.get(&connection.id);
+            let answered = matches!(state, Some(AntigravityAccount::Ready(_) | AntigravityAccount::Failed(_)));
+            (answered, matches!(state, Some(AntigravityAccount::Missing)))
+        } else {
+            let state = self.codex.get(&connection.id);
+            let answered = matches!(state, Some(CodexAccount::Ready(_) | CodexAccount::Failed(_)));
+            (answered, matches!(state, Some(CodexAccount::Missing)))
+        };
+        match (self.signed_in(connection), answered, missing) {
+            (true, ..) => Standing::SignedIn,
+            (_, true, _) => Standing::SignedOut,
+            (_, _, true) => Standing::Missing,
+            _ => Standing::Unknown,
+        }
+    }
+
+    /// Asks the tool of the Codex or Antigravity account `connection` about it anew, as the refresh
+    /// icon on its row does.
+    pub(super) fn read_anew(&mut self, connection: &Connection, actions: &mut Vec<Action>) {
+        if connection.kind == ConnectionKind::Antigravity {
+            self.antigravity.insert(connection.id.clone(), AntigravityAccount::Checking);
+            self.ask_antigravity(connection, true, actions);
+        } else {
+            self.codex.insert(connection.id.clone(), CodexAccount::Checking);
+            actions.push(Action::ProbeCodex(Box::new(connection.clone())));
+        }
+    }
+
+    /// The Codex or Antigravity account `connection` was just added and its sign-in opened: it is
+    /// asked about when the user comes back to the window ([`Shell::focused`]).
+    pub(super) fn signing_in(&mut self, connection: &Connection) {
+        if connection.kind == ConnectionKind::Antigravity {
+            self.antigravity.insert(connection.id.clone(), AntigravityAccount::Checking);
+        } else {
+            self.codex.insert(connection.id.clone(), CodexAccount::Checking);
+        }
+    }
+
+    /// The Codex or Antigravity account `connection` left the list.
+    pub(super) fn forget_account(&mut self, connection: &str) {
+        self.codex.remove(connection);
+        self.antigravity.remove(connection);
+        self.antigravity_asked.remove(connection);
     }
 
     /// Codex answered (or could not) about the Codex account `connection`.
@@ -428,6 +543,9 @@ impl Shell {
                 && !matches!(self.codex.get(&connection.id), Some(CodexAccount::Checking))
             {
                 actions.push(Action::ProbeCodex(Box::new(connection)));
+            } else if connection.kind == ConnectionKind::Antigravity && !self.antigravity_signed_in(&connection.id) {
+                // Found since its installer ran, or signed in since: only starting it says.
+                self.ask_antigravity(&connection, true, actions);
             }
         }
     }
@@ -840,6 +958,19 @@ impl Shell {
                     return None;
                 }
                 Some(CodexAccount::Ready(info)) if info.account.is_none() && info.requires_auth => {
+                    self.notify(format!("{} is not signed in. Sign in under Settings, Providers.", connection.name));
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        if connection.kind == ConnectionKind::Antigravity {
+            match self.antigravity.get(&connection.id) {
+                Some(AntigravityAccount::Missing) => {
+                    self.notify("Antigravity is not installed: install it in Settings, Providers.".into());
+                    return None;
+                }
+                Some(AntigravityAccount::Ready(info)) if !info.signed_in => {
                     self.notify(format!("{} is not signed in. Sign in under Settings, Providers.", connection.name));
                     return None;
                 }
@@ -3517,6 +3648,103 @@ mod tests {
         actions.clear();
         shell.send("/compact", false, Vec::new(), &mut actions);
         assert!(sent_texts(&actions).is_empty());
+    }
+
+    /// A shell whose one agent thinks through an Antigravity account, and that account.
+    fn on_antigravity() -> (Shell, Connection, Vec<Action>) {
+        let account = Connection::antigravity("Antigravity");
+        let agent = Agent { connection: account.id.clone(), ..Agent::new("Scout") };
+        let mut config = Config::default();
+        config.connections.push(account.clone());
+        let mut shell = Shell::new(config, vec![agent], Vec::new());
+        let mut actions = Vec::new();
+        shell.start(&mut actions);
+        (shell, account, actions)
+    }
+
+    /// What Antigravity says of a signed-in account: two models, the second the one it picks.
+    fn antigravity_offer() -> AntigravityInfo {
+        let level = |id: &str| atroxabot_core::AntigravityEffort { id: id.into(), name: id.to_uppercase() };
+        let model = |id: &str| atroxabot_core::AntigravityModel {
+            id: id.into(),
+            name: id.to_uppercase(),
+            description: String::new(),
+        };
+        AntigravityInfo {
+            version: "1.5.12".into(),
+            signed_in: true,
+            catalog: atroxabot_core::AntigravityCatalog {
+                models: vec![model("flash"), model("pro")],
+                model: "pro".into(),
+                efforts: vec![level("low"), level("high")],
+                effort: "high".into(),
+            },
+            efforts: vec![("pro".into(), vec![level("low"), level("high")]), ("flash".into(), vec![level("low")])],
+            commands: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_antigravity_account_is_asked_once_and_answers_with_its_own_models() {
+        let (mut shell, account, mut actions) = on_antigravity();
+        // At the start what is kept of it is asked for, which starts nothing.
+        let asked = |actions: &[Action], anew: bool| {
+            let fits = |a: &Action| matches!(a, Action::ProbeAntigravity { connection, fresh } if connection.id == account.id && *fresh == anew);
+            actions.iter().filter(|a| fits(a)).count()
+        };
+        assert_eq!((asked(&actions, false), asked(&actions, true)), (1, 0));
+        assert_eq!(shell.standing(&account), Standing::Unknown);
+        // Not installed: nothing goes, and its row offers the installer.
+        shell.antigravity_info(&account.id, Err(AntigravityError::NotFound));
+        assert_eq!(shell.standing(&account), Standing::Missing);
+        shell.send("Hello", false, Vec::new(), &mut actions);
+        assert!(!actions.iter().any(|a| matches!(a, Action::Send { .. })));
+        assert!(shell.notices.iter().any(|notice| notice.text.contains("Antigravity is not installed")));
+
+        // Back in the window with the settings open, it is looked for again, once however often.
+        shell.modal = Some(Modal::Settings(Box::new(settings::Settings::new(settings::Tab::Providers))));
+        actions.clear();
+        shell.focused(&mut actions);
+        shell.focused(&mut actions);
+        assert_eq!(asked(&actions, true), 1, "starting it takes a while: one at a time");
+        // Installed, and nobody signed in: it can sign in, and nothing goes yet.
+        shell.antigravity_info(
+            &account.id,
+            Ok(AntigravityInfo { version: "1.5.12".into(), ..AntigravityInfo::default() }),
+        );
+        assert_eq!(shell.standing(&account), Standing::SignedOut);
+        assert_eq!(shell.provider_detail(&account), "Not signed in");
+        actions.clear();
+        shell.focused(&mut actions);
+        assert_eq!(asked(&actions, true), 1, "signed in since, perhaps");
+        shell.antigravity_info(&account.id, Ok(antigravity_offer()));
+        assert_eq!(shell.standing(&account), Standing::SignedIn);
+        actions.clear();
+        shell.focused(&mut actions);
+        assert_eq!(asked(&actions, true), 0, "signed in: nothing to ask");
+        shell.modal = None;
+
+        // Its own models, the one it picks by itself first, each with the levels it takes.
+        let choices = shell.model_choices(&account);
+        let listed: Vec<(&str, usize, &str)> =
+            choices.iter().map(|choice| (choice.value.as_str(), choice.efforts.len(), choice.usual.as_str())).collect();
+        assert_eq!(listed, [("pro", 2, "high"), ("flash", 1, "")]);
+        // It goes with Antigravity's own choice of model, at the level that model is at.
+        shell.send("Hello", false, Vec::new(), &mut actions);
+        let sent = actions.iter().find_map(|a| match a {
+            Action::Send { agent, connection, .. } => {
+                Some((agent.model.clone(), agent.effort.clone(), connection.kind))
+            }
+            _ => None,
+        });
+        assert_eq!(sent, Some((String::new(), "high".into(), ConnectionKind::Antigravity)));
+        // Its limits are not the app's to ask about: Antigravity says nothing of them to a client.
+        assert!(!shell.can_check(&account));
+        // The refresh icon starts it to ask anew.
+        actions.clear();
+        shell.read_anew(&account, &mut actions);
+        assert_eq!(asked(&actions, true), 1);
+        assert_eq!(shell.standing(&account), Standing::Unknown);
     }
 
     fn atroxabot_codex_account(email: &str, plan: &str) -> atroxabot_core::CodexAccount {

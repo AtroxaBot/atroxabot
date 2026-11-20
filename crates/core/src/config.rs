@@ -35,18 +35,21 @@ pub enum ConnectionKind {
     /// The Codex CLI the user installed and signed in to, driven through
     /// its app server. AtroxaBot never sees its sign-in.
     Codex,
+    /// The Antigravity CLI (`agy`) the user installed and signed in to,
+    /// driven through `agy acp`. AtroxaBot never sees its sign-in.
+    Antigravity,
 }
 
 impl ConnectionKind {
     /// Every kind, in the order menus list them.
-    pub const ALL: [Self; 4] = [Self::ClaudeAgent, Self::Codex, Self::ClaudeApi, Self::OpenAi];
+    pub const ALL: [Self; 5] = [Self::ClaudeAgent, Self::Codex, Self::Antigravity, Self::ClaudeApi, Self::OpenAi];
 
     /// Whether it runs an agent the user installed and signed in to (Claude
-    /// Code, Codex), which keeps the conversation and brings its own tools,
-    /// rather than an API the app runs the agent loop over.
+    /// Code, Codex, Antigravity), which keeps the conversation and brings its
+    /// own tools, rather than an API the app runs the agent loop over.
     #[must_use]
     pub fn is_account(self) -> bool {
-        matches!(self, Self::ClaudeAgent | Self::Codex)
+        matches!(self, Self::ClaudeAgent | Self::Codex | Self::Antigravity)
     }
 
     /// The name menus show. "Claude Agent" is the name Anthropic's branding
@@ -58,6 +61,7 @@ impl ConnectionKind {
             Self::ClaudeApi => "Claude API",
             Self::OpenAi => "OpenAI-compatible",
             Self::Codex => "Codex",
+            Self::Antigravity => "Antigravity",
         }
     }
 }
@@ -80,7 +84,8 @@ pub struct Connection {
     /// For a Claude account: the folder Claude Code keeps this account's
     /// sign-in, settings and history in (its `CLAUDE_CONFIG_DIR`). Empty for
     /// Claude Code's own default folder, the account it already uses. For a
-    /// Codex account, the same of Codex (its `CODEX_HOME`).
+    /// Codex account, the same of Codex (its `CODEX_HOME`), and for an
+    /// Antigravity account of Antigravity (its `--gemini-dir`).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub config_dir: String,
 }
@@ -132,6 +137,32 @@ impl Connection {
         let id = crate::session::new_id();
         let config_dir = Config::dir()?.join("codex").join(&id).display().to_string();
         Ok(Self { id, kind: ConnectionKind::Codex, name: name.to_owned(), config_dir, ..Self::default() })
+    }
+
+    /// The Antigravity account the user already has: whoever `agy` is
+    /// signed in as in their terminal, with Antigravity's own settings.
+    #[must_use]
+    pub fn antigravity(name: &str) -> Self {
+        Self {
+            id: crate::session::new_id(),
+            kind: ConnectionKind::Antigravity,
+            name: name.to_owned(),
+            ..Self::default()
+        }
+    }
+
+    /// Another Antigravity account, kept apart from the first: Antigravity
+    /// is started for it with a folder of its own under
+    /// `~/.atroxabot/antigravity/`, where it keeps that account's sign-in,
+    /// settings and conversations. The user signs in to it with Antigravity
+    /// itself.
+    ///
+    /// # Errors
+    /// [`Error::NoHomeDir`] if the platform reports no home directory.
+    pub fn antigravity_account(name: &str) -> Result<Self> {
+        let id = crate::session::new_id();
+        let config_dir = Config::dir()?.join("antigravity").join(&id).display().to_string();
+        Ok(Self { id, kind: ConnectionKind::Antigravity, name: name.to_owned(), config_dir, ..Self::default() })
     }
 
     /// The host of its address, for showing where an API connection goes.

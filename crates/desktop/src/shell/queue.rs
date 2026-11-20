@@ -76,10 +76,10 @@ impl Shell {
         if thread.stopping {
             return;
         }
-        // Claude Code keeps what it is handed and answers it after the stop. Codex would drop it with the turn
-        // it was put into: there it goes as the next message instead, once the turn has stopped.
-        let kept =
-            self.config.connection(&thread.sent_on).map(|connection| connection.kind) != Some(ConnectionKind::Codex);
+        // Claude Code keeps what it is handed and answers it after the stop. Codex and Antigravity would drop it
+        // with the turn it was put into: there it goes as the next message instead, once the turn has stopped.
+        let on = self.config.connection(&thread.sent_on).map(|connection| connection.kind);
+        let kept = !matches!(on, Some(ConnectionKind::Codex | ConnectionKind::Antigravity));
         for waiting in thread.follow_ups.iter_mut().filter(|w| kept && !w.sent && !is_command(&w.message.text)) {
             waiting.sent = true;
             actions.push(Action::FollowUp { session: session.to_owned(), message: Box::new(waiting.message.clone()) });

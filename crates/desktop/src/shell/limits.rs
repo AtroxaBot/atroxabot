@@ -244,6 +244,7 @@ impl Shell {
                 matches!(self.claude.get(&connection.id), Some(Account::Ready(info)) if !info.account.email.is_empty())
             }
             ConnectionKind::Codex => self.codex_signed_in(&connection.id),
+            ConnectionKind::Antigravity => self.antigravity_signed_in(&connection.id),
             ConnectionKind::ClaudeApi | ConnectionKind::OpenAi => false,
         }
     }

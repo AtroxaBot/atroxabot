@@ -2,7 +2,8 @@
 
 AtroxaBot is a native desktop app for agents the user chats with and calls. It is a Cargo workspace:
 `crates/claude-agent` (the Rust port of the Claude Agent SDK's transport), `crates/codex` (the transport
-for the installed Codex CLI's app server), `crates/mcp` (a small MCP client), `crates/core` (agents, sessions, API client, agent loop and tools, usage statistics, git, the sessions' worktrees, updating the app; no GUI), `crates/voice` (Fish
+for the installed Codex CLI's app server), `crates/antigravity` (the transport for the installed
+Antigravity CLI's `agy acp`), `crates/mcp` (a small MCP client), `crates/core` (agents, sessions, API client, agent loop and tools, usage statistics, git, the sessions' worktrees, updating the app; no GUI), `crates/voice` (Fish
 Audio and ElevenLabs, the call loop, audio devices) and `crates/desktop` (the app; package and binary
 `atroxabot`). `README.md` describes every feature, the crate layout and the storage format: read it before
 changing behaviour, and keep it current when you do.
@@ -37,6 +38,14 @@ cargo fmt --all --check
   app sets `CODEX_HOME` to select an extra account's folder and never looks
   inside it. What the app gives Codex (MCP servers, the skill library) is for the run only: nothing is
   written to an account's configuration.
+- **Antigravity accounts, the same way.** Run the user's installed Antigravity binary as published (`agy
+  acp`), never a `.cmd` launcher, and say the app is AtroxaBot, never another client. Never read, store
+  or forward its credentials, and never send `authenticate`: signing in is `agy acp --login`, started in
+  a terminal the user sees, and installing is Google's own installer (`ANTIGRAVITY_INSTALL`), the same
+  way. Its plan limits are not shown, because reading them takes its sign-in. The app gives an extra
+  account a folder of its own (`--gemini-dir`, with `SSH_CONNECTION` so that Antigravity keeps the
+  sign-in there) and never looks inside it. It unpacks itself at every start: never start it only to
+  ask what an account offers when that is kept already (`antigravity_info`, `antigravity.json`).
 - **Rust-native, custom UI.** `winit` + `wgpu`, and we draw the app's interface ourselves. No UI
   frameworks (egui, iced, Tauri, …).
 - **Beautiful, elegant and fast.** Redraw only when something changes, do minimal work per frame, and keep
@@ -85,7 +94,8 @@ face (`orb.rs`) and, faintly, washed down the top of its canvas; everything else
 The exceptions are what a diff adds and removes (`Palette::positive`, `Palette::danger`), how a branch's
 pull request stands in the side panel (open green, merged `Palette::merged`, closed red) and a provider's
 mark: its platform's logo (`logo.rs`, drawn from an outline through the glyph atlas with `Painter::logo`,
-in `theme::provider_color` where the platform has a colour), or a picture the user put in
+in `theme::provider_color` where the platform has a colour; or, for a mark one colour cannot say, its
+owner's own picture, `logo::Picture`, drawn with `Painter::mark`), or a picture the user put in
 `~/.atroxabot/icons/`. The owner decided the logos are fine to show as nominative use: they only say
 which platform a provider is. Never use one as the app's own branding.
 

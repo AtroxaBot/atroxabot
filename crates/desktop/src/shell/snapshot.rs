@@ -11,9 +11,10 @@ use atroxabot_core::stats::{Ledger, Record, day_of};
 use atroxabot_core::update::{Release, Staged, Version};
 use atroxabot_core::worktree;
 use atroxabot_core::{
-    Agent, AgentEvent, Ask, Autonomy, ClaudeError, ClaudeInfo, ClaudeMcpServer, ClaudeModel, CodexAccount, CodexError,
-    CodexInfo, CodexModel, Config, Connection, ConnectionKind, ContextPart, LimitWindow, Limits, McpServer, Model,
-    PlanCheck, Session, ToolUse, Usage, VoiceSettings, Worktree, unix_now,
+    Agent, AgentEvent, AntigravityCatalog, AntigravityEffort, AntigravityError, AntigravityInfo, AntigravityModel, Ask,
+    Autonomy, ClaudeError, ClaudeInfo, ClaudeMcpServer, ClaudeModel, CodexAccount, CodexError, CodexInfo, CodexModel,
+    Config, Connection, ConnectionKind, ContextPart, LimitWindow, Limits, McpServer, Model, PlanCheck, Session,
+    ToolUse, Usage, VoiceSettings, Worktree, unix_now,
 };
 use atroxabot_voice::CallState;
 
@@ -460,6 +461,7 @@ fn snapshots() {
                 shell.claude_info(account, Err(ClaudeError::NotFound));
             }
             shell.codex_info("codex", Err(CodexError::NotFound), &mut Vec::new());
+            shell.antigravity_info("agy", Err(AntigravityError::NotFound));
             shell
         };
         // The General page at its foot, where Claude Code's row is.
@@ -781,6 +783,11 @@ fn snapshots() {
             ("add-provider-key", adding(Tab::Providers, Adding::Provider(1))),
             ("add-account", adding(Tab::Providers, Adding::ClaudeAccount)),
             ("add-codex-account", adding(Tab::Providers, Adding::CodexAccount)),
+            // The foot of the providers: the Antigravity accounts, as they are, while one is added and without
+            // Antigravity installed.
+            ("settings-providers-end", foot(settings(Tab::Providers))),
+            ("add-antigravity-account", foot(adding(Tab::Providers, Adding::AntigravityAccount))),
+            ("settings-providers-end-missing", foot(uninstalled(Tab::Providers))),
             ("settings-worktrees", worktrees),
             ("menu-folder-worktree", worktree_menu),
             ("panel-worktree", in_worktree()),
@@ -1056,8 +1063,9 @@ fn shell() -> Shell {
         ..Connection::default()
     };
     let codex = Connection { id: "codex".into(), ..Connection::codex("Codex") };
+    let antigravity = Connection { id: "agy".into(), ..Connection::antigravity("Antigravity") };
     let config = Config {
-        connections: vec![work, router, codex],
+        connections: vec![work, router, codex, antigravity],
         voice: VoiceSettings { provider: "fish".into(), fish_key: Some("secret".into()), ..VoiceSettings::default() },
         mcp: vec![McpServer {
             name: "files".into(),
@@ -1091,6 +1099,23 @@ fn shell() -> Shell {
         ..CodexInfo::default()
     };
     shell.codex_info("codex", Ok(codex), &mut Vec::new());
+    let level = |id: &str| AntigravityEffort { id: id.into(), name: id.into() };
+    let levels = || vec![level("low"), level("medium"), level("high")];
+    let model =
+        |id: &str, name: &str| AntigravityModel { id: id.into(), name: name.into(), description: String::new() };
+    let antigravity = AntigravityInfo {
+        version: "1.5.12".into(),
+        signed_in: true,
+        catalog: AntigravityCatalog {
+            models: vec![model("gemini-3-pro", "Gemini 3 Pro"), model("gemini-3-flash", "Gemini 3 Flash")],
+            model: "gemini-3-pro".into(),
+            efforts: levels(),
+            effort: "high".into(),
+        },
+        efforts: vec![("gemini-3-pro".into(), levels()), ("gemini-3-flash".into(), levels())],
+        commands: Vec::new(),
+    };
+    shell.antigravity_info("agy", Ok(antigravity));
     let listed = vec![
         Model { id: "anthropic/claude-opus-5.5".into(), name: "Claude Opus 5.5".into(), ..Model::default() },
         Model { id: "openai/gpt-5".into(), name: "GPT-5".into(), ..Model::default() },

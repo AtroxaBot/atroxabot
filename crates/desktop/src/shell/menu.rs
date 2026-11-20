@@ -13,11 +13,11 @@ use super::agent_form::{VOICES, autonomy_hint};
 use super::limits::OutOfLimits;
 use super::settings::{Settings, Tab};
 use super::widgets::{Scroll, chip, logo_badge, toggle};
-use super::{Account, Cli, CodexAccount, INSTALLING, Modal, Models, Shell};
+use super::{Account, AntigravityAccount, Cli, CodexAccount, INSTALLING, Modal, Models, Shell};
 use crate::app::Action;
 use crate::editor::Editor;
 use crate::image::Lookup;
-use crate::logo::Logo;
+use crate::logo::{Logo, Picture};
 use crate::paint::{Color, Painter, Rect, fade};
 use crate::theme;
 use crate::tray::CloseAction;
@@ -129,6 +129,7 @@ pub(super) fn icon_key(connection: &Connection) -> String {
     match connection.kind {
         ConnectionKind::ClaudeAgent => "claude".to_owned(),
         ConnectionKind::Codex => "codex".to_owned(),
+        ConnectionKind::Antigravity => "antigravity".to_owned(),
         ConnectionKind::ClaudeApi => "anthropic".to_owned(),
         ConnectionKind::OpenAi => {
             let host = connection.host().split(':').next().unwrap_or_default();
@@ -193,7 +194,7 @@ impl Shell {
         let name = name.to_lowercase();
         match kind {
             ConnectionKind::ClaudeAgent => icon::SPARKLES,
-            ConnectionKind::Codex => icon::TERMINAL,
+            ConnectionKind::Codex | ConnectionKind::Antigravity => icon::TERMINAL,
             ConnectionKind::ClaudeApi => icon::KEY,
             ConnectionKind::OpenAi if name.contains("openrouter") => icon::ROUTE,
             ConnectionKind::OpenAi if name.contains("openai") => icon::HEXAGON,
@@ -218,6 +219,13 @@ impl Shell {
     pub(super) fn provider_picture(&self, p: &mut Painter, connection: &Connection, rect: Rect) -> bool {
         let key = icon_key(connection);
         let Some(path) = self.icons.get(&key) else {
+            // A mark that is a picture sits on the badge the way an outline does, in its own colours.
+            if let Some(picture) = Picture::named(&key) {
+                let t = p.theme;
+                p.bordered(rect, t.surface, rect.w * 0.28, 1.0, t.border);
+                p.mark(picture, (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5), (rect.w * 0.6).round(), 1.0);
+                return true;
+            }
             let logo = Logo::named(&key);
             if let Some(logo) = logo {
                 logo_badge(p, rect, logo, Self::provider_tint(connection));
@@ -247,6 +255,11 @@ impl Shell {
             .get(&icon_key(connection))
             .is_some_and(|path| matches!(p.image(path, rect, size * 0.22), Lookup::Ready(_)));
         if pictured {
+            return;
+        }
+        // Its platform's own picture, as faint as the ink it stands among.
+        if let Some(picture) = Picture::named(&icon_key(connection)) {
+            p.mark(picture, center, size, ink[3]);
             return;
         }
         let ink = Self::provider_tint(connection).unwrap_or(ink);
@@ -292,6 +305,17 @@ impl Shell {
                 Some(CodexAccount::Checking) | None => "Checking…".to_owned(),
             };
         }
+        if connection.kind == ConnectionKind::Antigravity {
+            // Antigravity does not say who is signed in, only whether someone is.
+            return match self.antigravity.get(&connection.id) {
+                Some(AntigravityAccount::Ready(info)) if info.signed_in => "Signed in".to_owned(),
+                Some(AntigravityAccount::Ready(_)) => "Not signed in".to_owned(),
+                Some(AntigravityAccount::Missing) if self.is_installing(Cli::Antigravity) => INSTALLING.to_owned(),
+                Some(AntigravityAccount::Missing) => "Antigravity is not installed".to_owned(),
+                Some(AntigravityAccount::Failed(why)) => why.clone(),
+                Some(AntigravityAccount::Checking) | None => "Checking: Antigravity takes a minute to start".to_owned(),
+            };
+        }
         if connection.kind != ConnectionKind::ClaudeAgent {
             return format!("{} · {}", connection.kind.label(), connection.host());
         }
@@ -328,6 +352,28 @@ impl Shell {
                 .collect();
             choices.sort_by_key(|(default, _)| !default);
             return choices.into_iter().map(|(_, choice)| choice).collect();
+        }
+        if connection.kind == ConnectionKind::Antigravity {
+            let Some(AntigravityAccount::Ready(info)) = self.antigravity.get(&connection.id) else { return Vec::new() };
+            let catalog = &info.catalog;
+            let levels = |model: &str| {
+                let of = info.efforts.iter().find(|(of, _)| of == model);
+                of.map(|(_, levels)| levels.iter().map(|level| level.id.clone()).collect()).unwrap_or_default()
+            };
+            let mut choices: Vec<ModelChoice> = (catalog.models.iter())
+                .filter(|model| !model.id.is_empty())
+                .map(|model| ModelChoice {
+                    value: model.id.clone(),
+                    label: if model.name.is_empty() { model.id.clone() } else { model.name.clone() },
+                    detail: model.description.clone(),
+                    efforts: levels(&model.id),
+                    // It says the level in use of the model it picks by itself only.
+                    usual: if model.id == catalog.model { catalog.effort.clone() } else { String::new() },
+                })
+                .collect();
+            // What Antigravity's own picker lists, the model it picks by itself first.
+            choices.sort_by_key(|choice| choice.value != catalog.model);
+            return choices;
         }
         if connection.kind == ConnectionKind::ClaudeAgent {
             let Some(Account::Ready(info)) = self.claude.get(&connection.id) else { return Vec::new() };
@@ -458,8 +504,20 @@ impl Shell {
             .collect();
         if items.is_empty() && needle.is_empty() {
             let codex = self.codex.get(&connection.id).filter(|_| connection.kind == ConnectionKind::Codex);
+            let antigravity =
+                self.antigravity.get(&connection.id).filter(|_| connection.kind == ConnectionKind::Antigravity);
             let note = match (connection.kind, self.claude.get(&connection.id), self.models.get(&connection.id)) {
                 _ if matches!(codex, Some(CodexAccount::Missing)) => "Codex is not installed".to_owned(),
+                _ if matches!(antigravity, Some(AntigravityAccount::Missing)) => {
+                    "Antigravity is not installed".to_owned()
+                }
+                _ if matches!(antigravity, Some(AntigravityAccount::Ready(info)) if !info.signed_in) => {
+                    "Antigravity is not signed in".to_owned()
+                }
+                _ if matches!(antigravity, Some(AntigravityAccount::Failed(_))) => {
+                    let why = if let Some(AntigravityAccount::Failed(why)) = antigravity { why.as_str() } else { "" };
+                    format!("The models could not be listed: {why}")
+                }
                 _ if matches!(codex, Some(CodexAccount::Failed(_))) => {
                     let why = if let Some(CodexAccount::Failed(why)) = codex { why.as_str() } else { "" };
                     format!("The models could not be listed: {why}")

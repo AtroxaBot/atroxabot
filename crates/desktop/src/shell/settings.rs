@@ -17,7 +17,7 @@ use winit::window::CursorIcon;
 use super::menu::Menu;
 use super::skills::SkillsPage;
 use super::widgets::{Scroll, chip, dropdown, line_field, logo_badge, modal, row, tile, toggle};
-use super::{Account, Cli, CodexAccount, Connectors, Shell};
+use super::{Account, Cli, Connectors, Shell, Standing};
 use crate::app::Action;
 use crate::editor::Editor;
 use crate::form::Fields;
@@ -87,6 +87,21 @@ const CUSTOM: usize = PRESETS.len() - 1;
 const VOICE_PROVIDERS: [(&str, &str, &str); 2] =
     [("fish", "Fish Audio", "Expressive voices and clones"), ("elevenlabs", "ElevenLabs", "Fast, natural voices")];
 
+/// What the settings say under the Codex accounts.
+const CODEX_NOTE: &str = "A Codex account is the Codex CLI installed here, run as it is, with its own tools, sandbox \
+                          and approvals, on your ChatGPT plan or API key. Without it, Install opens OpenAI's own \
+                          installer in a terminal. Each account you add has a Codex home of its own, with its own \
+                          sign-in, settings and conversations. Signing in opens Codex in a terminal; AtroxaBot never \
+                          sees your credentials.";
+
+/// What the settings say under the Antigravity accounts.
+const ANTIGRAVITY_NOTE: &str = "An Antigravity account is the Antigravity CLI (agy) installed here, run as it is, \
+                                with its own tools and models, on your Google account's plan. Without it, Install \
+                                opens Google's own installer in a terminal. Each account you add has a folder of its \
+                                own, with its own sign-in, settings and conversations. Signing in opens Antigravity \
+                                in a terminal; AtroxaBot never sees your credentials. Antigravity takes up to a \
+                                minute to start, so the first message of a session does too.";
+
 /// What is being added, if anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Adding {
@@ -95,6 +110,8 @@ pub(super) enum Adding {
     ClaudeAccount,
     /// A Codex account: it only needs a name.
     CodexAccount,
+    /// An Antigravity account: it only needs a name.
+    AntigravityAccount,
     /// An API provider: which one is being chosen.
     PickProvider,
     /// The API provider with this preset: its key (and, for a custom one, its name and address).
@@ -177,7 +194,9 @@ impl Settings {
     /// The fields on screen now, in order: Tab moves among these.
     fn visible(&self) -> Vec<usize> {
         match (self.tab, self.adding) {
-            (Tab::Providers, Adding::ClaudeAccount | Adding::CodexAccount) => vec![NAME],
+            (Tab::Providers, Adding::ClaudeAccount | Adding::CodexAccount | Adding::AntigravityAccount) => {
+                vec![NAME]
+            }
             (Tab::Providers, Adding::Provider(CUSTOM)) => vec![NAME, URL, KEY],
             (Tab::Providers, Adding::Provider(_)) | (Tab::Voice, Adding::Voice(_)) => vec![KEY],
             (Tab::Integrations, Adding::Mcp(_)) => vec![NAME, URL, VARS],
@@ -554,31 +573,38 @@ impl Settings {
         y + 58.0
     }
 
-    /// The Codex accounts: each the Codex CLI the user installed, signed in
-    /// to one account. Returns where what follows starts.
-    fn codex_accounts(
+    /// The accounts of Codex or of Antigravity (`kind`): each the command-line
+    /// agent the user installed, signed in to one account. Returns where what
+    /// follows starts, and whether the settings changed.
+    fn cli_accounts(
         &mut self,
         p: &mut Painter,
         ui: &mut Ui,
         (x, mut y, w): (f32, f32, f32),
+        kind: ConnectionKind,
         shell: &mut Shell,
-        changed: &mut bool,
         actions: &mut Vec<Action>,
-    ) -> f32 {
+    ) -> (f32, bool) {
         let t = p.theme;
-        if Self::heading(p, ui, (x, y, w), "Codex accounts", Some("Add account")) {
-            self.add(Adding::CodexAccount);
+        let antigravity = kind == ConnectionKind::Antigravity;
+        let tool = kind.label();
+        let (cli, adding, command, note) = if antigravity {
+            (Cli::Antigravity, Adding::AntigravityAccount, "agy", ANTIGRAVITY_NOTE)
+        } else {
+            (Cli::Codex, Adding::CodexAccount, "codex", CODEX_NOTE)
+        };
+        let sign_in = |account: &Connection| {
+            let account = Box::new(account.clone());
+            if antigravity { Action::AntigravityLogin(account) } else { Action::CodexLogin(account) }
+        };
+        if Self::heading(p, ui, (x, y, w), &format!("{tool} accounts"), Some("Add account")) {
+            self.add(adding);
         }
         y += 40.0;
-        let mut remove = None;
-        let accounts: Vec<Connection> =
-            shell.config.connections.iter().filter(|c| c.kind == ConnectionKind::Codex).cloned().collect();
+        let (mut changed, mut remove) = (false, None);
+        let accounts: Vec<Connection> = shell.config.connections.iter().filter(|c| c.kind == kind).cloned().collect();
         for account in &accounts {
             let rect = Rect::new(x, y, w, 58.0);
-            let state = shell.codex.get(&account.id);
-            let signed_in = matches!(state, Some(CodexAccount::Ready(info)) if info.account.is_some());
-            let can_sign_in = matches!(state, Some(CodexAccount::Ready(_) | CodexAccount::Failed(_)));
-            let missing = matches!(state, Some(CodexAccount::Missing));
             let title = if self.is_renaming(&account.id) { "" } else { account.name.as_str() };
             row(
                 p,
@@ -590,7 +616,7 @@ impl Settings {
             );
             if let Some(name) = self.name_field(p, ui, rect, (&account.id, &account.name), 190.0) {
                 shell.config.rename_connection(&account.id, &name);
-                *changed = true;
+                changed = true;
             }
             shell.provider_picture(p, account, Rect::new(rect.x + 12.0, rect.y + 12.0, 34.0, 34.0));
             let mut right = rect.right() - 12.0;
@@ -600,47 +626,47 @@ impl Settings {
             }
             right -= 30.0;
             if icon_button(p, ui, Rect::new(right, rect.y + 15.0, 28.0, 28.0), icon::REFRESH, true) {
-                shell.codex.insert(account.id.clone(), CodexAccount::Checking);
-                actions.push(Action::ProbeCodex(Box::new(account.clone())));
+                shell.read_anew(account, actions);
             }
-            if signed_in {
-                icon::draw(p, icon::CHECK, (right - 16.0, rect.y + 29.0), 15.0, t.text_muted);
-            } else if can_sign_in {
-                let sign_in = Rect::new(right - 92.0, rect.y + 13.0, 84.0, 32.0);
-                if button(p, ui, sign_in, "Sign in", ButtonStyle::Primary, true) {
-                    actions.push(Action::CodexLogin(Box::new(account.clone())));
+            let act = Rect::new(right - 92.0, rect.y + 13.0, 84.0, 32.0);
+            match shell.standing(account) {
+                Standing::SignedIn => icon::draw(p, icon::CHECK, (right - 16.0, rect.y + 29.0), 15.0, t.text_muted),
+                Standing::SignedOut => {
+                    if button(p, ui, act, "Sign in", ButtonStyle::Primary, true) {
+                        actions.push(sign_in(account));
+                    }
                 }
-            } else if missing {
-                // OpenAI's own installer; once Codex is found, the account signs in.
-                let install = Rect::new(right - 92.0, rect.y + 13.0, 84.0, 32.0);
-                if button(p, ui, install, "Install", ButtonStyle::Primary, true) {
-                    actions.push(Action::Install(Cli::Codex));
+                // Its maker's own installer; once the tool is found, the account signs in.
+                Standing::Missing => {
+                    if button(p, ui, act, "Install", ButtonStyle::Primary, true) {
+                        actions.push(Action::Install(cli));
+                    }
                 }
+                Standing::Unknown => {}
             }
             y += 66.0;
         }
         if let Some(id) = remove {
             // Its folder, and so its sign-in, stays where it is: the account only leaves the list.
             shell.config.connections.retain(|c| c.id != id);
-            shell.codex.remove(&id);
-            *changed = true;
+            shell.forget_account(&id);
+            changed = true;
         }
         if accounts.iter().all(|account| !account.config_dir.is_empty()) {
-            // The Codex the user already has, as they use it in their terminal.
+            // The one the user already has, as they use it in their terminal.
             let rect = Rect::new(x, y, w, 58.0);
-            let about = "Whoever `codex` is signed in as in your terminal, with its settings.";
-            row(p, rect, (icon::TERMINAL, None), "Codex's own sign-in", about, 100.0);
+            let about = format!("Whoever `{command}` is signed in as in your terminal, with its settings.");
+            row(p, rect, (icon::TERMINAL, None), &format!("{tool}'s own sign-in"), &about, 100.0);
             let add = Rect::new(rect.right() - 92.0, rect.y + 13.0, 80.0, 32.0);
             if button(p, ui, add, "Use it", ButtonStyle::Secondary, true) {
-                let account = Connection::codex("Codex");
-                shell.codex.insert(account.id.clone(), CodexAccount::Checking);
-                actions.push(Action::ProbeCodex(Box::new(account.clone())));
+                let account = if antigravity { Connection::antigravity(tool) } else { Connection::codex(tool) };
+                shell.read_anew(&account, actions);
                 shell.config.connections.push(account);
-                *changed = true;
+                changed = true;
             }
             y += 66.0;
         }
-        if self.adding == Adding::CodexAccount {
+        if self.adding == adding {
             let card = Rect::new(x, y, w, 108.0);
             p.bordered(card, t.surface, theme::RADIUS, 1.0, t.border_focus);
             p.label("A name for the account", theme::CAPTION, card.x + 16.0, card.y + 14.0, t.text_muted);
@@ -653,12 +679,14 @@ impl Settings {
             }
             let add = Rect::new(card.right() - 150.0, card.y + 38.0, 134.0, 42.0);
             if button(p, ui, add, "Add and sign in", ButtonStyle::Primary, !name.is_empty()) {
-                match Connection::codex_account(&name) {
+                let made =
+                    if antigravity { Connection::antigravity_account(&name) } else { Connection::codex_account(&name) };
+                match made {
                     Ok(account) => {
-                        shell.codex.insert(account.id.clone(), CodexAccount::Checking);
-                        actions.push(Action::CodexLogin(Box::new(account.clone())));
+                        shell.signing_in(&account);
+                        actions.push(sign_in(&account));
                         shell.config.connections.push(account);
-                        *changed = true;
+                        changed = true;
                     }
                     Err(e) => shell.notify(format!("The account could not be added: {e}")),
                 }
@@ -666,12 +694,7 @@ impl Settings {
             }
             y += 116.0;
         }
-        let note = "A Codex account is the Codex CLI installed here, run as it is, with its own tools, sandbox \
-                    and approvals, on your ChatGPT plan or API key. Without it, Install opens OpenAI's own \
-                    installer in a terminal. Each account you add has a Codex home of its own, with its own \
-                    sign-in, settings and conversations. Signing in opens Codex in a terminal; AtroxaBot never \
-                    sees your credentials.";
-        Self::note(p, (x, y + 2.0, w), note) + 30.0
+        (Self::note(p, (x, y + 2.0, w), note) + 30.0, changed)
     }
 
     fn providers(
@@ -819,7 +842,11 @@ impl Settings {
                     account you sign in to.";
         y = Self::note(p, (x, y + 2.0, w), note) + 30.0;
 
-        y = self.codex_accounts(p, ui, (x, y, w), shell, &mut changed, actions);
+        for kind in [ConnectionKind::Codex, ConnectionKind::Antigravity] {
+            let (next, touched) = self.cli_accounts(p, ui, (x, y, w), kind, shell, actions);
+            y = next;
+            changed |= touched;
+        }
 
         // API providers.
         let adding_provider = matches!(self.adding, Adding::PickProvider | Adding::Provider(_));

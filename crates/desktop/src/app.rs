@@ -21,9 +21,10 @@ use atroxabot_core::tools::{Jobs, Workspace};
 use atroxabot_core::update;
 use atroxabot_core::worktree;
 use atroxabot_core::{
-    Agent, AgentEvent, ApiEngine, ClaudeAgent, ClaudeError, ClaudeInfo, ClaudeMcpServer, Client, CodexAgent,
-    CodexError, CodexInfo, Config, Connection, ConnectionKind, Control, Error, FollowUp, Limits, McpHub, McpServer,
-    Model, PlanCheck, Records, SearchHit, Session, SessionStore, SessionSummary, Verdict,
+    Agent, AgentEvent, AntigravityAgent, AntigravityError, AntigravityInfo, ApiEngine, ClaudeAgent, ClaudeError,
+    ClaudeInfo, ClaudeMcpServer, Client, CodexAgent, CodexError, CodexInfo, Config, Connection, ConnectionKind,
+    Control, Error, FollowUp, Limits, McpHub, McpServer, Model, PlanCheck, Records, SearchHit, Session, SessionStore,
+    SessionSummary, Verdict,
 };
 use atroxabot_voice::{Call, CallEvent, CallOptions, VoiceConfig};
 use winit::dpi::{LogicalPosition, LogicalSize};
@@ -118,6 +119,13 @@ pub enum WorkerEvent {
         connection: String,
         /// Its models and who is signed in, or why it could not be asked.
         result: Result<CodexInfo, CodexError>,
+    },
+    /// Antigravity said (or could not say) what an Antigravity account offers.
+    AntigravityInfo {
+        /// The account's connection id.
+        connection: String,
+        /// Its models and whether it is signed in, or why it could not be asked.
+        result: Result<AntigravityInfo, AntigravityError>,
     },
     /// Claude Code said (or could not say) where a Claude account's plan limits stand.
     LimitsChecked {
@@ -246,7 +254,7 @@ pub enum Action {
         /// The session.
         session: Box<Session>,
     },
-    /// End the agent's process (Claude Code, Codex) of this session, if it has one.
+    /// End the agent's process (Claude Code, Codex, Antigravity) of this session, if it has one.
     CloseLive(String),
     /// Stop the commands an API session's agent left running in the background.
     StopJobs(String),
@@ -286,7 +294,16 @@ pub enum Action {
     ProbeCodex(Box<Connection>),
     /// Open Codex's own sign-in for a Codex account, in a terminal.
     CodexLogin(Box<Connection>),
-    /// Open the maker's own installer of Claude Code or Codex, in a terminal.
+    /// Say what an Antigravity account offers: what is kept of it, or `fresh`, by starting Antigravity.
+    ProbeAntigravity {
+        /// The account.
+        connection: Box<Connection>,
+        /// Whether to start Antigravity and ask it, whatever is kept.
+        fresh: bool,
+    },
+    /// Open Antigravity's own sign-in for an Antigravity account, in a terminal.
+    AntigravityLogin(Box<Connection>),
+    /// Open the maker's own installer of Claude Code, Codex or Antigravity, in a terminal.
     Install(Cli),
     /// Search every session's messages.
     Search {
@@ -422,7 +439,7 @@ pub struct App {
     agents: Option<Records>,
     /// Performs every file write, in order, off the UI thread.
     writer: Writer,
-    /// The agent's process (Claude Code, Codex) of each session that has one.
+    /// The agent's process (Claude Code, Codex, Antigravity) of each session that has one.
     live: HashMap<String, Live>,
     /// The running API turn of each session that has one.
     turns: HashMap<String, Control>,
@@ -912,6 +929,12 @@ impl App {
                 }
                 self.shell.codex_info(&connection, result, &mut actions);
             }
+            WorkerEvent::AntigravityInfo { connection, result } => {
+                if let Err(e) = &result {
+                    log::error(format!("Antigravity could not be asked about an account: {e}"));
+                }
+                self.shell.antigravity_info(&connection, result);
+            }
             WorkerEvent::LimitsChecked { connection, result } => {
                 match &result {
                     Err(e) => log::error(format!("Claude Code could not say where a plan's limits stand: {e}")),
@@ -1104,11 +1127,28 @@ impl App {
                     self.shell.notify(format!("The sign-in could not be opened: {e}"));
                 }
             }
+            Action::ProbeAntigravity { connection, fresh } => self.spawn(move || WorkerEvent::AntigravityInfo {
+                result: atroxabot_core::antigravity_info(&connection, fresh),
+                connection: connection.id.clone(),
+            }),
+            Action::AntigravityLogin(connection) => {
+                // Antigravity's own sign-in, in a terminal the user sees: the app only starts it.
+                match atroxabot_core::antigravity_login(&connection) {
+                    Some(login) => {
+                        if let Err(e) = in_terminal("Sign in to Antigravity", &login) {
+                            self.shell.notify(format!("The sign-in could not be opened: {e}"));
+                        }
+                    }
+                    // Its row says so, and offers the installer.
+                    None => self.shell.antigravity_info(&connection.id, Err(AntigravityError::NotFound)),
+                }
+            }
             Action::Install(cli) => {
                 // The maker's own installer, in a terminal the user sees and answers: the app only starts it.
                 let (title, installer) = match cli {
                     Cli::Claude => ("Install Claude Code", atroxabot_core::claude_install()),
                     Cli::Codex => ("Install Codex", atroxabot_core::codex_install()),
+                    Cli::Antigravity => ("Install Antigravity", atroxabot_core::antigravity_install()),
                 };
                 match in_terminal(title, &installer) {
                     Ok(()) => self.shell.installing(cli),
@@ -1324,12 +1364,13 @@ impl App {
                 self.renew(&id);
             }
             let mut emit = self.emitter(&id);
-            let codex = connection.kind == ConnectionKind::Codex;
             // One process serves the session until it is closed or its agent changes. Another model or
-            // effort is no reason to start one again: Codex takes both with every turn, and a running
-            // Claude Code is asked to change, the message going once it has (`retuned`).
+            // effort is no reason to start one again: Codex takes both with every turn, Antigravity sets
+            // them as a turn starts, and a running Claude Code is asked to change, the message going once
+            // it has (`retuned`).
             match self.live.get(&id) {
                 Some(Live::Codex(live)) => live.retune(&agent.model, &agent.effort),
+                Some(Live::Antigravity(live)) => live.retune(&agent.model, &agent.effort),
                 Some(Live::Claude(live)) if !live.runs_with(&agent.model, &agent.effort) => {
                     let (proxy, changed) = (self.proxy.clone(), id.clone());
                     let asked = live.retune(&agent.model, &agent.effort, move |outcome| {
@@ -1355,15 +1396,24 @@ impl App {
             let sent = if let Some(live) = self.live.get(&id) {
                 live.send(text, &files)
             } else {
-                let started = if codex {
-                    CodexAgent::connect(agent, connection, &session, servers, self.emitter(&id))
-                        .map(Live::Codex)
-                        .map_err(|e| e.to_string())
-                } else {
-                    let mcp = atroxabot_core::claude_mcp_config(servers);
-                    ClaudeAgent::connect(agent, connection, &session, mcp, self.shell.suggesting(), self.emitter(&id))
-                        .map(Live::Claude)
-                        .map_err(|e| e.to_string())
+                let started = match connection.kind {
+                    ConnectionKind::Codex => {
+                        CodexAgent::connect(agent, connection, &session, servers, self.emitter(&id))
+                            .map(Live::Codex)
+                            .map_err(|e| e.to_string())
+                    }
+                    ConnectionKind::Antigravity => {
+                        AntigravityAgent::connect(agent, connection, &session, servers, self.emitter(&id))
+                            .map(Live::Antigravity)
+                            .map_err(|e| e.to_string())
+                    }
+                    _ => {
+                        let mcp = atroxabot_core::claude_mcp_config(servers);
+                        let suggest = self.shell.suggesting();
+                        ClaudeAgent::connect(agent, connection, &session, mcp, suggest, self.emitter(&id))
+                            .map(Live::Claude)
+                            .map_err(|e| e.to_string())
+                    }
                 };
                 started.and_then(|live| {
                     let sent = live.send(text, &files);
@@ -1375,7 +1425,11 @@ impl App {
                 if let Some(live) = self.live.remove(&id) {
                     retire(live, self.leases.remove(&id));
                 }
-                let who = if codex { "Codex" } else { "The Claude Agent" };
+                let who = match connection.kind {
+                    ConnectionKind::Codex => "Codex",
+                    ConnectionKind::Antigravity => "Antigravity",
+                    _ => "The Claude Agent",
+                };
                 fail(&mut emit, format!("{who} could not be reached: {e}"));
             }
             return;
@@ -1775,10 +1829,11 @@ fn provider_icons() -> HashMap<String, String> {
     pictures.filter_map(|path| Some((path.file_stem()?.to_str()?.to_lowercase(), path.display().to_string()))).collect()
 }
 
-/// The agent's process of a session: the Claude Code or the Codex the user installed.
+/// The agent's process of a session: the Claude Code, the Codex or the Antigravity the user installed.
 enum Live {
     Claude(ClaudeAgent),
     Codex(CodexAgent),
+    Antigravity(AntigravityAgent),
 }
 
 impl Live {
@@ -1787,6 +1842,7 @@ impl Live {
         match self {
             Self::Claude(agent) => agent.send(text, files).map_err(|e| e.to_string()),
             Self::Codex(agent) => agent.send(text, files).map_err(|e| e.to_string()),
+            Self::Antigravity(agent) => agent.send(text, files).map_err(|e| e.to_string()),
         }
     }
 
@@ -1796,15 +1852,17 @@ impl Live {
         match self {
             Self::Claude(agent) => drop(agent.follow_up(message)),
             Self::Codex(agent) => drop(agent.follow_up(message)),
+            Self::Antigravity(agent) => drop(agent.follow_up(message)),
         }
     }
 
     /// Stops the turn in progress; what was handed over and not read yet is
-    /// dropped when `cancel_queued`. (Codex keeps none: the app sends it again.)
+    /// dropped when `cancel_queued`. (Codex and Antigravity keep none: the app sends it again.)
     fn interrupt(&self, cancel_queued: bool) {
         match self {
             Self::Claude(agent) => agent.interrupt(cancel_queued),
             Self::Codex(agent) => agent.interrupt(),
+            Self::Antigravity(agent) => agent.interrupt(),
         }
     }
 
@@ -1813,6 +1871,7 @@ impl Live {
         match self {
             Self::Claude(agent) => agent.decide(id, verdict),
             Self::Codex(agent) => agent.decide(id, verdict),
+            Self::Antigravity(agent) => agent.decide(id, verdict),
         }
     }
 
@@ -1828,6 +1887,7 @@ impl Live {
         match self {
             Self::Claude(agent) => agent.close(),
             Self::Codex(agent) => agent.close(),
+            Self::Antigravity(agent) => agent.close(),
         }
     }
 }

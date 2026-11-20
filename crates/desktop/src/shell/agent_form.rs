@@ -369,6 +369,13 @@ pub(super) fn autonomy_hint(level: Autonomy, connection: Option<&Connection>) ->
         (Autonomy::Edits | Autonomy::Auto, Some(ConnectionKind::Codex)) => {
             "Works freely in its folder, in Codex's sandbox; asks for what reaches beyond it."
         }
+        // Antigravity asks about what it does, and the app answers what the level settles.
+        (Autonomy::Ask, Some(ConnectionKind::Antigravity)) => {
+            "Reads freely; asks before it changes a file, runs a command or goes online."
+        }
+        (Autonomy::Edits | Autonomy::Auto, Some(ConnectionKind::Antigravity)) => {
+            "Also edits files in its folder without asking; asks for commands and for what reaches beyond it."
+        }
         (Autonomy::Auto, _) => "With a Claude account. Here it edits freely and asks for the rest.",
         _ => level.hint(),
     }

@@ -24,7 +24,8 @@
 
 You make agents. Each one has a name, a face, instructions and as many sessions as you like, each
 working in a folder of its own (or a git worktree of its own). An agent thinks through one of your
-**Claude accounts**, your **Codex account**, **Anthropic's API**, or any **OpenAI-compatible** gateway, and
+**Claude accounts**, your **Codex** or **Antigravity account**, **Anthropic's API**, or any
+**OpenAI-compatible** gateway, and
 you can switch a session between them at any time.
 
 Runs on Windows, macOS and Linux. Pure Rust, drawn on the GPU: no web view, no UI framework.
@@ -80,7 +81,7 @@ Runs on Windows, macOS and Linux. Pure Rust, drawn on the GPU: no web view, no U
   - [Voice calls](#voice-calls) · [The app](#the-app)
 - [Keyboard shortcuts](#keyboard-shortcuts)
 - [Claude accounts and Anthropic's terms](#claude-accounts-and-anthropics-terms) ·
-  [Codex accounts](#codex-accounts)
+  [Codex accounts](#codex-accounts) · [Antigravity accounts](#antigravity-accounts)
 - [For developers](#for-developers): [Build](#build) · [Layout](#layout) · [Storage](#storage) ·
   [Releases](#releases)
 - [Known limits](#known-limits) · [License](#license)
@@ -115,6 +116,7 @@ AtroxaBot itself needs nothing else. What you need depends on how your agents sh
 |---|---|---|
 | **A Claude account** | [Claude Code](https://code.claude.com/docs/en/setup) on this computer: *Install* in Settings, Providers puts it there | *Sign in* in Settings, Providers (`claude auth login`) |
 | **A Codex account** (ChatGPT plan or OpenAI key) | The [Codex CLI](https://developers.openai.com/codex) on this computer: *Install* in Settings, Providers puts it there | *Sign in* in Settings, Providers (`codex login`) |
+| **An Antigravity account** (Google account) | The [Antigravity CLI](https://antigravity.google) (`agy`) on this computer: *Install* in Settings, Providers puts it there | *Sign in* in Settings, Providers (`agy acp --login`) |
 | **Anthropic's API** | An Anthropic API key | Paste the key in Settings, Providers |
 | **An OpenAI-compatible gateway** (OpenRouter, OpenAI, Ollama, …) | Its address, and a key if it needs one | Settings, Providers |
 
@@ -125,16 +127,16 @@ You need only one of these.
 Only for Claude accounts, and AtroxaBot can do it for you. It runs the Claude Code that is installed on
 your computer; it does not include its own copy, and it never signs you in itself (see
 [Claude accounts and Anthropic's terms](#claude-accounts-and-anthropics-terms)). Without Claude Code,
-everything else works: API providers and Codex work as usual.
+everything else works: API providers, Codex and Antigravity work as usual.
 
 While Claude Code is missing, Settings, Providers (and Settings, General) show **Install**. It opens a
 terminal running Anthropic's own installer, which downloads Claude Code from Anthropic, checks it and puts
 it in place; you watch it there, and answer it if it asks anything. The account says *Installing* until
 then. Come back to AtroxaBot's settings and it finds Claude Code by itself; the account then offers
-**Sign in**. Codex has the same button, with OpenAI's own installer.
+**Sign in**. Codex has the same button, with OpenAI's own installer, and Antigravity with Google's.
 
 <details>
-<summary><b>Installing Claude Code or Codex by hand</b></summary>
+<summary><b>Installing Claude Code, Codex or Antigravity by hand</b></summary>
 
 To install it by hand instead, follow [Anthropic's setup page](https://code.claude.com/docs/en/setup). In
 short:
@@ -157,6 +159,9 @@ looks again.
 Codex by hand: `irm https://chatgpt.com/codex/install.ps1 | iex` on Windows,
 `curl -fsSL https://chatgpt.com/codex/install.sh | sh` elsewhere (OpenAI's native installers; npm's
 `npm install -g @openai/codex` works too).
+
+Antigravity by hand: `irm https://antigravity.google/cli/install.ps1 | iex` on Windows,
+`curl -fsSL https://antigravity.google/cli/install.sh | bash` elsewhere (Google's native installers).
 
 </details>
 
@@ -318,6 +323,11 @@ page lists every worktree on disk, with what it holds and how much room it takes
   | *Full autonomy* | Never asks. | Runs without sandbox or questions. |
   | *Read only* | Looks but never touches: what would need approval is refused. | Refuses what would change something. |
 
+  An Antigravity account asks about what it does, and the level answers for you: reading and searching
+  at every level; changes to files in the session's folder (and the agent's notes) from *Edit freely*
+  on; everything at *Full autonomy*; and at *Read only* whatever is not reading is refused. What is
+  left is asked. A tool of an MCP server is always asked about, short of *Full autonomy*.
+
   The app's own data folder, which holds your API keys, is off limits to every agent's file tools.
 - **Questions.** When an agent asks you something (Claude's `AskUserQuestion`, or an API agent's `ask`:
   say "interview me"), a card over the message box shows one question at a time with its options. Click
@@ -360,6 +370,9 @@ Each session has its own provider, model and effort.
     [Claude accounts and Anthropic's terms](#claude-accounts-and-anthropics-terms).
   - **Codex accounts**: the Codex CLI you installed, driven through its app server, with its own tools,
     sandbox, approvals and sub-agents. Several accounts are kept apart; see [Codex accounts](#codex-accounts).
+  - **Antigravity accounts**: the Antigravity CLI (`agy`) you installed, driven through `agy acp`, with
+    its own tools and models. Several accounts are kept apart; see
+    [Antigravity accounts](#antigravity-accounts).
   - **Claude API**: Anthropic's Messages API with your key.
   - **OpenAI-compatible**: OpenRouter, Inworld, OpenAI, Ollama, or any other Chat Completions gateway.
 
@@ -367,8 +380,8 @@ Each session has its own provider, model and effort.
 - **Swapping provider.** The chip in the top bar swaps the open session's provider; the agent's editor
   sets where its next sessions start (a new session starts on the provider picked last). Each session
   keeps the provider it was left on, so swapping in one leaves the agent's other sessions where they are,
-  and going back to a session goes back to its account and the conversation that account holds. A Claude
-  or Codex account that never saw the conversation is handed what was said so far. Moving to another
+  and going back to a session goes back to its account and the conversation that account holds. A Claude,
+  Codex or Antigravity account that never saw the conversation is handed what was said so far. Moving to another
   account of the same kind (one Claude account for another) keeps the model where that account offers it
   too, also when it was the old account's default (each account's default is its own, from its plan or
   what `/model` set in it). The effort always goes along, also one you never picked yourself. A message after the switch goes
@@ -376,7 +389,8 @@ Each session has its own provider, model and effort.
 - **Models from the provider.** The model menu under the message box lists what the provider offers: a
   Claude account's list comes from Claude Code (so it is always current; of a family in several versions
   only the newest shows), a Codex account's from Codex (each with its efforts and the effort Codex gives
-  it by default), an API provider's from its `/models`. The provider's default is used until you pick
+  it by default), an Antigravity account's from Antigravity (as it was last asked: the refresh icon in
+  Settings, Providers asks again), an API provider's from its `/models`. The provider's default is used until you pick
   another, and any model id can be typed.
 - **Effort.** The same menu sets the effort, always one of the model's own levels. Opus, Haiku and Fable
   start at medium, Sonnet at high. Switching models keeps the effort you picked; a model that lacks it
@@ -386,7 +400,7 @@ Each session has its own provider, model and effort.
   of provider takes that provider's default model, at the effort it had where that model takes it. On a
   Claude account another model or effort goes to the Claude Code that is already running (as its own
   `/model` does), so nothing is started again and what it runs in the background stays.
-- **When an account runs out** (Settings, Providers). When a Claude or Codex account's usage limit stops
+- **When an account runs out** (Settings, Providers). When a Claude, Codex or Antigravity account's usage limit stops
   a turn, the session can:
   - *Wait for limit refill* (the default): it goes on by itself a minute after the limit lifts, so you can
     walk away. When the provider did not say when, it tries again every 15 minutes.
@@ -420,12 +434,14 @@ Each session has its own provider, model and effort.
   it starts again. A used-up window says *Limit reached* and when it starts over. A session that runs
   into a limit says so in its conversation, and in the row above its message box when it waits; no notice
   is put over the session for it. A Codex account's limits show the same way, as Codex reports
-  them (when the app starts, with each turn, and when they are asked about as above).
+  them (when the app starts, with each turn, and when they are asked about as above). An Antigravity
+  account shows none (see [Antigravity accounts](#antigravity-accounts)).
 - **Provider marks.** A provider wears its platform's logo (Claude, Anthropic, OpenAI, OpenRouter, Meta,
-  Gemini, Mistral, Ollama), in the platform's colour where it has one; others get an icon. The marks are
+  Gemini, Mistral, Ollama; Antigravity's in its own colours), in the platform's colour where it has one;
+  others get an icon. The marks are
   their owners' trademarks, shown only to say which platform a provider is. To use a picture of your own,
   put an image (`png`, `jpg` or `webp`) in `~/.atroxabot/icons/` named after the provider: `claude`,
-  `anthropic`, or the name in an API's address (`openrouter`, `openai`, …).
+  `codex`, `antigravity`, `anthropic`, or the name in an API's address (`openrouter`, `openai`, …).
 
 ### How API agents work
 
@@ -730,6 +746,52 @@ out** (the handshake, models, threads, resuming, a turn that fails for want of a
 interrupting, compaction); replies, tool calls, approvals, questions, plans, usage, limits and sub-agents
 are written from Codex's own protocol types and were not run against a signed-in account.
 
+## Antigravity accounts
+
+An Antigravity account is the Antigravity CLI (`agy`) you installed, driven the way an editor drives it:
+
+- AtroxaBot **starts the Antigravity binary you installed, as published** (`agy acp`, which speaks the
+  Agent Client Protocol over its standard input and output), found on your `PATH` or where Google's
+  installer puts it (`%LOCALAPPDATA%\agy\bin` on Windows, `~/.local/bin` elsewhere). Only the native
+  binary is run, never a `.cmd` launcher. It tells Antigravity it is AtroxaBot, nothing else; an older
+  Antigravity may offer such a client fewer models.
+- **Installing** is Google's own installer (`irm https://antigravity.google/cli/install.ps1 | iex` on
+  Windows, `curl -fsSL https://antigravity.google/cli/install.sh | bash` elsewhere), started by *Install*
+  in a terminal you see. The app never downloads or places Antigravity itself.
+- AtroxaBot **never handles your sign-in**. *Sign in* opens Antigravity's own `agy acp --login` in a
+  terminal; the app never asks Antigravity to sign in (it sends no `authenticate`), and never reads or
+  stores its credentials. That is also why an Antigravity account shows **no plan limits**: Antigravity
+  tells a client none, and reading them the way its own app does takes the sign-in itself.
+- **Several accounts**: the first is whoever `agy` is signed in as in your terminal, with its settings
+  (`~/.gemini`). Each account you add is a folder of its own (`--gemini-dir`, under
+  `~/.atroxabot/antigravity/<id>/`), with its own sign-in, settings and conversations. Antigravity keeps
+  the Google sign-in of every folder in one entry of the system's keyring, and keeps it in the folder
+  only when it takes itself to be reached over SSH, so an added account is started with `SSH_CONNECTION`
+  set. Google documents no way to keep two accounts apart: this one may stop working with a later
+  Antigravity. The first account is started plainly.
+- A session is an Antigravity session, resumed by its id; the agent's instructions are added to
+  Antigravity's own system prompt where it takes them. The app's MCP servers are given to Antigravity for
+  the run; the skill library is not (Antigravity has no way to be shown one for a run). Nothing is
+  written to an account's own configuration.
+- **Approvals.** Antigravity has no sandbox or permission mode a client sets: it asks about what it does,
+  and the agent's autonomy answers what it settles (see *Autonomy*). What is left is asked on the
+  approval card.
+- A message sent while Antigravity works is put into the running turn, where it reads it at its next
+  step; one it does not take in is sent again as the next message. *Send now* stops the turn and sends it
+  right after.
+- **It starts slowly.** Antigravity unpacks itself every time it starts, which can take a minute: a
+  session's first message says so while it waits, and the session's process is kept a while after you
+  look elsewhere, as every account's is. What an account offers (its models and their levels) is asked
+  once and kept in `antigravity.json`, so opening the app starts nothing; the refresh icon on its row in
+  Settings, Providers asks anew.
+- When an account's quota is used up Antigravity only refuses the turn, without saying until when: the
+  session then does what *When an account runs out* says, trying again every 15 minutes.
+
+`crates/antigravity` is the transport. It is written from the Agent Client Protocol and from how other
+clients drive `agy acp`, and **has not been run against the real binary yet**: expect rough edges. We know
+of no page of Google's on how other apps may drive `agy acp`; read Antigravity's terms yourself before
+distributing the app.
+
 ## For developers
 
 ### Build
@@ -753,14 +815,15 @@ To look at the design without opening the app, draw every screen offscreen in ev
 |---|---|
 | `crates/claude-agent` (`atroxabot-claude-agent`) | Rust port of the Claude Agent SDK's transport and control protocol. Only dependency: `serde_json`. |
 | `crates/codex` (`atroxabot-codex`) | Drives the installed Codex CLI through `codex app-server`: the handshake, threads and turns as a state machine without I/O (`machine.rs`), its messages (`parse.rs`), the process (`session.rs`), finding the binary (`cli.rs`). Only dependency: `serde_json`. |
+| `crates/antigravity` (`atroxabot-antigravity`) | Drives the installed Antigravity CLI through `agy acp` (the Agent Client Protocol): the handshake, sessions and turns as a state machine without I/O (`machine.rs`), its messages (`parse.rs`), the process (`session.rs`), finding the binary (`cli.rs`). Only dependency: `serde_json`. |
 | `crates/mcp` (`atroxabot-mcp`) | A small MCP client (stdio and Streamable HTTP): lists a server's tools and calls them. |
-| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Anthropic's Messages in `messages.rs`, OpenAI's Responses in `openai.rs`, Chat Completions in `completions.rs`); the agent loop and its tools (`engine.rs`, `tools.rs`, and `pattern.rs`, the regular expressions `search` reads); the Claude Agent and Codex engines (`claude.rs`, `codex.rs`), and an MCP server's form as questions on the app's card (`elicit.rs`); usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the sessions' worktrees and their cleaning up (`worktree.rs`); pictures read and made small enough for a model (`picture.rs`); updating the app from a signed release (`update.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
+| `crates/core` (`atroxabot-core`) | Agents, sessions and their storage; the API client (Anthropic's Messages in `messages.rs`, OpenAI's Responses in `openai.rs`, Chat Completions in `completions.rs`); the agent loop and its tools (`engine.rs`, `tools.rs`, and `pattern.rs`, the regular expressions `search` reads); the Claude Agent, Codex and Antigravity engines (`claude.rs`, `codex.rs`, `antigravity.rs`), and an MCP server's form as questions on the app's card (`elicit.rs`); usage statistics (`stats.rs`); git through the `git` CLI (`git.rs`); the sessions' worktrees and their cleaning up (`worktree.rs`); pictures read and made small enough for a model (`picture.rs`); updating the app from a signed release (`update.rs`); the skill library and its repositories (`skills/`: `fetch.rs` gets a repository, `archive.rs` unpacks GitHub's `.tar.gz`, `scan.rs` reads what it offers). No GUI. |
 | `crates/voice` (`atroxabot-voice`) | Fish Audio and ElevenLabs speech-to-text and text-to-speech, voice-activity detection, the call loop, and audio devices (`cpal`). |
 | `crates/desktop` | The app (`atroxabot`): winit window, wgpu renderer, text engine, immediate-mode UI. |
 
 Every engine reports a turn as the same `AgentEvent`s (`core/src/engine.rs`), and `Session::apply` turns
-those into the saved transcript, so the app shows a Claude session, a Codex session and an API session the
-same way.
+those into the saved transcript, so the app shows a Claude session, a Codex session, an Antigravity session
+and an API session the same way.
 
 `crates/desktop/src`:
 
@@ -820,6 +883,8 @@ Everything lives in `~/.atroxabot/`:
 | `worktrees/<repository>-<session id>/` | The git worktree of each session that works in one. The app makes and removes them; agents' file tools may work in them as in any folder. |
 | `claude/<id>/` | The Claude Code configuration folder of each extra Claude account. Claude Code owns what is in it. Removing an account in Settings leaves the folder, and so its sign-in, where it is. |
 | `codex/<id>/` | The Codex home of each extra Codex account. Codex owns what is in it. Removing an account in Settings leaves the folder, and so its sign-in, where it is. |
+| `antigravity/<id>/` | The folder of each extra Antigravity account. Antigravity owns what is in it. Removing an account in Settings leaves the folder, and so its sign-in, where it is. |
+| `antigravity.json` | What each Antigravity account offered when it was last asked (its models, their levels, its commands), so that starting the app starts no Antigravity. Nothing of a sign-in is in it. |
 | `desktop.log`, `desktop-crash.log`, `desktop.lock` | The app's log (every time an agent's process ended unexpectedly is in it, with the last thing it said about why), crash reports, and what keeps it to one running copy. |
 
 Files the app writes are written atomically, `0600` on Unix. An API key is only sent to the address it was
@@ -883,6 +948,11 @@ Deliberate, for now.
   `/compact` is not sent to Codex (it summarises by itself), the context's breakdown and a reply's cost
   are not known for it, and its sign-in status is read when the app starts and when you come back to the
   settings.
+- **Antigravity accounts**: not run against the real binary yet (see
+  [Antigravity accounts](#antigravity-accounts)). Its plan limits, who is signed in, a reply's cost and
+  the context's breakdown are not known for it; its sub-agents show as one call with what they returned;
+  the skill library is not given to it; and it takes up to a minute to start. Whether it is signed in is
+  read when you come back to the settings or click the account's refresh icon.
 - **Worktrees**: merged work is recognised from what your repository knows, so a pull request merged on
   the server counts once you have fetched or pulled (the app does not fetch); until then the
   unused-worktree rule cleans it up. What git ignores in a worktree (build output, a local `.env`) goes
@@ -926,7 +996,8 @@ Deliberate, for now.
   Repositories are not looked at by themselves: those your skills came from are read once when the Skills
   page first opens, to find updates.
 - **Per provider**: questions, subagents, the task list and `/compact` are Claude accounts' and API
-  agents' (Codex has its own), and the plan's limits are the accounts' (skills work on every provider).
+  agents' (Codex and Antigravity have their own), and the plan's limits are Claude and Codex accounts'
+  (skills work on every provider but Antigravity).
 - **Messages while it works** are read after the tool calls in progress: one long call (a test run, a
   subagent) keeps a message waiting until it is done, unless you use *Send now*, which stops that call. A
   Claude Code older than about 2.1.219 cannot drop a message it was handed when you press Stop: it answers
