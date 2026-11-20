@@ -8,6 +8,7 @@ use winit::window::Window;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Sight {
     /// Nothing: other windows lie over all of it, or it is on another desktop.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code, reason = "only Windows measures what lies over a window"))]
     Covered,
     /// Some of it, with the mouse elsewhere.
     Open,
