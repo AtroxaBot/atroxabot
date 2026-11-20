@@ -150,6 +150,11 @@ fn main() -> ExitCode {
     };
     #[cfg(windows)]
     platform::mark_running();
+    // What it starts ends with it, even when it crashes.
+    #[cfg(windows)]
+    if let Err(e) = platform::tie_children() {
+        log::error(format!("cannot tie the agents' processes to the app: {e}"));
+    }
     // What an update left beside the app goes, off the start's way: nothing here looks for a new one.
     let swept = std::thread::Builder::new().name("atroxabot-update".into()).spawn(move || update::sweep(updated));
     if let Err(e) = swept {

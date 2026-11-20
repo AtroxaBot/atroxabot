@@ -31,6 +31,7 @@ mod messages;
 mod openai;
 mod pattern;
 pub mod picture;
+pub mod process;
 mod responses;
 mod session;
 pub mod skills;

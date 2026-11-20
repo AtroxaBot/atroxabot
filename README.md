@@ -483,7 +483,9 @@ began, kept with the session, so a process started again later (after the app re
 was closed for idling) takes up the conversation under the same prompt and the cache still serves it.
 An account's process is not closed the moment you look at another session: it stays for 15 minutes
 after you left a session with nothing to do (the three left last, at most), so coming back answers at
-once. Tool outputs are bounded
+once. On Windows the agents' processes, and whatever they run, end with the app, also when it crashed or
+was ended in the Task Manager (a job object, `platform::tie_children`); what it opens for you (a link, a
+terminal to sign in, the next version after an update) stays. Tool outputs are bounded
 (long files read in pages, long outputs cut in the middle, both saying so). Claude's thinking is replayed
 unchanged, so it keeps its reasoning between tool calls. Long conversations are summarised: by Anthropic's
 server-side compaction on its own API, by a request of the app's elsewhere.

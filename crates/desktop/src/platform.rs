@@ -19,15 +19,19 @@ pub fn no_window(command: &mut Command) -> &mut Command {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         command.creation_flags(CREATE_NO_WINDOW);
     }
     command
 }
 
+/// The Windows creation flag that opens no console window.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Starts `command` detached from our stdio and reaps it in the background.
+/// What it opens is the user's: it stays when the app ends.
 fn launch(mut command: Command) -> io::Result<()> {
-    let mut child = no_window(&mut command).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn()?;
+    command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = atroxabot_core::process::spawn_lasting(&mut command, CREATE_NO_WINDOW)?;
     std::thread::spawn(move || child.wait());
     Ok(())
 }
@@ -85,6 +89,73 @@ pub fn mark_running() {
     // null attributes are allowed. The handle is kept open on purpose: the
     // mutex is to exist for as long as the process does.
     let _held = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+}
+
+/// Puts the app in a job that ends every process it starts (agents' processes
+/// and what they run) when the app ends, also when it crashed or was ended in
+/// the Task Manager: an agent's turn never carries on alone. What is started
+/// for the user goes through `atroxabot_core::process::spawn_lasting`, which
+/// the job lets go.
+///
+/// # Errors
+/// Windows refused the job; the app runs on without it.
+#[cfg(target_os = "windows")]
+pub fn tie_children() -> io::Result<()> {
+    use std::ffi::c_void;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct BasicLimits {
+        per_process_user_time: i64,
+        per_job_user_time: i64,
+        flags: u32,
+        minimum_working_set: usize,
+        maximum_working_set: usize,
+        active_processes: u32,
+        affinity: usize,
+        priority_class: u32,
+        scheduling_class: u32,
+    }
+    /// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`.
+    #[repr(C)]
+    #[derive(Default)]
+    struct ExtendedLimits {
+        basic: BasicLimits,
+        io: [u64; 6],
+        process_memory: usize,
+        job_memory: usize,
+        peak_process_memory: usize,
+        peak_job_memory: usize,
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateJobObjectW(attributes: *const c_void, name: *const u16) -> *mut c_void;
+        fn SetInformationJobObject(job: *mut c_void, class: i32, info: *const c_void, length: u32) -> i32;
+        fn AssignProcessToJobObject(job: *mut c_void, process: *mut c_void) -> i32;
+        fn GetCurrentProcess() -> *mut c_void;
+    }
+    const EXTENDED_LIMIT_INFORMATION: i32 = 9;
+    const BREAKAWAY_OK: u32 = 0x0800;
+    const KILL_ON_JOB_CLOSE: u32 = 0x2000;
+
+    // SAFETY: null attributes and name are allowed. The handle is kept open on
+    // purpose: Windows closes it as the process ends, which ends the job.
+    let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+    if job.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut limits = ExtendedLimits::default();
+    limits.basic.flags = KILL_ON_JOB_CLOSE | BREAKAWAY_OK;
+    let size = u32::try_from(size_of::<ExtendedLimits>()).unwrap_or(u32::MAX);
+    // SAFETY: the pointer is to a live `JOBOBJECT_EXTENDED_LIMIT_INFORMATION` of `size` bytes.
+    if unsafe { SetInformationJobObject(job, EXTENDED_LIMIT_INFORMATION, (&raw const limits).cast(), size) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both handles are valid; the current process' is a pseudo-handle that needs no closing.
+    if unsafe { AssignProcessToJobObject(job, GetCurrentProcess()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Shows a native error dialog with `title` and `message` and waits until
@@ -556,7 +627,9 @@ pub fn run_in_terminal(title: &str, program: &Path, args: &[String], env: &[(Str
         let mut command = Command::new("cmd");
         command.args(["/C", "start"]).raw_arg(format!("\"{title}\"")).args(["cmd", "/K"]).arg(program).args(args);
         command.envs(env.iter().map(|(name, value)| (name.as_str(), value.as_str())));
-        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(|_| ())
+        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        // The terminal is the user's: it stays when the app ends.
+        atroxabot_core::process::spawn_lasting(&mut command, 0).map(drop)
     }
     #[cfg(not(windows))]
     {
@@ -616,6 +689,55 @@ fn run_in_unix_terminal(program: &Path, args: &[String], env: &[(String, String)
 #[cfg(all(test, windows))]
 mod tests {
     use super::*;
+
+    /// Whether a process with `pid` runs.
+    #[cfg(target_os = "windows")]
+    fn runs(pid: &str) -> bool {
+        let mut tasklist = Command::new("tasklist");
+        tasklist.args(["/NH", "/FI", &format!("PID eq {pid}")]);
+        let output = no_window(&mut tasklist).output().expect("tasklist");
+        String::from_utf8_lossy(&output.stdout).split_whitespace().any(|word| word == pid)
+    }
+
+    /// In a process of its own (the test runs itself again), the app's job
+    /// ends what it started when it ends, and leaves what is the user's.
+    #[test]
+    #[cfg(target_os = "windows")]
+    #[expect(clippy::zombie_processes, reason = "the children are to outlive the process that started them")]
+    fn what_the_app_starts_ends_with_it_and_what_is_the_users_stays() {
+        let wait = || {
+            let mut ping = Command::new("ping");
+            ping.args(["-n", "60", "127.0.0.1"]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            ping
+        };
+        // The pids go through a file: the children hold on to whatever pipe the test's output is.
+        if let Some(file) = std::env::var_os("ATROXABOT_JOB_TEST") {
+            tie_children().expect("the job");
+            let tied = no_window(&mut wait()).spawn().expect("a child");
+            let lasting =
+                atroxabot_core::process::spawn_lasting(&mut wait(), CREATE_NO_WINDOW).expect("a lasting child");
+            std::fs::write(file, format!("tied={} lasting={}", tied.id(), lasting.id())).expect("the pids");
+            return;
+        }
+        let file = std::env::temp_dir().join(format!("atroxabot-job-test-{}.txt", std::process::id()));
+        let test = "platform::tests::what_the_app_starts_ends_with_it_and_what_is_the_users_stays";
+        let mut again = Command::new(std::env::current_exe().expect("the test"));
+        again.args(["--exact", test, "--nocapture", "--test-threads=1"]).env("ATROXABOT_JOB_TEST", &file);
+        again.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+        no_window(&mut again).status().expect("the test again");
+        let printed = std::fs::read_to_string(&file).unwrap_or_default();
+        let _ = std::fs::remove_file(&file);
+        let pid = |name: &str| {
+            let found = printed.split_whitespace().find_map(|word| word.strip_prefix(&format!("{name}=")));
+            found.expect("its pid").to_owned()
+        };
+        let (tied, lasting) = (pid("tied"), pid("lasting"));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        let (tied_runs, lasting_runs) = (runs(&tied), runs(&lasting));
+        let _ = Command::new("taskkill").args(["/F", "/PID", &lasting]).output();
+        assert!(!tied_runs, "the process it started ended with it");
+        assert!(lasting_runs, "the user's process stays");
+    }
 
     #[test]
     fn less_motion_is_read_from_what_the_setting_prints() {

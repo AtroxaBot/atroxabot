@@ -544,7 +544,9 @@ pub fn relaunch(start: &Path) -> io::Result<()> {
     } else {
         Command::new(start)
     };
-    command.arg(AFTER_UPDATE).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map(drop)
+    command.arg(AFTER_UPDATE).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // It lives on as this one ends.
+    crate::process::spawn_lasting(&mut command, 0).map(drop)
 }
 
 /// Clears away what updating left beside the app: the version before, and
