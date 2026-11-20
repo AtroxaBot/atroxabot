@@ -1350,7 +1350,7 @@ impl Shell {
         }
         // What a response used goes to the usage log, which outlives the session.
         if matches!(event, AgentEvent::ReplyEnded { .. })
-            && let Some(mut record) = Ledger::collect(std::slice::from_ref(&thread.session)).records.pop()
+            && let Some(mut record) = Ledger::latest(&thread.session)
             && (record.input + record.output > 0 || !record.tools.is_empty())
         {
             record.provider = ran_on(thread, &self.agents);

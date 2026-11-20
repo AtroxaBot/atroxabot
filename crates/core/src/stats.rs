@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Config, write_private};
 use crate::engine::Limits;
 use crate::error::Result;
-use crate::session::{Block, Entry, Session};
+use crate::session::{Block, Entry, Reply, Session};
 
 /// Seconds in a day.
 const DAY: u64 = 86_400;
@@ -188,31 +188,24 @@ impl Ledger {
                 match entry {
                     Entry::User { .. } => prompts += 1,
                     Entry::Summary { .. } | Entry::Note { .. } => {}
-                    Entry::Reply(reply) => {
-                        let at = if reply.at == 0 { session.updated } else { reply.at };
-                        let mut tools = Vec::new();
-                        called(&reply.blocks, &mut tools);
-                        records.push(Record {
-                            day: at / DAY,
-                            agent: session.agent.clone(),
-                            session: session.id.clone(),
-                            // Only a Claude account is on record in a session.
-                            provider: session.account.clone(),
-                            provider_name: String::new(),
-                            model: if reply.model.is_empty() { "unknown".to_owned() } else { reply.model.clone() },
-                            input: reply.usage.input_tokens,
-                            output: reply.usage.output_tokens,
-                            cached: reply.usage.cached_tokens,
-                            written: reply.usage.cache_write_tokens,
-                            cost: reply.cost,
-                            prompts: std::mem::take(&mut prompts),
-                            tools,
-                        });
-                    }
+                    Entry::Reply(reply) => records.push(record(session, reply, std::mem::take(&mut prompts))),
                 }
             }
         }
         Self { records }
+    }
+
+    /// The record of the latest response of `session`, as [`Ledger::collect`] makes it, without
+    /// making those of the responses before it: what is logged as each one ends.
+    #[must_use]
+    pub fn latest(session: &Session) -> Option<Record> {
+        let is_reply = |entry: &Entry| matches!(entry, Entry::Reply(_));
+        let at = session.entries.iter().rposition(is_reply)?;
+        let Some(Entry::Reply(reply)) = session.entries.get(at) else { return None };
+        // The user messages since the response before it are the ones it answered.
+        let since = session.entries[..at].iter().rposition(is_reply).map_or(0, |before| before + 1);
+        let prompts = session.entries[since..at].iter().filter(|entry| matches!(entry, Entry::User { .. })).count();
+        Some(record(session, reply, prompts as u64))
     }
 
     /// Where responses are logged: `usage.jsonl` in the data folder.
@@ -355,6 +348,29 @@ pub fn save_limits<S: std::hash::BuildHasher>(limits: &HashMap<String, Limits, S
     write_private(&Config::dir()?.join(LIMITS_FILE), &serde_json::to_vec(limits)?)
 }
 
+/// The record of the response `reply` of `session`, which answered `prompts` user messages.
+fn record(session: &Session, reply: &Reply, prompts: u64) -> Record {
+    let at = if reply.at == 0 { session.updated } else { reply.at };
+    let mut tools = Vec::new();
+    called(&reply.blocks, &mut tools);
+    Record {
+        day: at / DAY,
+        agent: session.agent.clone(),
+        session: session.id.clone(),
+        // Only a Claude account is on record in a session.
+        provider: session.account.clone(),
+        provider_name: String::new(),
+        model: if reply.model.is_empty() { "unknown".to_owned() } else { reply.model.clone() },
+        input: reply.usage.input_tokens,
+        output: reply.usage.output_tokens,
+        cached: reply.usage.cached_tokens,
+        written: reply.usage.cache_write_tokens,
+        cost: reply.cost,
+        prompts,
+        tools,
+    }
+}
+
 /// The tools called in `blocks` and whether each failed, those of subagents included.
 fn called(blocks: &[Block], out: &mut Vec<(String, bool)>) {
     for block in blocks {
@@ -438,7 +454,9 @@ mod tests {
         // Summed without the records, a session comes to the same.
         for session in [&a, &b] {
             assert_eq!(Tally::of(session), Ledger::collect(std::slice::from_ref(session)).summary(0).total);
+            assert_eq!(Ledger::latest(session), Ledger::collect(std::slice::from_ref(session)).records.pop());
         }
+        assert_eq!(Ledger::latest(&Session::new("nobody")), None);
         let ledger = Ledger::collect(&[a, b]);
         assert_eq!(ledger.records.len(), 4);
         assert_eq!(ledger.records.iter().map(|r| r.prompts).collect::<Vec<_>>(), [1, 0, 1, 1]);
