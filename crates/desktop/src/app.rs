@@ -38,6 +38,7 @@ use crate::log;
 use crate::paint::{Painter, Rect};
 use crate::platform;
 use crate::shell::{Cli, Shell};
+use crate::sight::{self, Sight};
 use crate::text::{Fonts, GlyphAtlas};
 use crate::theme::{Palette, Scheme};
 use crate::titlebar::{self, Command, Grab};
@@ -61,6 +62,15 @@ const GPU_RETRY: Duration = Duration::from_secs(2);
 const SKIPPED_RETRY: Duration = Duration::from_millis(100);
 /// How often a working agent's face is drawn at the least, in frames a second, when nothing else moves.
 const BUSY_FPS: f64 = 60.0;
+/// The least time between two frames while the window does not have the keyboard and the mouse is elsewhere:
+/// whoever looks at it then watches, and thirty frames a second show what an agent does.
+const UNFOCUSED_FRAME: Duration = Duration::from_millis(33);
+/// The same while other windows cover it all. Nothing would be drawn at all, were it not that a window
+/// wrongly taken for covered would then stand still for good.
+const COVERED_FRAME: Duration = Duration::from_secs(1);
+/// How long it is believed what was seen of the window, and how soon a covered one is looked at again:
+/// nothing says when it is uncovered.
+const LOOK: Duration = Duration::from_millis(250);
 
 /// Results delivered from other threads.
 pub enum WorkerEvent {
@@ -386,6 +396,14 @@ pub struct App {
     gpu_retry: Option<Instant>,
     /// When to draw again: after a frame that could not be shown, or the next frame of a working agent's face.
     redraw_at: Option<Instant>,
+    /// What could be seen of the window when it was last looked at, without the keyboard ([`sight::look`]).
+    sight: Option<(Instant, Sight)>,
+    /// Other windows cover the window, so the last frame asked for was not drawn.
+    covered: bool,
+    /// When to look again whether a covered window still is.
+    look_at: Option<Instant>,
+    /// A frame was put off until then, the window being watched at most: nothing on screen is due sooner.
+    hold: Option<Instant>,
     /// The refresh rate of the window's screen in millihertz, when the platform says.
     refresh: Option<u32>,
     fonts: Fonts,
@@ -553,6 +571,10 @@ impl App {
             renderer: Some(renderer),
             gpu_retry: None,
             redraw_at: None,
+            sight: None,
+            covered: false,
+            look_at: None,
+            hold: None,
             refresh,
             fonts: Fonts::load(),
             atlas: GlyphAtlas::default(),
@@ -697,14 +719,23 @@ impl App {
                     self.spawn(|| WorkerEvent::Motion(platform::reduce_motion()));
                 }
                 self.ui.focused = focused;
+                // What was seen of it without the keyboard says nothing of now.
+                self.sight = None;
             }
             // A file dragged onto the window goes along with the next message.
             WindowEvent::DroppedFile(path) => self.spawn(move || WorkerEvent::FilesPicked(attachable(vec![path]))),
             WindowEvent::ModifiersChanged(mods) => self.ui.mods = mods.state(),
             WindowEvent::CursorMoved { position, .. } => {
                 self.ui.mouse = (position.x as f32 / scale, position.y as f32 / scale);
+                // The mouse is over it: it is seen, and drawn as often as when it has the keyboard.
+                if !self.ui.focused {
+                    self.sight = Some((Instant::now(), Sight::Pointed));
+                }
             }
-            WindowEvent::CursorLeft { .. } => self.ui.mouse = (f32::MIN, f32::MIN),
+            WindowEvent::CursorLeft { .. } => {
+                self.ui.mouse = (f32::MIN, f32::MIN);
+                self.sight = None;
+            }
             WindowEvent::MouseInput { state, button: MouseButton::Left, .. } => {
                 if state == ElementState::Pressed {
                     let now = self.start.elapsed().as_secs_f32();
@@ -1488,13 +1519,16 @@ impl App {
         if self.renderer.as_ref().is_none_or(Renderer::is_lost) {
             self.recover_gpu();
         }
-        self.redraw_at = None;
+        (self.redraw_at, self.look_at, self.hold) = (None, None, None);
         // What cannot be seen is not drawn, and nothing asks for the next frame: showing the window again
         // (restoring it, from the tray, or uncovered) draws it.
         if self.unseen() {
             return;
         }
         let now = Instant::now();
+        if self.put_off(now) {
+            return;
+        }
         let dt = (now - self.last_frame).as_secs_f32().min(0.05);
         self.last_frame = now;
         self.ui.begin(dt, (now - self.start).as_secs_f32());
@@ -1618,6 +1652,38 @@ impl App {
         }
     }
 
+    /// Whether the frame asked for now waits, the window not having the keyboard: under other windows it is
+    /// drawn once in a long while, and looked at again soon; seen with the mouse elsewhere, at a watcher's
+    /// pace. With the mouse over it nothing waits. A working agent otherwise has the whole window drawn many
+    /// times a second for nobody.
+    fn put_off(&mut self, now: Instant) -> bool {
+        self.covered = false;
+        if !self.shown || self.ui.focused {
+            return false;
+        }
+        let sight = match self.sight {
+            Some((at, sight)) if now.saturating_duration_since(at) < LOOK => sight,
+            _ => {
+                let sight = sight::look(&self.window, self.ui.mouse.0 > f32::MIN);
+                self.sight = Some((now, sight));
+                sight
+            }
+        };
+        let since = now.saturating_duration_since(self.last_frame);
+        match sight {
+            Sight::Covered if since < COVERED_FRAME => {
+                (self.covered, self.look_at) = (true, Some(now + LOOK));
+                true
+            }
+            Sight::Open if since < UNFOCUSED_FRAME => {
+                let next = self.last_frame + UNFOCUSED_FRAME;
+                (self.redraw_at, self.hold) = (Some(next), Some(next));
+                true
+            }
+            Sight::Covered | Sight::Open | Sight::Pointed => false,
+        }
+    }
+
     /// Whether the window cannot be seen: minimised, in the tray, or (where the platform says) covered.
     /// The first frame is drawn regardless: it is what shows the window.
     fn unseen(&self) -> bool {
@@ -1628,7 +1694,7 @@ impl App {
     /// tooltip shows, or something the shell waits for is due.
     pub fn control_flow(&self) -> ControlFlow {
         // Unseen, nothing on screen is due: the caret, a tooltip and the next frame wait until it is seen.
-        let seen = !self.unseen();
+        let seen = !self.unseen() && !self.covered;
         let blink = (seen && self.ui.focused)
             .then(|| self.last_frame + Duration::from_secs_f32(self.ui.next_blink().max(0.01)));
         // A tooltip shows once the mouse has rested a moment, with nothing else moving.
@@ -1641,7 +1707,10 @@ impl App {
             Instant::now() + Duration::from_secs(left)
         });
         let next_frame = self.redraw_at.filter(|_| seen);
-        match blink.into_iter().chain(tip).chain(self.gpu_retry).chain(next_frame).chain(due).min() {
+        // While a frame is put off, waking for the screen any sooner would only spin.
+        let screen = blink.into_iter().chain(tip).chain(next_frame).min();
+        let screen = screen.map(|at| self.hold.map_or(at, |hold| at.max(hold)));
+        match screen.into_iter().chain(self.gpu_retry).chain(self.look_at).chain(due).min() {
             Some(at) => ControlFlow::WaitUntil(at),
             None => ControlFlow::Wait,
         }

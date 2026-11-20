@@ -788,7 +788,11 @@ macOS bundle's `Info.plist`, the Linux launcher entry and `install.sh`, the rele
 
 The app redraws only when something changes. A working agent's glowing face is drawn at 60 frames a second
 or a little more, on whole refreshes of the screen, not at every refresh of a fast one; and a window that
-cannot be seen (minimised, in the tray, or covered where the platform says so) is not drawn at all. When the
+cannot be seen (minimised, in the tray, or covered where the platform says so) is not drawn at all. A window
+without the keyboard is drawn for whoever may be watching it, not working in it (`sight.rs`): at most thirty
+times a second while the mouse is elsewhere, and, on Windows, which goes on composing a window that lies
+under others and never says so, once a second while the windows above cover all of it (they are measured
+four times a second, only while there is something to draw). When the
 system asks for less motion (Windows' "Animation effects" off, macOS' "Reduce motion", GNOME's "Enable
 animations" off; read at start and whenever the window is focused again), what shows that an agent works holds
 still: a steady glow on its face, a still dot, and the window is drawn once a second for the time it has

@@ -26,6 +26,7 @@ mod paint;
 mod platform;
 mod raster;
 mod shell;
+mod sight;
 mod text;
 mod theme;
 mod titlebar;
