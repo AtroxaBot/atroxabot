@@ -135,6 +135,19 @@ impl Scroll {
         self.target = (self.target + by).clamp(0.0, self.max);
     }
 
+    /// Moves the view and where it is headed by `by` at once: what lies above it grew by that
+    /// much, and what is looked at stays where it is. Call before [`Scroll::finish`].
+    pub fn shift(&mut self, by: f32) {
+        self.pos = (self.pos + by).max(0.0);
+        self.target = (self.target + by).max(0.0);
+    }
+
+    /// Where the view is, in content coordinates.
+    #[cfg(test)]
+    pub fn position(&self) -> f32 {
+        self.pos
+    }
+
     /// Sends the view to its end, as far as is known.
     pub fn follow_end(&mut self) {
         self.target = self.max;
@@ -218,7 +231,8 @@ pub(super) fn modal(p: &mut Painter, ui: &mut Ui, view: Rect, size: (f32, f32), 
         w,
         h,
     );
-    p.shadow(Rect::new(card.x, card.y + 16.0, card.w, card.h), fade(t.shadow, appear), theme::RADIUS_LG, 48.0);
+    let lifted = Rect::new(card.x, card.y + 16.0, card.w, card.h);
+    p.shadow_under(lifted, fade(t.shadow, appear), theme::RADIUS_LG, 48.0, (card, theme::RADIUS_LG, t.bg));
     p.bordered(card, t.bg, theme::RADIUS_LG, 1.0, t.border_strong);
     let outside = ui.released && !card.contains(ui.mouse) && !card.contains(ui.press_pos);
     (card, outside)

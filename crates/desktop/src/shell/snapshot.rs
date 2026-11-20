@@ -890,7 +890,7 @@ const DIFF: &str = "diff --git a/src/tokenizer.rs b/src/tokenizer.rs\nindex 3f1c
 +\n+    #[test]\n+    fn escaped_quotes_stay_inside_the_string() {\n+        assert_eq!(tokens(r#\"\"a\\\\\"b\"\"#).len(), 1);\n+    }\n }\n";
 
 /// A repository mid-change.
-fn repository() -> GitStatus {
+pub(super) fn repository() -> GitStatus {
     let file = |path: &str, change, added, removed| GitFile { path: path.into(), change, added, removed };
     GitStatus {
         branch: "fix/escaped-quotes".into(),
@@ -1031,7 +1031,7 @@ fn claude(email: &str, plan: &str) -> ClaudeInfo {
 
 /// Three agents, the first with a session two turns in: reasoning, tool
 /// calls (one open, one failed) and an answer with code.
-fn shell() -> Shell {
+pub(super) fn shell() -> Shell {
     let scout = Agent {
         tagline: "Finds and fixes bugs in this repository.".into(),
         instructions: "You are a careful engineer. Reproduce a bug before you fix it, and keep changes small.".into(),

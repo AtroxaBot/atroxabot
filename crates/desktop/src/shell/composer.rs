@@ -333,7 +333,7 @@ impl Shell {
 
         let focus = ui.anim(id("composer-focus"), f32::from(u8::from(typing)));
         let raised = Rect::new(card.x + 8.0, card.y + 10.0, card.w - 16.0, card.h);
-        p.shadow(raised, fade(t.shadow, 0.8), theme::RADIUS_LG, 28.0);
+        p.shadow_under(raised, fade(t.shadow, 0.8), theme::RADIUS_LG, 28.0, (card, theme::RADIUS_LG, t.surface));
         p.bordered(card, t.surface, theme::RADIUS_LG, 1.0, mix(t.border_strong, t.border_focus, focus * 0.6));
 
         let clip = p.push_clip(Rect::new(text_area.x - 2.0, text_area.y, text_area.w + 4.0, text_area.h));

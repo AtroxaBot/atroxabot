@@ -96,6 +96,34 @@ impl Tally {
         self.tools += record.tools.len() as u64;
     }
 
+    /// What the replies of `session` used so far: the total of [`Ledger::collect`]'s records of it,
+    /// summed without making them, for what shows it while the session works.
+    #[must_use]
+    pub fn of(session: &Session) -> Self {
+        fn calls(blocks: &[Block]) -> u64 {
+            let within = |block: &Block| if let Block::Tool(call) = block { 1 + calls(&call.sub) } else { 0 };
+            blocks.iter().map(within).sum()
+        }
+        let (mut tally, mut prompts) = (Self::default(), 0);
+        for entry in &session.entries {
+            match entry {
+                Entry::User { .. } => prompts += 1,
+                Entry::Summary { .. } | Entry::Note { .. } => {}
+                Entry::Reply(reply) => {
+                    tally.input += reply.usage.input_tokens;
+                    tally.output += reply.usage.output_tokens;
+                    tally.cached += reply.usage.cached_tokens;
+                    tally.written += reply.usage.cache_write_tokens;
+                    tally.cost += reply.cost;
+                    tally.replies += 1;
+                    tally.prompts += std::mem::take(&mut prompts);
+                    tally.tools += calls(&reply.blocks);
+                }
+            }
+        }
+        tally
+    }
+
     /// Tokens in and out.
     #[must_use]
     pub fn tokens(&self) -> u64 {
@@ -407,6 +435,10 @@ mod tests {
         b.updated = 13 * DAY + 1;
         // Saved before replies were dated: counted on the session's last day.
         b.entries = vec![user(), reply(0, "", usage(1_000, 100, 0), 1.0, &[])];
+        // Summed without the records, a session comes to the same.
+        for session in [&a, &b] {
+            assert_eq!(Tally::of(session), Ledger::collect(std::slice::from_ref(session)).summary(0).total);
+        }
         let ledger = Ledger::collect(&[a, b]);
         assert_eq!(ledger.records.len(), 4);
         assert_eq!(ledger.records.iter().map(|r| r.prompts).collect::<Vec<_>>(), [1, 0, 1, 1]);

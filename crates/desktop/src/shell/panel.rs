@@ -9,7 +9,6 @@
 use std::time::{Duration, Instant};
 
 use atroxabot_core::git::{Change, GitFile, GitStatus, Job, PullRequest, PullState, Report};
-use atroxabot_core::stats::Ledger;
 use atroxabot_core::{ConnectionKind, ContextPart, LimitWindow, Limits, Todo, TodoState};
 use winit::window::CursorIcon;
 
@@ -458,7 +457,7 @@ impl Shell {
             return (y + 26.0, false);
         };
         let mut compacting = false;
-        let total = Ledger::collect(std::slice::from_ref(&thread.session)).summary(0).total;
+        let total = thread.total();
         let context = thread.session.context_tokens();
         // How much the model takes: what its engine said, or what its provider lists.
         let listed = || {
@@ -515,7 +514,8 @@ impl Shell {
     /// Resting the mouse on a task cut short shows it in full, with what the agent wrote of it.
     fn draw_todos(&self, p: &mut Painter, ui: &mut Ui, (x, mut y, w): (f32, f32, f32)) -> f32 {
         let t = p.theme;
-        let todos = self.thread().map(|thread| thread.session.todos()).unwrap_or_default();
+        let todos = self.thread().map(Thread::todos);
+        let todos = todos.as_ref().map_or(&[][..], |todos| todos.as_slice());
         if todos.is_empty() {
             return y;
         }
@@ -766,7 +766,8 @@ impl Shell {
     /// Draws the panel in `rect`.
     pub(super) fn draw_panel(&mut self, p: &mut Painter, ui: &mut Ui, rect: Rect, actions: &mut Vec<Action>) {
         let t = p.theme;
-        p.shadow(Rect::new(rect.x, rect.y + 2.0, rect.w, rect.h), fade(t.shadow, 0.35), theme::CANVAS_RADIUS, 18.0);
+        let lifted = Rect::new(rect.x, rect.y + 2.0, rect.w, rect.h);
+        p.shadow_under(lifted, fade(t.shadow, 0.35), theme::CANVAS_RADIUS, 18.0, (rect, theme::CANVAS_RADIUS, t.bg));
         p.rect(rect, t.bg, theme::CANVAS_RADIUS);
         // Another session, another folder: its repository is read.
         if self.work_folder() != self.git.folder {

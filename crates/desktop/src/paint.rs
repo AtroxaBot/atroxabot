@@ -269,6 +269,44 @@ impl<'a> Painter<'a> {
         self.push(rect, color, color, [radius, 0.0, blur.max(0.01), KIND_SHAPE], [0.0; 4]);
     }
 
+    /// The soft shadow of something opaque that is drawn right after it: `rect` blurred by `blur`,
+    /// of which only what shows around `cover` is drawn (the opaque thing: where it is, how round
+    /// its corners are, and what it is filled with). Nearly all of a large surface's shadow lies
+    /// under the surface, and shading that for nothing costs the GPU as much as the surface does.
+    /// Under a fill that lets anything through, the whole shadow is drawn.
+    pub fn shadow_under(&mut self, rect: Rect, color: Color, radius: f32, blur: f32, cover: (Rect, f32, Color)) {
+        let (cover, cover_radius, fill) = cover;
+        // Well inside the cover's rounded corners and its border, and on whole pixels, so that the
+        // strips around it share none.
+        let inset = (cover_radius * 0.3).ceil() + 2.0;
+        let s = self.scale;
+        let snap = |v: f32| (v * s).round() / s;
+        let (left, top) = (snap(cover.x + inset), snap(cover.y + inset));
+        let (right, bottom) = (snap(cover.right() - inset), snap(cover.bottom() - inset));
+        if fill[3] < 1.0 || right <= left || bottom <= top {
+            self.shadow(rect, color, radius, blur);
+            return;
+        }
+        let reach = blur + 2.0;
+        let (x0, y0) = (rect.x - reach, rect.y - reach);
+        let (x1, y1) = (rect.right() + reach, rect.bottom() + reach);
+        let around = [
+            Rect::new(x0, y0, x1 - x0, top - y0),
+            Rect::new(x0, bottom, x1 - x0, y1 - bottom),
+            Rect::new(x0, top, left - x0, bottom - top),
+            Rect::new(right, top, x1 - right, bottom - top),
+        ];
+        let clip = self.clip;
+        for strip in around {
+            let shown = clip.intersect(strip);
+            if strip.w > 0.0 && strip.h > 0.0 && shown.w > 0.0 && shown.h > 0.0 {
+                self.clip = shown;
+                self.shadow(rect, color, radius, blur);
+            }
+        }
+        self.clip = clip;
+    }
+
     /// Lays out text with this frame's scale.
     #[must_use]
     pub fn layout(&self, text: &str, style: Style, max_width: Option<f32>) -> TextLayout {

@@ -225,7 +225,8 @@ impl Spotlight {
             width,
             55.0 + list_h + 34.0,
         );
-        p.shadow(Rect::new(card.x, card.y + 16.0, card.w, card.h), fade(t.shadow, appear), theme::RADIUS_LG, 48.0);
+        let lifted = Rect::new(card.x, card.y + 16.0, card.w, card.h);
+        p.shadow_under(lifted, fade(t.shadow, appear), theme::RADIUS_LG, 48.0, (card, theme::RADIUS_LG, t.surface));
         p.bordered(card, t.surface, theme::RADIUS_LG, 1.0, t.border_strong);
         let mut outcome = None;
         if ui.released && !card.contains(ui.mouse) && !card.contains(ui.press_pos) {

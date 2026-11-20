@@ -16,6 +16,8 @@ mod find;
 mod limits;
 mod menu;
 mod panel;
+#[cfg(test)]
+mod perf;
 mod picture;
 mod plan;
 mod question;
@@ -601,6 +603,11 @@ impl Shell {
         self.notices.drain(..extra);
     }
 
+    /// Whether `session` is the one the window shows.
+    pub fn shows(&self, session: &str) -> bool {
+        self.current.as_deref() == Some(session)
+    }
+
     /// Whether something is moving and the next frame should follow at once.
     pub fn is_busy(&self) -> bool {
         self.call.is_some() || self.threads.values().any(|thread| thread.busy)
@@ -812,6 +819,7 @@ impl Shell {
                 let Some(thread) = self.threads.get_mut(session).filter(|thread| !thread.loaded) else { return };
                 thread.session = loaded;
                 thread.loaded = true;
+                thread.touch();
                 let waiting = thread.queued.take();
                 if self.current.as_deref() == Some(session) {
                     self.want_models_in_use(actions);
@@ -1314,6 +1322,7 @@ impl Shell {
         let suggesting = self.suggesting();
         let Some(thread) = self.threads.get_mut(session) else { return };
         thread.session.apply(&event);
+        thread.heard(&event);
         // What a subagent's response used is logged too, apart: it is no reply of the session's.
         if let AgentEvent::Sub { event: inner, .. } = &event
             && let AgentEvent::ReplyEnded { model, usage, cost, .. } = inner.as_ref()
@@ -1588,7 +1597,7 @@ impl Shell {
     /// Draws the whole interface into `view`.
     pub fn draw(&mut self, p: &mut Painter, ui: &mut Ui, view: Rect, scheme: Scheme, actions: &mut Vec<Action>) {
         let t = p.theme;
-        p.rect(view, t.panel, 0.0);
+        // The window itself is the panel's colour: the frame is cleared to it (`App::frame`).
         let body = Rect::new(view.x, view.y + theme::TITLE_HEIGHT, view.w, view.h - theme::TITLE_HEIGHT);
         let sidebar = Rect::new(body.x, body.y, theme::SIDEBAR_WIDTH.min(body.w * 0.4), body.h);
         // The side panel takes its width from the session, where the window has it to give;
@@ -1617,7 +1626,7 @@ impl Shell {
         self.draw_sidebar(p, ui, sidebar, actions);
 
         let lifted = Rect::new(canvas.x, canvas.y + 2.0, canvas.w, canvas.h);
-        p.shadow(lifted, fade(t.shadow, 0.35), theme::CANVAS_RADIUS, 18.0);
+        p.shadow_under(lifted, fade(t.shadow, 0.35), theme::CANVAS_RADIUS, 18.0, (canvas, theme::CANVAS_RADIUS, t.bg));
         p.rect(canvas, t.bg, theme::CANVAS_RADIUS);
         let clip = p.push_clip(canvas);
         if self.call.is_some() {
@@ -3006,6 +3015,86 @@ mod tests {
             shell.draw(&mut p, ui, view, Scheme::Black, &mut Vec::new());
             ui.end();
         }
+    }
+
+    /// Draws `frames` frames of `shell` in a window `size` large.
+    fn paints_at(shell: &mut Shell, ui: &mut Ui, size: (f32, f32), frames: usize) {
+        let fonts = crate::text::Fonts::load();
+        let (mut atlas, mut images) = (crate::text::GlyphAtlas::default(), crate::image::ImageAtlas::default());
+        let view = Rect::new(0.0, 0.0, size.0, size.1);
+        for _ in 0..frames {
+            let mut instances = Vec::new();
+            ui.begin(0.016, 1.0);
+            let mut p =
+                Painter::new(&fonts, (&mut atlas, &mut images), &mut instances, 1.0, view, Scheme::Black.palette());
+            shell.draw(&mut p, ui, view, Scheme::Black, &mut Vec::new());
+            ui.end();
+        }
+    }
+
+    /// A day's work in the open session, with how many tool calls its conversation shows.
+    fn long_session() -> (Shell, usize) {
+        let mut shell = super::snapshot::shell();
+        super::perf::fill(&mut shell, super::perf::DAY);
+        let thread = shell.thread().expect("an open session");
+        let calls = |entry: &Entry| match entry {
+            Entry::Reply(reply) => {
+                reply.blocks.iter().filter(|block| matches!(block, atroxabot_core::Block::Tool(_))).count()
+            }
+            _ => 0,
+        };
+        let calls = thread.session.entries.iter().map(calls).sum();
+        (shell, calls)
+    }
+
+    #[test]
+    fn only_what_is_in_view_of_a_long_conversation_is_worked_on() {
+        let (mut shell, calls) = long_session();
+        let mut ui = Ui::default();
+        (ui.focused, ui.mouse) = (true, (-1.0, -1.0));
+        // Opened, it is shown at its end; the rest is measured in the frames that follow.
+        paints(&mut shell, &mut ui, 3);
+        assert_eq!(shell.thread().and_then(Thread::progress), Some(1.0), "it opens at its end");
+        paints(&mut shell, &mut ui, 400);
+        let thread = shell.thread().expect("an open session");
+        assert!(thread.measured(), "all of it is measured in the end");
+        assert_eq!(thread.progress(), Some(1.0), "and it stayed at its end meanwhile");
+        let read = thread.rows_read();
+        assert!(calls > 300 && read < calls / 8, "{read} of {calls} tool calls were read: only those in view");
+        // Scrolled to its start, the first calls come into view and are read, the last no more.
+        ui.mouse = (800.0, 400.0);
+        for _ in 0..200 {
+            ui.scroll = -4000.0;
+            paints(&mut shell, &mut ui, 1);
+        }
+        let thread = shell.thread().expect("an open session");
+        assert!(thread.progress().is_some_and(|progress| progress < 0.01), "{:?}", thread.progress());
+        assert!(thread.rows_read() > read && thread.rows_read() < calls, "{} of {calls}", thread.rows_read());
+    }
+
+    #[test]
+    fn what_is_looked_at_stays_put_while_what_is_above_it_is_measured_again() {
+        let (mut shell, _) = long_session();
+        let mut ui = Ui::default();
+        (ui.focused, ui.mouse) = (true, (800.0, 400.0));
+        paints(&mut shell, &mut ui, 400);
+        // Scrolled up into the middle of it.
+        ui.scroll = -9000.0;
+        paints(&mut shell, &mut ui, 200);
+        let thread = shell.thread().expect("an open session");
+        let entries = thread.session.entries.len();
+        // The entry that lies across the top of the view.
+        let across = (0..entries).rev().find(|index| thread.top_of(*index) <= 0.0).expect("an entry at the top");
+        assert!(across > 3 && across + 3 < entries, "in the middle: {across} of {entries}");
+        let top = thread.top_of(across);
+        // The window is made narrower: every entry is as tall as its words wrap now. What is in view
+        // is laid out at once, the rest over the frames that follow, and nothing in view moves.
+        for frame in 0..400 {
+            paints_at(&mut shell, &mut ui, (900.0, 900.0), 1);
+            let now = shell.thread().expect("an open session").top_of(across);
+            assert!((now - top).abs() < 0.5, "frame {frame}: it moved from {top} to {now}");
+        }
+        assert!(shell.thread().is_some_and(Thread::measured));
     }
 
     #[test]

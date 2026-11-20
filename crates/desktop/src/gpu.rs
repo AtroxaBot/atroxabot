@@ -587,6 +587,48 @@ impl Offscreen {
     }
 }
 
+#[cfg(test)]
+impl Offscreen {
+    /// Draws `instances` `frames` times into a texture of `size`, to measure: the time it took to hand
+    /// the frames over, and the time until the GPU had finished them all.
+    pub fn bench(
+        &mut self,
+        (width, height): (u32, u32),
+        instances: &[Instance],
+        (glyphs, images): (&mut Vec<Upload>, &mut Vec<Upload>),
+        scale: f32,
+        clear: [f32; 4],
+        frames: u32,
+    ) -> (std::time::Duration, std::time::Duration) {
+        self.draw.upload(&self.queue, glyphs, images);
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("bench"),
+            size: wgpu::Extent3d { width, height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: Self::FORMAT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        for _ in 0..20 {
+            let warm = self.draw.encode(&self.device, &self.queue, (&view, (width, height)), instances, scale, clear);
+            self.queue.submit([warm]);
+        }
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        let start = std::time::Instant::now();
+        for _ in 0..frames {
+            let commands =
+                self.draw.encode(&self.device, &self.queue, (&view, (width, height)), instances, scale, clear);
+            self.queue.submit([commands]);
+        }
+        let handed = start.elapsed();
+        let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+        (handed, start.elapsed())
+    }
+}
+
 fn srgb_to_linear(c: f64) -> f64 {
     if c <= 0.040_45 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
 }

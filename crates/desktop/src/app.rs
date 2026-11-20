@@ -62,7 +62,14 @@ const GPU_RETRY: Duration = Duration::from_secs(2);
 /// busy surface) while something moves: not at once, which would spin.
 const SKIPPED_RETRY: Duration = Duration::from_millis(100);
 /// How often a working agent's face is drawn at the least, in frames a second, when nothing else moves.
-const BUSY_FPS: f64 = 60.0;
+/// Its glow, the dot going round a running tool and the dots of an answer on its way move slowly, and by
+/// whole pixels: thirty frames a second show them as well as more would, and every one of them is the
+/// whole window drawn again.
+const BUSY_FPS: f64 = 30.0;
+/// How often what an agent says is drawn at the least, in frames a second, while it arrives: its words
+/// come many times a second, and its subagents' doings more often still. A frame for each would be drawn
+/// at every refresh of a fast screen. (What scrolls after the words is drawn at every refresh anyway.)
+const STREAM_FPS: f64 = 60.0;
 /// The least time between two frames while the window does not have the keyboard and the mouse is elsewhere:
 /// whoever looks at it then watches, and thirty frames a second show what an agent does.
 const UNFOCUSED_FRAME: Duration = Duration::from_millis(33);
@@ -889,6 +896,8 @@ impl App {
     /// Applies a result from another thread.
     pub fn worker_event(&mut self, event_loop: &ActiveEventLoop, event: WorkerEvent) {
         let mut actions = Vec::new();
+        // The pace a frame is asked for at, for what arrives many times a second.
+        let mut pace = None;
         match event {
             WorkerEvent::Tray(TrayEvent::Open) => self.restore(),
             WorkerEvent::Tray(TrayEvent::Quit) | WorkerEvent::Quit => event_loop.exit(),
@@ -904,6 +913,8 @@ impl App {
                         self.leases.remove(&session);
                     }
                 }
+                // Of a session that is not the one shown, only the sidebar says anything.
+                pace = Some(if self.shell.shows(&session) { STREAM_FPS } else { BUSY_FPS });
                 self.shell.agent_event(&session, event, &mut actions);
             }
             WorkerEvent::Models { connection, result } => {
@@ -997,7 +1008,19 @@ impl App {
             WorkerEvent::Tools(found) => self.shell.tools_found(found, &mut actions),
         }
         self.apply(actions);
-        self.window.request_redraw();
+        match pace {
+            Some(fps) => self.frame_within(frame_interval(self.refresh, fps)),
+            None => self.window.request_redraw(),
+        }
+    }
+
+    /// Asks for a frame no sooner than `least` after the last one: what arrives many times a second is
+    /// shown at that pace, not drawn at every arrival. A frame drawn for anything else meanwhile shows it too.
+    fn frame_within(&mut self, least: Duration) {
+        match due(self.last_frame, Instant::now(), least) {
+            None => self.window.request_redraw(),
+            Some(at) => self.redraw_at = Some(self.redraw_at.map_or(at, |known| known.min(at))),
+        }
     }
 
     fn apply(&mut self, actions: Vec<Action>) {
@@ -1731,11 +1754,11 @@ impl App {
         if self.ui.animating || (busy && !self.ui.still) {
             if drawn == Frame::Skipped {
                 self.redraw_at = Some(Instant::now() + SKIPPED_RETRY);
-            } else if let Some(wait) = busy_interval(self.refresh).filter(|_| !self.ui.animating) {
-                // Only a working agent's face moves, slowly: not drawn at every refresh of a fast screen.
-                self.redraw_at = Some(now + wait);
-            } else {
+            } else if self.ui.animating {
                 self.window.request_redraw();
+            } else {
+                // Only a working agent's face moves, slowly: not drawn at every refresh of the screen.
+                self.redraw_at = Some(now + frame_interval(self.refresh, BUSY_FPS));
             }
         } else if busy {
             // Held still for less motion: only how long it has worked changes, once a second.
@@ -2007,13 +2030,23 @@ fn refresh_rate(window: &Window) -> Option<u32> {
     window.current_monitor().and_then(|screen| screen.refresh_rate_millihertz())
 }
 
-/// How long the next frame waits when only a working agent's face moves: a whole number of the screen's
-/// refreshes, as many as still keep it at [`BUSY_FPS`] or more. `None` (draw at every refresh) when that
-/// is one, or the rate is unknown.
-fn busy_interval(refresh_millihertz: Option<u32>) -> Option<Duration> {
-    let hz = f64::from(refresh_millihertz?) / 1000.0;
-    let refreshes = (hz / BUSY_FPS).floor();
-    (refreshes >= 2.0).then(|| Duration::from_secs_f64(refreshes / hz))
+/// How long the next frame waits to show something at `fps` frames a second or a little more: until
+/// half a refresh before a whole number of the screen's refreshes has passed (one, when it refreshes no
+/// faster than that), so that the frame is asked for in time for that refresh and not just after it. The
+/// frame time of `fps` itself when the screen's rate is unknown.
+fn frame_interval(refresh_millihertz: Option<u32>, fps: f64) -> Duration {
+    let Some(hz) = refresh_millihertz.map(|rate| f64::from(rate) / 1000.0).filter(|hz| *hz >= 1.0) else {
+        return Duration::from_secs_f64(1.0 / fps);
+    };
+    // A screen at 59.94 Hz is one of sixty.
+    let refreshes = (hz / fps + 0.05).floor().max(1.0);
+    Duration::from_secs_f64((refreshes - 0.5) / hz)
+}
+
+/// When a frame that is to follow the one drawn at `drawn` by `gap` at the soonest is due, at `now`:
+/// `None` when that time has come.
+fn due(drawn: Instant, now: Instant, gap: Duration) -> Option<Instant> {
+    Some(drawn + gap).filter(|at| *at > now)
 }
 
 /// The smallest the window may be at `zoom` (percent): the interface is
@@ -2241,14 +2274,64 @@ mod tests {
     }
 
     #[test]
-    fn a_working_face_is_drawn_on_whole_refreshes_at_sixty_or_more() {
-        let fps = |millihertz| busy_interval(Some(millihertz)).map(|wait| (1.0 / wait.as_secs_f64()).round());
-        assert_eq!(fps(165_000), Some(83.0), "every second refresh");
-        assert_eq!(fps(240_000), Some(60.0), "every fourth");
-        assert_eq!(fps(144_000), Some(72.0));
-        assert_eq!(fps(59_940), None, "every refresh");
-        assert_eq!(fps(100_000), None);
-        assert_eq!(busy_interval(None), None, "unknown: every refresh");
+    fn a_working_face_is_drawn_on_whole_refreshes_at_thirty_or_a_little_more() {
+        // The refresh the frame lands on, counted from the one before it: asked for half a refresh ahead.
+        let refreshes = |millihertz: u32, fps| {
+            let wait = frame_interval(Some(millihertz), fps).as_secs_f64();
+            (wait * f64::from(millihertz) / 1000.0 + 0.5).round()
+        };
+        assert_eq!(refreshes(165_000, BUSY_FPS), 5.0, "33 frames a second");
+        assert_eq!(refreshes(240_000, BUSY_FPS), 8.0, "30");
+        assert_eq!(refreshes(144_000, BUSY_FPS), 4.0, "36");
+        assert_eq!(refreshes(59_940, BUSY_FPS), 2.0, "30");
+        assert_eq!(refreshes(100_000, BUSY_FPS), 3.0, "33");
+        assert_eq!(refreshes(165_000, STREAM_FPS), 2.0, "what an agent says: 83 frames a second");
+        assert_eq!(refreshes(59_940, STREAM_FPS), 1.0, "every refresh of a screen that has no more");
+        assert_eq!(refreshes(24_000, BUSY_FPS), 1.0, "never more often than the screen refreshes");
+        assert_eq!(frame_interval(None, BUSY_FPS), Duration::from_secs_f64(1.0 / 30.0), "unknown: by the clock");
+        assert_eq!(frame_interval(Some(0), STREAM_FPS), Duration::from_secs_f64(1.0 / 60.0));
+        // A face at work asks for its next frame at every frame.
+        assert_eq!(frames_drawn(165, 1, frame_interval(Some(165_000), BUSY_FPS), 4), 33);
+        assert_eq!(frames_drawn(60, 1, frame_interval(Some(60_000), BUSY_FPS), 4), 30);
+        assert_eq!(frames_drawn(144, 1, frame_interval(Some(144_000), BUSY_FPS), 4), 36);
+    }
+
+    /// The frames drawn in `seconds` of an agent's words arriving every `every` milliseconds on a screen
+    /// refreshing `hz` times a second, when each arrival asks for a frame `gap` after the last one.
+    fn frames_drawn(hz: u64, every: u64, gap: Duration, seconds: u64) -> u64 {
+        let start = Instant::now();
+        let at = |micros: u64| start + Duration::from_micros(micros);
+        let (mut last, mut wanted, mut frames) = (start, None::<Instant>, 0);
+        // The screen's refreshes, one after the other: a frame asked for is drawn at the next.
+        for refresh in 1..=hz * seconds {
+            let (from, now) = ((refresh - 1) * 1_000_000 / hz, refresh * 1_000_000 / hz);
+            for arrival in (from / (every * 1000) + 1)..=(now / (every * 1000)) {
+                let asked = at(arrival * every * 1000);
+                let frame = due(last, asked, gap).unwrap_or(asked);
+                wanted = Some(wanted.map_or(frame, |known| known.min(frame)));
+            }
+            if wanted.is_some_and(|wanted| wanted <= at(now)) {
+                (last, wanted, frames) = (at(now), None, frames + 1);
+            }
+        }
+        frames / seconds
+    }
+
+    #[test]
+    fn words_arriving_often_are_not_each_a_frame() {
+        // Words every four milliseconds (a few subagents at work), on a screen at 165 Hz.
+        let each = frames_drawn(165, 4, Duration::ZERO, 4);
+        assert_eq!(each, 165, "a frame for each arrival is a frame at every refresh");
+        let shown = frames_drawn(165, 4, frame_interval(Some(165_000), STREAM_FPS), 4);
+        assert!((80..=83).contains(&shown), "the session that is shown: {shown} frames a second");
+        let other = frames_drawn(165, 4, frame_interval(Some(165_000), BUSY_FPS), 4);
+        assert!((32..=33).contains(&other), "a session in the sidebar: {other} frames a second");
+        // Words that come slowly are drawn as they come.
+        assert_eq!(frames_drawn(165, 100, frame_interval(Some(165_000), STREAM_FPS), 4), 10);
+        // The time has come: no waiting.
+        let now = Instant::now();
+        assert_eq!(due(now, now + Duration::from_millis(20), Duration::from_millis(12)), None);
+        assert_eq!(due(now, now, Duration::from_millis(12)), Some(now + Duration::from_millis(12)));
     }
 
     #[test]

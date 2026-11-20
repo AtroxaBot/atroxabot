@@ -5,12 +5,15 @@
 //! a row in the side panel's list: either opens what it said and did, which
 //! reads like a conversation of its own under a bar that leads back.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use atroxabot_core::attach::media_type;
-use atroxabot_core::{Ask, Block, Entry, Reply, Session, SessionSummary, TodoState, ToolUse, tools};
+use atroxabot_core::stats::Tally;
+use atroxabot_core::{AgentEvent, Ask, Block, Entry, Reply, Session, SessionSummary, Todo, TodoState, ToolUse, tools};
 use serde_json::Value;
 use winit::window::CursorIcon;
 
@@ -33,9 +36,77 @@ use crate::ui::{Tip, Ui, icon, id};
 type FileCount = (String, u32, u32);
 /// The files a run of replies changed, after the weight of the calls they were gathered from.
 type Gathered = (usize, Vec<FileCount>);
-/// The lines a tool call added and removed (`None` when it changes no file), after the length of the
-/// input they were counted from.
-type Counted = (usize, Option<(u32, u32)>);
+
+/// What a tool call's row shows, worked out once from its input rather than at every frame.
+#[derive(Default)]
+struct Row {
+    /// The length of the input it was worked out from; `None` before it was.
+    of: Option<usize>,
+    /// The icon of its kind of tool.
+    icon: char,
+    /// What it was called on, in a line.
+    about: String,
+    /// The lines it added to a file and removed from it, when it is one that changes a file.
+    changed: Option<(u32, u32)>,
+}
+
+/// A subagent's kind and what it was started for, read once from its call's input.
+struct Brief {
+    /// The length of the input they were read from.
+    of: usize,
+    kind: String,
+    description: String,
+}
+
+impl Brief {
+    /// What the subagent is listed as: what it was started for, or else its kind.
+    fn label(&self) -> &str {
+        if self.description.is_empty() { &self.kind } else { &self.description }
+    }
+}
+
+/// Something worked out from a session's messages, after the count of their changes and the number
+/// of entries it was worked out at.
+type Summed<T> = Option<((u64, usize), T)>;
+
+/// What is known of an entry of the conversation from when it was last drawn: enough to leave it
+/// alone while it is out of view.
+#[derive(Default)]
+struct Seen {
+    /// How tall it was; `None` before it was ever drawn.
+    height: Option<f32>,
+    /// The width and scale it was laid out at.
+    fits: (u32, u32),
+    /// How much it held and how it stood ([`weight`]): another now, and it is measured again.
+    weight: usize,
+    /// The blocks of it text can be marked in, in the order they are drawn.
+    marks: Vec<(usize, usize)>,
+}
+
+/// How much `entry` holds, with whether it is being written (`live`) and whether it ends a run of
+/// replies (`ends`): what its height hangs on besides the width, for an entry that is not the newest.
+fn weight(entry: &Entry, live: bool, ends: bool) -> usize {
+    let held = match entry {
+        Entry::User { text, files, .. } => text.len() + files.len(),
+        Entry::Reply(reply) => reply.blocks.len(),
+        Entry::Summary { text } | Entry::Note { text } => text.len(),
+    };
+    held * 4 + usize::from(live) * 2 + usize::from(ends)
+}
+
+/// The words of `block`, when it is one of the answer's.
+fn words(block: &Block) -> Option<&str> {
+    if let Block::Text { text } = block { Some(text.as_str()) } else { None }
+}
+
+/// About how tall `entry` is, before it was ever measured: where the scroll bar is until it is.
+fn guess(entry: &Entry) -> f32 {
+    match entry {
+        Entry::User { text, .. } => 70.0 + (text.len() / 90) as f32 * 24.0,
+        Entry::Reply(reply) => 40.0 + reply.blocks.len() as f32 * 32.0,
+        Entry::Summary { .. } | Entry::Note { .. } => 34.0,
+    }
+}
 
 /// Widest the user's bubble gets, as a share of the column.
 const BUBBLE_SHARE: f32 = 0.78;
@@ -46,10 +117,11 @@ const DETAIL_CHARS: usize = 6_000;
 /// The style of tool details: small monospace.
 const DETAIL: Style = Style::mono(12.5);
 
-/// How long one frame may spend laying out again what is out of view at a
-/// new width (the window is being resized): the rest keeps its old layout
-/// for now and follows in the next frames.
-const RELAYOUT_BUDGET: Duration = Duration::from_millis(4);
+/// How long one frame may spend measuring what is out of view: at a new
+/// width (the window is being resized), or for the first time (a long
+/// conversation was just opened). The rest keeps what is known of it for
+/// now and follows in the next frames.
+const RELAYOUT_BUDGET: Duration = Duration::from_millis(2);
 
 /// Layout keys of what a subagent said and did start here, far from any entry's index.
 const SUB_KEYS: usize = 1 << 62;
@@ -77,23 +149,28 @@ fn agents<'a>(blocks: &'a [Block], out: &mut Vec<&'a ToolUse>) {
 }
 
 /// The subagents of one turn (what the agent did between two of the user's
-/// messages): the turn the `open` one is in, or the latest.
+/// messages): the turn the `open` one is in, or the latest. Turns are gone
+/// through from the latest back, so the latest costs only itself.
 fn turn_agents<'a>(entries: &'a [Entry], open: Option<&str>) -> Vec<&'a ToolUse> {
-    let mut turns = vec![Vec::new()];
-    for entry in entries {
-        match entry {
-            Entry::User { .. } => turns.push(Vec::new()),
-            Entry::Reply(reply) => {
-                if let Some(turn) = turns.last_mut() {
-                    agents(&reply.blocks, turn);
-                }
+    let (mut end, mut latest) = (entries.len(), None);
+    loop {
+        let before = &entries[..end];
+        let start = before.iter().rposition(|entry| matches!(entry, Entry::User { .. })).map_or(0, |at| at + 1);
+        let mut turn = Vec::new();
+        for entry in &before[start..] {
+            if let Entry::Reply(reply) = entry {
+                agents(&reply.blocks, &mut turn);
             }
-            _ => {}
         }
+        if open.is_none_or(|open| turn.iter().any(|call| call.id == open)) {
+            return turn;
+        }
+        latest.get_or_insert(turn);
+        if start == 0 {
+            return latest.unwrap_or_default();
+        }
+        end = start - 1;
     }
-    let holds = |turn: &Vec<&ToolUse>| open.is_some_and(|open| turn.iter().any(|call| call.id == open));
-    let at = turns.iter().position(holds).unwrap_or(turns.len() - 1);
-    turns.swap_remove(at)
 }
 
 /// Whether the subagent `call` started is still at work: its call has not
@@ -103,12 +180,6 @@ fn turn_agents<'a>(entries: &'a [Entry], open: Option<&str>) -> Vec<&'a ToolUse>
 fn at_work(call: &ToolUse) -> bool {
     let ended = ["Done", "Failed", "Stopped"].iter().any(|end| call.activity.starts_with(end));
     !ended && (call.output.is_none() || !call.activity.is_empty())
-}
-
-/// What a subagent is listed as: what it was started for, or else its kind.
-fn agent_label(call: &ToolUse) -> String {
-    let (kind, description, _) = agent_brief(call);
-    if description.is_empty() { kind } else { description }
 }
 
 /// A subagent of the turn, as the side panel lists it.
@@ -260,10 +331,19 @@ pub(super) struct Thread {
     follow: bool,
     /// Layouts by (entry, block); block `usize::MAX` is a tool's detail.
     cache: HashMap<(usize, usize), Cached>,
-    /// How many lines each tool call that changes a file added and removed
-    /// (`None` for a call that changes none), by (entry, block), with the
-    /// length of the input they were counted from.
-    changes: HashMap<(usize, usize), Counted>,
+    /// What each tool call's row shows, by (entry, block).
+    rows: HashMap<(usize, usize), Row>,
+    /// What each subagent is and is for, by the id of the call that started it.
+    briefs: RefCell<HashMap<String, Rc<Brief>>>,
+    /// Counts the changes of the session's messages other than more words: what its replies
+    /// used hangs on them.
+    revision: u64,
+    /// Counts those of them that are the agent's own, not a subagent's: its task list hangs on them.
+    listed: u64,
+    /// The agent's task list, as last worked out.
+    todos: RefCell<Summed<Rc<Vec<Todo>>>>,
+    /// What its replies used, as last summed.
+    total: Cell<Summed<Tally>>,
     /// Reasoning and tool rows the user opened.
     open: HashSet<(usize, usize)>,
     /// The code block last copied and when, to show "Copied" for a moment.
@@ -278,15 +358,15 @@ pub(super) struct Thread {
     drawn: usize,
     /// What the agent's task list says it is doing, while a turn runs.
     doing: String,
-    /// How tall each entry was when last drawn, to know which are out of view.
-    heights: Vec<f32>,
-    /// The entry being drawn is out of view: a block of it whose layout is
-    /// only of another width keeps it once the frame's budget is spent.
-    lazy: bool,
-    /// Until when this frame lays out again what is out of view.
+    /// What each entry was like when last drawn: one out of view is left alone.
+    seen: Vec<Seen>,
+    /// Until when this frame measures what is out of view (anew at another
+    /// width, or for the first time).
     deadline: Option<Instant>,
-    /// Something out of view kept an old layout: the next frame goes on with it.
+    /// Something out of view is not measured yet: the next frame goes on with it.
     behind: bool,
+    /// How many frames it has been measured in without being shown, since it was opened.
+    opening: u8,
     /// A picture of the conversation that was just clicked, for the shell to open whole.
     pub clicked_picture: Option<String>,
     /// The search of what the conversation shows, while its bar is open (`find.rs`).
@@ -358,7 +438,12 @@ impl Thread {
             fresh: true,
             follow: true,
             cache: HashMap::new(),
-            changes: HashMap::new(),
+            rows: HashMap::new(),
+            briefs: RefCell::default(),
+            revision: 0,
+            listed: 0,
+            todos: RefCell::default(),
+            total: Cell::default(),
             open: HashSet::new(),
             copied: None,
             selection: None,
@@ -366,10 +451,10 @@ impl Thread {
             order: Vec::new(),
             drawn: 0,
             doing: String::new(),
-            heights: Vec::new(),
-            lazy: false,
+            seen: Vec::new(),
             deadline: None,
             behind: false,
+            opening: 0,
             clicked_picture: None,
             find: None,
             find_first: false,
@@ -437,8 +522,58 @@ impl Thread {
         self.started = Some(Instant::now());
     }
 
+    /// The session's messages changed in a way that what is worked out from them
+    /// ([`Thread::todos`], [`Thread::total`]) may have too.
+    pub fn touch(&mut self) {
+        self.revision += 1;
+        self.listed += 1;
+    }
+
+    /// The engine said `event`, which the session has taken in. More words
+    /// change nothing that is worked out from it, and what a subagent does
+    /// is no part of the agent's own task list.
+    pub fn heard(&mut self, event: &AgentEvent) {
+        let words = |event: &AgentEvent| matches!(event, AgentEvent::Text(_) | AgentEvent::Thinking(_));
+        match event {
+            AgentEvent::Sub { event, .. } if words(event) => {}
+            AgentEvent::Sub { .. } => self.revision += 1,
+            event if words(event) => {}
+            _ => self.touch(),
+        }
+    }
+
+    /// The agent's task list ([`Session::todos`]): worked out when a tool
+    /// call of its own came or was answered, not at every frame.
+    pub fn todos(&self) -> Rc<Vec<Todo>> {
+        let stamp = (self.listed, self.session.entries.len());
+        let mut kept = self.todos.borrow_mut();
+        match kept.as_ref() {
+            Some((of, todos)) if *of == stamp => Rc::clone(todos),
+            _ => {
+                let todos = Rc::new(self.session.todos());
+                *kept = Some((stamp, Rc::clone(&todos)));
+                todos
+            }
+        }
+    }
+
+    /// What the session's replies used so far: summed when its messages
+    /// changed, not at every frame.
+    pub fn total(&self) -> Tally {
+        let stamp = (self.revision, self.session.entries.len());
+        match self.total.get() {
+            Some((of, total)) if of == stamp => total,
+            _ => {
+                let total = Tally::of(&self.session);
+                self.total.set(Some((stamp, total)));
+                total
+            }
+        }
+    }
+
     /// The turn is over; a problem no reply carries is shown on the last one.
     pub fn end_turn(&mut self, problem: Option<String>) {
+        self.touch();
         self.busy = false;
         self.asks.clear();
         self.status.clear();
@@ -475,6 +610,7 @@ impl Thread {
         if self.busy {
             return false;
         }
+        self.touch();
         for task in &lost {
             let text = if task.what.is_empty() {
                 "A background task was stopped with the agent's process".to_owned()
@@ -494,10 +630,11 @@ impl Thread {
 
     /// Entries moved (a summary was inserted): every layout is made again.
     pub fn invalidate(&mut self) {
+        self.touch();
         self.cache.clear();
-        self.changes.clear();
+        self.rows.clear();
         self.touched.clear();
-        self.heights.clear();
+        self.seen.clear();
         self.open.clear();
         self.selection = None;
         // What it found was in blocks that are others now.
@@ -519,7 +656,7 @@ impl Thread {
     /// The pictures it shows are found from the session's folder.
     fn markdown(&mut self, p: &Painter, key: (usize, usize), text: &str, width: f32, ink: u8) -> &mut Doc {
         let stale = self.cache.get(&key).is_none_or(|c| c.len != text.len() || !c.doc.fits(width, p.scale));
-        if stale && !self.wait(key, text) {
+        if stale {
             let previous = self.cache.remove(&key).map(|c| c.doc);
             let folder = self.session.folder();
             let doc = Doc::markdown_in(p.fonts, text, (width, p.scale), ink, &folder, previous);
@@ -528,49 +665,94 @@ impl Thread {
         &mut self.cache.entry(key).or_insert_with(|| Cached { doc: Doc::default(), len: 0 }).doc
     }
 
-    /// Whether block `key`, whose layout is only of another width or scale,
-    /// keeps it this frame: it is out of view and the frame's time for
-    /// laying out such blocks is spent. Resizing the window then costs what
-    /// is in view, not the whole conversation.
-    fn wait(&mut self, key: (usize, usize), text: &str) -> bool {
-        let spent = self.deadline.is_some_and(|deadline| Instant::now() >= deadline);
-        let laid_out = self.cache.get(&key).is_some_and(|c| c.len == text.len());
-        let wait = self.lazy && spent && laid_out;
-        self.behind |= wait;
-        wait
+    /// Whether this frame's time for measuring what is out of view is
+    /// spent: the rest keeps what is known of it and follows in the next
+    /// frames. Resizing the window, or opening a long conversation, then
+    /// costs what is in view, not the whole conversation.
+    fn spent(&self) -> bool {
+        self.deadline.is_some_and(|deadline| Instant::now() >= deadline)
     }
 
     /// The plain layout of block `key` in `style`.
     fn plain(&mut self, p: &Painter, key: (usize, usize), text: &str, style: Style, width: f32) -> &mut Doc {
         let scale = p.scale;
         let outdated = self.cache.get(&key).is_none_or(|c| c.len != text.len() || !c.doc.fits(width, scale));
-        if outdated && !self.wait(key, text) {
+        if outdated {
             let doc = Doc::plain(p.fonts, text, style, width, p.scale);
             self.cache.insert(key, Cached { doc, len: text.len() });
         }
         &mut self.cache.entry(key).or_insert_with(|| Cached { doc: Doc::default(), len: 0 }).doc
     }
 
-    /// How many lines the tool call `call` at `key` added to a file and
-    /// removed from it, when it is one that changes a file (`change.rs`).
-    /// Worked out once for each call.
-    fn changed(&mut self, key: (usize, usize), call: &ToolUse, input: &Value) -> Option<(u32, u32)> {
-        match self.changes.get(&key) {
-            Some((len, counts)) if *len == call.input.len() => *counts,
-            _ => {
-                let counts = change::of(&call.name, input).map(|change| (change.added, change.removed));
-                self.changes.insert(key, (call.input.len(), counts));
-                counts
-            }
+    /// What the row of the tool call `call` at `key` shows: its icon, what
+    /// it was called on, and how many lines it added to a file and removed
+    /// from it when it is one that changes a file (`change.rs`). Its input
+    /// is read once for that, not at every frame.
+    fn row(&mut self, key: (usize, usize), call: &ToolUse) -> &Row {
+        let known = self.rows.entry(key).or_default();
+        if known.of != Some(call.input.len()) {
+            let input = serde_json::from_str::<Value>(&call.input).unwrap_or(Value::Null);
+            *known = Row {
+                of: Some(call.input.len()),
+                icon: tool_icon(&call.name),
+                about: tools::summary(&input),
+                changed: change::of(&call.name, &input).map(|change| (change.added, change.removed)),
+            };
         }
+        known
+    }
+
+    /// The kind of the subagent `call` started and what it was started for.
+    fn brief(&self, call: &ToolUse) -> Rc<Brief> {
+        let mut briefs = self.briefs.borrow_mut();
+        if let Some(known) = briefs.get(&call.id).filter(|known| known.of == call.input.len()) {
+            return Rc::clone(known);
+        }
+        let (kind, description, _) = agent_brief(call);
+        let brief = Rc::new(Brief { of: call.input.len(), kind, description });
+        briefs.insert(call.id.clone(), Rc::clone(&brief));
+        brief
+    }
+
+    /// What went into the tool call `call` and what came out of it, laid
+    /// out for the detail of its row at `key`: its input (not of a call
+    /// that `edited` a file, whose lines say it), then the first of its
+    /// output.
+    fn detail(&mut self, p: &Painter, key: (usize, usize), call: &ToolUse, edited: bool, width: f32) -> &mut Doc {
+        let said = call.output.as_ref().map_or(0, |output| output.len() + 1);
+        let of = call.input.len().wrapping_mul(31).wrapping_add(said);
+        let scale = p.scale;
+        let outdated = self.cache.get(&key).is_none_or(|c| c.len != of || !c.doc.fits(width, scale));
+        if outdated {
+            let mut detail = if edited {
+                String::new()
+            } else {
+                let input = serde_json::from_str::<Value>(&call.input).unwrap_or(Value::Null);
+                serde_json::to_string_pretty(&input).unwrap_or_else(|_| call.input.clone())
+            };
+            if let Some(output) = &call.output {
+                let shown: String = output.chars().take(DETAIL_CHARS).collect();
+                if !detail.is_empty() {
+                    detail.push_str("\n\n");
+                }
+                detail.push_str(&shown);
+                if shown.len() < output.len() {
+                    detail.push_str("\n…");
+                }
+            }
+            let doc = Doc::plain(p.fonts, &detail, DETAIL, width, scale);
+            self.cache.insert(key, Cached { doc, len: of });
+        }
+        &mut self.cache.entry(key).or_insert_with(|| Cached { doc: Doc::default(), len: 0 }).doc
     }
 
     /// The lines `call` changed, laid out as a diff for the detail of its row at `key`.
-    fn diff(&mut self, p: &Painter, key: (usize, usize), call: &ToolUse, input: &Value, width: f32) -> &mut Doc {
+    fn diff(&mut self, p: &Painter, key: (usize, usize), call: &ToolUse, width: f32) -> &mut Doc {
         let scale = p.scale;
         let outdated = self.cache.get(&key).is_none_or(|c| c.len != call.input.len() || !c.doc.fits(width, scale));
-        if outdated && !self.wait(key, &call.input) {
-            let lines = change::of(&call.name, input).map(|change| change.lines).unwrap_or_default();
+        if outdated {
+            let input = serde_json::from_str::<Value>(&call.input).unwrap_or(Value::Null);
+            let lines = change::of(&call.name, &input).map(|change| change.lines).unwrap_or_default();
             let doc = Doc::diff(p.fonts, &lines, DETAIL, width, scale);
             self.cache.insert(key, Cached { doc, len: call.input.len() });
         }
@@ -605,6 +787,10 @@ impl Thread {
             self.order.push(key);
         }
         self.mark_found(p, key, origin);
+        // Measured out of sight: there is nothing to mark it by.
+        if p.clip().w <= 0.0 {
+            return;
+        }
         let Some(doc) = self.cache.get_mut(&key).map(|cached| &mut cached.doc) else { return };
         let at = (ui.mouse.0 - origin.0, ui.mouse.1 - origin.1);
         let over = Rect::new(origin.0, origin.1, size.0, size.1).contains(ui.mouse) && ui.hovered(p.clip());
@@ -671,9 +857,9 @@ impl Thread {
         if self.selection.is_some_and(|marked| moved(marked.from) || moved(marked.to)) {
             self.selection = None;
         }
-        let doing = |todo: atroxabot_core::Todo| if todo.doing.is_empty() { todo.subject } else { todo.doing };
-        let active = self.busy.then(|| self.session.todos().into_iter().find(|todo| todo.state == TodoState::Active));
-        self.doing = active.flatten().map(doing).unwrap_or_default();
+        let doing = |todo: &Todo| if todo.doing.is_empty() { todo.subject.clone() } else { todo.doing.clone() };
+        let active = self.busy.then(|| self.todos().iter().find(|todo| todo.state == TodoState::Active).map(doing));
+        self.doing = active.flatten().unwrap_or_default();
         // The bar of a search floats over the conversation: what is under it is not hovered or clicked.
         let bar = self.find.as_mut().map(|find| {
             find.begin();
@@ -686,7 +872,8 @@ impl Thread {
         // The entries are taken out while they are drawn: drawing needs the
         // layout cache, which lives beside them.
         let entries = std::mem::take(&mut self.session.entries);
-        let calls = turn_agents(&entries, self.sub.as_deref());
+        // Only an open subagent has its turn's calls looked up.
+        let calls = if self.sub.is_some() { turn_agents(&entries, self.sub.as_deref()) } else { Vec::new() };
         let open = self.sub.as_deref().and_then(|sub| calls.iter().find(|call| call.id == sub).copied());
         if let Some(call) = open {
             let body = self.draw_bar(p, ui, area, call);
@@ -726,8 +913,8 @@ impl Thread {
                 Entry::Note { .. } => false,
             };
             if let Some(index) = entries.iter().position(said) {
-                let above: f32 = self.heights.iter().take(index).filter(|height| height.is_finite()).sum();
-                let tall = self.heights.get(index).copied().filter(|height| height.is_finite()).unwrap_or(0.0);
+                let above: f32 = self.seen.iter().take(index).filter_map(|seen| seen.height).sum();
+                let tall = self.seen.get(index).and_then(|seen| seen.height).unwrap_or(0.0);
                 scroll.reveal(above, above + 56.0 + tall.min(area.h - 56.0), area.h);
                 moved = true;
             }
@@ -758,6 +945,32 @@ impl Thread {
         self.scroll.progress()
     }
 
+    /// How many tool calls' rows were worked out: those that came into view.
+    #[cfg(test)]
+    pub fn rows_read(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether the conversation is shown: it was opened, and measured enough to be drawn at its end.
+    #[cfg(test)]
+    pub fn shown(&self) -> bool {
+        self.loaded && !self.fresh
+    }
+
+    /// Whether every entry of the conversation was measured.
+    #[cfg(test)]
+    pub fn measured(&self) -> bool {
+        self.seen.len() == self.session.entries.len() && self.seen.iter().all(|seen| seen.height.is_some())
+    }
+
+    /// Where the entry `index` begins under the top of the conversation's view, by what is known
+    /// of the entries before it.
+    #[cfg(test)]
+    pub fn top_of(&self, index: usize) -> f32 {
+        let above: f32 = self.seen.iter().take(index).filter_map(|seen| seen.height).sum();
+        28.0 + above - self.scroll.position()
+    }
+
     /// How far down the open subagent's view is (`0..=1`), when it scrolls.
     #[cfg(test)]
     pub fn sub_progress(&self) -> Option<f32> {
@@ -770,7 +983,7 @@ impl Thread {
         let calls = turn_agents(&self.session.entries, self.sub.as_deref());
         let listed = |call: &ToolUse| Subagent {
             id: call.id.clone(),
-            label: agent_label(call),
+            label: self.brief(call).label().to_owned(),
             // One sent to the background goes on after the turn, for as long as its process does.
             running: (self.busy || self.live) && at_work(call),
             failed: call.is_error,
@@ -797,7 +1010,7 @@ impl Thread {
         p.text(&back, chip.x + 26.0, chip.y + (chip.h - back.height()) * 0.5, ink);
         let mark = (chip.right() + 19.0, chip.y + 14.0);
         agent_mark(p, ui, mark, (self.busy && at_work(call), call.is_error), t.text_muted);
-        let mut label = p.layout(&agent_label(call), theme::SMALL, None);
+        let mut label = p.layout(self.brief(call).label(), theme::SMALL, None);
         label.truncate(p.fonts, (x + width + 16.0 - mark.0 - 11.0).max(0.0));
         p.text(&label, mark.0 + 11.0, chip.y + (chip.h - label.height()) * 0.5, t.text);
         p.rect(Rect::new(area.x, strip.bottom() - 1.0, area.w, 1.0), t.border, 0.0);
@@ -914,27 +1127,54 @@ impl Thread {
             self.selecting = false;
         }
         let top = area.y + 28.0 - offset;
-        // The first frame only measures: the conversation appears at its end, not its start.
-        let hidden = self.fresh.then(|| p.push_clip(Rect::new(area.x, area.y, 0.0, 0.0)));
+        // A conversation just opened only measures until it can be shown at its end, not its start.
+        let nowhere = Rect::new(area.x, area.y, 0.0, 0.0);
+        let hidden = self.fresh.then(|| p.push_clip(nowhere));
         let mut y = top;
         let last = entries.len().saturating_sub(1);
         // Half a view above and below counts as in view: it is laid out at once.
         let (above, below) = (area.y - area.h * 0.5, area.bottom() + area.h * 0.5);
         (self.deadline, self.behind) = (Some(Instant::now() + RELAYOUT_BUDGET), false);
-        self.heights.resize(entries.len(), f32::NAN);
+        self.seen.resize_with(entries.len(), Seen::default);
+        let fits = (width.to_bits(), p.scale.to_bits());
+        // How much taller what was measured above the view turned out to be: the view goes down
+        // with it, so that what is looked at stays where it is.
+        let mut pushed = 0.0;
+        // Something in view was placed by a guess, or by a height that is no longer its own.
+        let mut guessed = false;
         for (index, entry) in entries.iter().enumerate() {
-            let known = self.heights[index];
-            // An entry not drawn before (NaN) is in view until it is measured.
-            self.lazy = y + known < above || y > below;
-            let start = y;
+            let live = self.busy && index == last;
+            let ends = !live && !matches!(entries.get(index + 1), Some(Entry::Reply(_)));
+            let weight = weight(entry, live, ends);
+            let seen = &self.seen[index];
+            let tall = seen.height.unwrap_or_else(|| guess(entry));
+            let current = seen.height.is_some() && seen.fits == fits && seen.weight == weight;
+            // What is out of view is its height and nothing more: once it is measured, or while this
+            // frame has no time left to measure it. The newest entry is the one that changes, and
+            // a search goes through every block.
+            let out = y + tall < above || y > below;
+            if out && index != last && self.find.is_none() && (current || self.spent()) {
+                self.behind |= !current;
+                let marks = &seen.marks;
+                if self.order.get(self.drawn..self.drawn + marks.len()) != Some(marks.as_slice()) {
+                    self.order.truncate(self.drawn);
+                    self.order.extend_from_slice(marks);
+                }
+                self.drawn += marks.len();
+                y += tall;
+                continue;
+            }
+            // Measured out of sight above the view, it is not drawn: only how tall it is matters.
+            let unseen = !current && y + tall <= area.y;
+            guessed |= !current && !unseen;
+            let clip = unseen.then(|| p.push_clip(nowhere));
+            let (start, first) = (y, self.drawn);
             match entry {
                 Entry::User { text, files, .. } => {
                     y = self.draw_prompt(p, ui, ((index, 0), text, files), (x, y, width));
                 }
                 Entry::Reply(reply) => {
-                    let live = self.busy && index == last;
                     // Under the last reply of a run that is over: the files the run changed.
-                    let ends = !live && !matches!(entries.get(index + 1), Some(Entry::Reply(_)));
                     let touched = if ends { self.take_touched(index, entries) } else { None };
                     let files = touched.as_ref().map_or(&[][..], |(_, files)| files.as_slice());
                     y = self.draw_reply(p, ui, (index, reply, live), (x, y, width), (agent, files), actions);
@@ -947,10 +1187,26 @@ impl Thread {
                 }
                 Entry::Note { text } => y = divider(p, text, (x, y, width)),
             }
-            self.heights[index] = y - start;
+            if let Some(clip) = clip {
+                p.set_clip(clip);
+            }
+            let height = y - start;
+            if unseen {
+                // It keeps its foot where it was: what is under it does not move.
+                pushed += height - tall;
+                y = start + tall;
+            }
+            let seen = &mut self.seen[index];
+            (seen.height, seen.fits, seen.weight) = (Some(height), fits, weight);
+            let marks = self.order.get(first..self.drawn).unwrap_or_default();
+            if seen.marks != marks {
+                seen.marks.clear();
+                seen.marks.extend_from_slice(marks);
+            }
         }
-        (self.lazy, self.deadline) = (false, None);
-        if std::mem::take(&mut self.behind) {
+        self.deadline = None;
+        let behind = std::mem::take(&mut self.behind);
+        if behind {
             ui.animating = true;
         }
         // A turn that has not written anything yet still shows it is alive.
@@ -961,7 +1217,8 @@ impl Thread {
         if let Some(clip) = hidden {
             p.set_clip(clip);
         }
-        let content = y - top + 28.0 + 24.0;
+        let content = y - top + pushed + 28.0 + 24.0;
+        self.scroll.shift(pushed);
         self.scroll.finish(ui, content, area.h);
         if hovered && ui.scroll > 0.0 && self.scroll.at_end() {
             self.follow = true;
@@ -970,9 +1227,13 @@ impl Thread {
             // Dragged to the end, it follows the newest message again; anywhere else, it stays.
             self.follow = self.scroll.at_end();
         }
-        let opened = std::mem::take(&mut self.fresh);
+        let opened = self.fresh;
         if opened {
             self.scroll.jump_to_end();
+            // It is shown with the next frame once all of it is measured, or once a frame placed
+            // what is in view by nothing but heights that were measured before.
+            self.opening = self.opening.saturating_add(1);
+            self.fresh = behind && guessed && self.opening < 12;
             ui.animating = true;
         } else if self.follow && !self.scroll.at_end() {
             // What was just written is brought into view.
@@ -1266,9 +1527,14 @@ impl Thread {
         color: Color,
     ) -> f32 {
         let t = p.theme;
-        let (kind, description, _) = agent_brief(call);
         let card = Rect::new(x - 8.0, y - 1.0, width + 16.0, 52.0);
-        let hovered = ui.hovered(card);
+        // Out of sight, a card is its height and nothing more.
+        let view = p.clip();
+        if card.bottom() < view.y || card.y > view.bottom() || view.w <= 0.0 {
+            return card.bottom() + 11.0;
+        }
+        let brief = self.brief(call);
+        let hovered = ui.hovered(card) && view.contains(ui.mouse);
         let hover = ui.anim(id(("agent-call", key)), f32::from(u8::from(hovered)));
         p.bordered(
             card,
@@ -1278,8 +1544,8 @@ impl Thread {
             mix(t.border, t.border_strong, hover),
         );
         icon::draw(p, icon::BOT, (card.x + 23.0, card.y + 26.0), 16.0, mix(t.text_muted, t.text, hover));
-        let name_w = p.label(&kind, theme::LABEL, card.x + 44.0, card.y + 9.0, t.text);
-        let mut about = p.layout(&description, theme::SMALL, None);
+        let name_w = p.label(&brief.kind, theme::LABEL, card.x + 44.0, card.y + 9.0, t.text);
+        let mut about = p.layout(&brief.description, theme::SMALL, None);
         about.truncate(p.fonts, (card.w - name_w - 104.0).max(0.0));
         p.text(&about, card.x + 44.0 + name_w + 10.0, card.y + 9.0, t.text_muted);
         let running = live && at_work(call);
@@ -1320,19 +1586,18 @@ impl Thread {
         actions: &mut Vec<Action>,
     ) -> f32 {
         let t = p.theme;
-        let said: String = reply
-            .blocks
-            .iter()
-            .filter_map(|block| if let Block::Text { text } = block { Some(text.as_str()) } else { None })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        if said.trim().is_empty() {
+        if reply.blocks.iter().filter_map(words).all(|text| text.trim().is_empty()) {
             return y;
         }
         let row = Rect::new(x - 6.0, y - 4.0, width + 12.0, 26.0);
+        // Out of sight, it is its height and nothing more.
+        let view = p.clip();
+        if row.bottom() < view.y || row.y > view.bottom() || view.w <= 0.0 {
+            return y + 24.0;
+        }
         let near = ui.anim(id(("reply-footer", index)), f32::from(u8::from(ui.hovered(row))));
         let copy = Rect::new(x - 5.0, y - 3.0, 24.0, 24.0);
-        let over = ui.hovered(copy);
+        let over = ui.hovered(copy) && view.contains(ui.mouse);
         icon::draw(
             p,
             icon::COPY,
@@ -1343,7 +1608,8 @@ impl Thread {
         if over {
             ui.cursor = CursorIcon::Pointer;
             if ui.clicked(copy) {
-                actions.push(Action::Copy(said));
+                // What it said is put together when it is asked for, not at every frame.
+                actions.push(Action::Copy(reply.blocks.iter().filter_map(words).collect::<Vec<_>>().join("\n\n")));
             }
         }
         let tokens = reply.usage.input_tokens.saturating_add(reply.usage.output_tokens);
@@ -1376,7 +1642,7 @@ impl Thread {
         let t = p.theme;
         let open = self.open.contains(&key);
         let row = Rect::new(x - 6.0, y - 2.0, 150.0, 26.0);
-        let hovered = ui.hovered(row);
+        let hovered = ui.hovered(row) && p.clip().contains(ui.mouse);
         let hover = ui.anim(id(("thinking", key)), f32::from(u8::from(hovered)));
         // Its turn is running meanwhile, which draws the next frame.
         let color = if writing {
@@ -1426,14 +1692,21 @@ impl Thread {
         let t = p.theme;
         let open = self.open.contains(&key);
         let row = Rect::new(x - 8.0, y - 3.0, width + 16.0, 28.0);
-        let hovered = ui.hovered(row);
+        // A closed row out of sight is its height and nothing more.
+        let view = p.clip();
+        if !open && (row.bottom() < view.y || row.y > view.bottom() || view.w <= 0.0) {
+            return y + 28.0;
+        }
+        let hovered = ui.hovered(row) && view.contains(ui.mouse);
         let hover = ui.anim(id(("tool", key)), f32::from(u8::from(hovered || open)));
         p.rect(row, fade(t.hover, hover * 0.8), theme::RADIUS_SM);
         let mid = y + 11.0;
-        icon::draw(p, tool_icon(&call.name), (x + 7.0, mid), 14.0, mix(t.text_faint, t.text_muted, hover));
+        let (glyph, changed, mut about) = {
+            let known = self.row(key, call);
+            (known.icon, known.changed, p.layout(&known.about, Style::mono(12.5), None))
+        };
+        icon::draw(p, glyph, (x + 7.0, mid), 14.0, mix(t.text_faint, t.text_muted, hover));
         let name_w = p.label(&call.name, theme::LABEL, x + 22.0, y + 2.0, mix(t.text_muted, t.text, hover));
-        let input = serde_json::from_str::<Value>(&call.input).unwrap_or(Value::Null);
-        let changed = self.changed(key, call, &input);
         // What it added and removed, before the mark of how it went: one that failed changed nothing.
         let counted = changed.filter(|_| !call.is_error).map_or(0.0, |lines| {
             let right = x + width - 24.0;
@@ -1442,7 +1715,6 @@ impl Thread {
         // One the user said no to never ran: it says so, where a failure would show its warning.
         let refused = call.denied.then(|| p.layout("Not run", theme::TINY, None));
         let refused_w = refused.as_ref().map_or(0.0, |note| note.width() + 10.0);
-        let mut about = p.layout(&tools::summary(&input), Style::mono(12.5), None);
         about.truncate(p.fonts, (width - name_w - 76.0 - counted - refused_w).max(0.0));
         p.text(&about, x + 22.0 + name_w + 10.0, y + 3.0, t.text_faint);
         // How it went, at the row's right.
@@ -1466,38 +1738,26 @@ impl Thread {
         y += 28.0;
         if open && changed.is_some() {
             let lines = (key.0, usize::MAX / 2 - key.1);
-            let height = self.diff(p, lines, call, &input, width - 46.0).height;
+            let height = self.diff(p, lines, call, width - 46.0).height;
             let frame = Rect::new(x + 22.0, y + 2.0, width - 22.0, height + 20.0);
             p.bordered(frame, t.code_bg, theme::RADIUS_SM, 1.0, t.border);
             self.mark_found(p, lines, (frame.x + 12.0, frame.y + 10.0));
-            let doc = self.diff(p, lines, call, &input, width - 46.0);
+            let doc = self.diff(p, lines, call, width - 46.0);
             doc.draw(p, ui, (frame.x + 12.0, frame.y + 10.0), t.text_muted, false, None);
             y = frame.bottom() + if call.is_error { 6.0 } else { 10.0 };
         }
         // The lines say what an edit did: of its answer, only why it failed is worth reading.
         if open && (changed.is_none() || call.is_error) {
-            let mut detail = match changed {
-                Some(_) => String::new(),
-                None => serde_json::to_string_pretty(&input).unwrap_or_else(|_| call.input.clone()),
-            };
-            if let Some(output) = &call.output {
-                let shown: String = output.chars().take(DETAIL_CHARS).collect();
-                if !detail.is_empty() {
-                    detail.push_str("\n\n");
-                }
-                detail.push_str(&shown);
-                if shown.len() < output.len() {
-                    detail.push_str("\n…");
-                }
-            }
-            if !detail.is_empty() {
+            // An edit that said nothing has nothing to show here.
+            let nothing = changed.is_some() && call.output.as_deref().is_none_or(str::is_empty);
+            if !nothing {
                 let said = (key.0, usize::MAX - key.1);
-                let height = self.plain(p, said, &detail, DETAIL, width - 46.0).height;
+                let height = self.detail(p, said, call, changed.is_some(), width - 46.0).height;
                 let frame = Rect::new(x + 22.0, y + 2.0, width - 22.0, height + 20.0);
                 p.bordered(frame, t.code_bg, theme::RADIUS_SM, 1.0, t.border);
                 let ink = if call.is_error { mix(t.text_muted, t.danger, 0.5) } else { t.text_muted };
                 self.mark_found(p, said, (frame.x + 12.0, frame.y + 10.0));
-                let doc = self.plain(p, said, &detail, DETAIL, width - 46.0);
+                let doc = self.detail(p, said, call, changed.is_some(), width - 46.0);
                 doc.draw(p, ui, (frame.x + 12.0, frame.y + 10.0), ink, false, None);
                 y = frame.bottom() + 10.0;
             }

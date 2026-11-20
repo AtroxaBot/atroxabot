@@ -62,7 +62,11 @@ fn vs_main(@builtin(vertex_index) vertex: u32, inst: Instance) -> VertexOut {
         size = round(size);
         pad = inst.params.z * s + 1.0;
     }
-    let p = origin - pad + corner * (size + 2.0 * pad);
+    // Nothing of a quad shows outside its clip (the fragment shader discards there): it is cut to
+    // the clip here, half a pixel wide of it, so that no fragment is shaded for nothing.
+    let clip = inst.clip * s;
+    let low = clip.xy - 0.5;
+    let p = clamp(origin - pad + corner * (size + 2.0 * pad), low, max(low, clip.zw + 0.5));
 
     var out: VertexOut;
     out.position = vec4<f32>(p / globals.viewport * vec2<f32>(2.0, -2.0) + vec2<f32>(-1.0, 1.0), 0.0, 1.0);
@@ -74,7 +78,7 @@ fn vs_main(@builtin(vertex_index) vertex: u32, inst: Instance) -> VertexOut {
     out.color = inst.color;
     out.color2 = inst.color2;
     out.params = vec4<f32>(inst.params.xyz * s, kind);
-    out.clip = inst.clip * s;
+    out.clip = clip;
     return out;
 }
 
