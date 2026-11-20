@@ -508,6 +508,10 @@ fn one(shape: Shape, gpu: &mut Option<Offscreen>) {
         rig.frame(&mut shell, 1.0);
     }
     run("idle, 300 sessions in the sidebar", &mut rig, &mut shell, 300, NOTHING);
+    // Left alone long enough, it gives its messages back (`warm.rs`).
+    let held = live_mb();
+    drop(shell.threads.remove(&id));
+    println!("  let go of, it gives back {:.1} MB", held - live_mb());
 }
 
 #[test]

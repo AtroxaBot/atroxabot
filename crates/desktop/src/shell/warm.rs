@@ -13,6 +13,13 @@
 //! conversation under the system prompt it began with
 //! (`Session::account_prompt`), so the provider's cache still serves it.
 
+//!
+//! The messages of a session outlive its process, but not for good: an
+//! opened session holds everything its agent and its subagents read and
+//! wrote, tens of megabytes for a long one. One that is not looked at, has
+//! no process and nothing waiting gives them back after [`HOLD`]; the
+//! sidebar keeps listing it, and opening it reads them again.
+
 use super::Shell;
 use crate::app::Action;
 
@@ -20,6 +27,8 @@ use crate::app::Action;
 const KEEP: u64 = 15 * 60;
 /// How many such processes are kept at most.
 const MOST: usize = 3;
+/// How long the messages of a session that is not looked at and has nothing to do stay in memory, in seconds.
+const HOLD: u64 = 30 * 60;
 
 impl Shell {
     /// Closes the processes that waited long enough at `now` (Unix seconds),
@@ -44,6 +53,43 @@ impl Shell {
             }
             actions.push(Action::CloseLive(session));
         }
+    }
+
+    /// Lets go of the messages of the sessions that had nothing to do for [`HOLD`] at `now` (Unix
+    /// seconds). What they hold is written first, whatever of it already was, and the writer lets
+    /// go of it too. Call it on every frame and timer.
+    pub(super) fn unload(&mut self, now: u64, actions: &mut Vec<Action>) {
+        let due = |(since, _): &(u64, String)| since.saturating_add(HOLD) <= now;
+        for (_, session) in self.idle().into_iter().filter(due) {
+            if let Some(thread) = self.threads.remove(&session) {
+                actions.push(Action::SaveSession(Box::new(thread.session)));
+                actions.push(Action::ForgetSession(session));
+            }
+        }
+    }
+
+    /// When the next of them has had nothing to do for long enough, in Unix seconds: the app wakes for it.
+    pub(super) fn next_unload(&self) -> Option<u64> {
+        self.idle().into_iter().map(|(since, _)| since.saturating_add(HOLD)).min()
+    }
+
+    /// The sessions whose messages are in memory for nobody: not the open one or the one on a call,
+    /// no process up, nothing at work, nothing asked and nothing waiting to be sent or to go on. Each
+    /// with since when: it was left, or changed last after that.
+    fn idle(&self) -> Vec<(u64, String)> {
+        let open = self.current.as_deref();
+        let called = self.call.as_ref().map(|call| call.session.as_str());
+        let idle = |(id, thread): &(&String, &super::thread::Thread)| {
+            let wanted = open == Some(id.as_str()) || called == Some(id.as_str());
+            let waiting = !thread.asks.is_empty()
+                || thread.queued.is_some()
+                || !thread.follow_ups.is_empty()
+                || thread.resume.is_some();
+            thread.loaded && !wanted && !thread.live && !thread.at_work() && !waiting
+        };
+        let since =
+            |(id, thread): (&String, &super::thread::Thread)| (thread.left.max(thread.session.updated), id.clone());
+        self.threads.iter().filter(idle).map(since).collect()
     }
 
     /// When the next of them has waited long enough, in Unix seconds: the app wakes for it.
@@ -99,6 +145,72 @@ mod tests {
             actions.iter().filter_map(|a| if let Action::CloseLive(s) = a { Some(s.clone()) } else { None }).collect();
         closed.sort();
         closed
+    }
+
+    fn unloaded(actions: &[Action]) -> Vec<String> {
+        actions.iter().filter_map(|a| if let Action::ForgetSession(s) = a { Some(s.clone()) } else { None }).collect()
+    }
+
+    #[test]
+    fn a_session_nobody_looks_at_gives_its_messages_back() {
+        let (mut shell, sessions, mut actions) = answered(2);
+        let (first, second) = (&sessions[0], &sessions[1]);
+        shell.rest(1_000, &mut actions);
+        shell.open_session(first, &mut actions);
+        shell.rest(1_010, &mut actions);
+        // While its process is up it is not let go of, however long that is.
+        shell.unload(1_010 + HOLD, &mut actions);
+        assert!(unloaded(&actions).is_empty() && shell.next_unload().is_none());
+        shell.rest(1_010 + KEEP, &mut actions);
+        assert_eq!(closed(&actions), std::slice::from_ref(second));
+        actions.clear();
+        // From then on it waits, and the app wakes when it has waited long enough.
+        assert_eq!(shell.next_unload(), Some(1_010 + HOLD));
+        shell.unload(1_010 + HOLD - 1, &mut actions);
+        assert!(actions.is_empty() && shell.threads.contains_key(second));
+        shell.unload(1_010 + HOLD, &mut actions);
+        assert!(!shell.threads.contains_key(second), "its messages are let go of");
+        let written = matches!(
+            actions.as_slice(),
+            [Action::SaveSession(saved), Action::ForgetSession(gone)] if saved.id == *second && gone == second
+        );
+        assert!(written, "written first, then forgotten by the writer too");
+        assert!(shell.sessions.iter().any(|known| known.id == *second), "the sidebar still lists it");
+        // The open one is never let go of.
+        actions.clear();
+        shell.unload(u64::MAX / 2, &mut actions);
+        assert!(actions.is_empty() && shell.threads.contains_key(first) && shell.next_unload().is_none());
+        // Opening it again reads its messages again.
+        shell.open_session(second, &mut actions);
+        assert!(matches!(actions.first(), Some(Action::LoadSession(id)) if id == second));
+        assert!(shell.threads.get(second).is_some_and(|thread| !thread.loaded));
+    }
+
+    #[test]
+    fn a_session_with_something_waiting_keeps_its_messages() {
+        let (mut shell, sessions, mut actions) = answered(3);
+        shell.rest(1_000, &mut actions);
+        shell.open_session(&sessions[0], &mut actions);
+        shell.rest(1_010, &mut actions);
+        shell.rest(1_010 + KEEP, &mut actions);
+        // One has a message to send once it can; the other runs something in the background.
+        let waits = shell.threads.get_mut(&sessions[1]).expect("loaded");
+        (waits.live, waits.queued) = (false, Some(("Later".into(), false, Vec::new())));
+        let works = shell.threads.get_mut(&sessions[2]).expect("loaded");
+        works.live = false;
+        works.background_task("b1".into(), "cargo test".into(), false);
+        actions.clear();
+        shell.unload(u64::MAX / 2, &mut actions);
+        assert!(unloaded(&actions).is_empty() && shell.threads.len() == 3, "{:?}", unloaded(&actions));
+        // Both done, both go.
+        shell.threads.get_mut(&sessions[1]).expect("loaded").queued = None;
+        shell.threads.get_mut(&sessions[2]).expect("loaded").background_task("b1".into(), String::new(), true);
+        shell.unload(u64::MAX / 2, &mut actions);
+        let mut gone = unloaded(&actions);
+        gone.sort();
+        let mut expected = vec![sessions[1].clone(), sessions[2].clone()];
+        expected.sort();
+        assert_eq!(gone, expected);
     }
 
     #[test]

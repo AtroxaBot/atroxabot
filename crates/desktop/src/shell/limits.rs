@@ -395,6 +395,7 @@ impl Shell {
     pub fn tick(&mut self, actions: &mut Vec<Action>) {
         let now = unix_now();
         self.rest(now, actions);
+        self.unload(now, actions);
         let mut due: Vec<String> = (self.threads.iter())
             .filter(|(_, thread)| thread.resume.as_ref().is_some_and(|resume| resume.at <= now))
             .map(|(id, _)| id.clone())
@@ -444,7 +445,7 @@ impl Shell {
     /// out. The app wakes for it.
     pub fn next_wake(&self) -> Option<u64> {
         let resumes = self.threads.values().filter_map(|thread| thread.resume.as_ref().map(|resume| resume.at));
-        resumes.chain(self.next_rest()).chain(self.cache_turns()).min()
+        resumes.chain(self.next_rest()).chain(self.next_unload()).chain(self.cache_turns()).min()
     }
 
     /// The open session's row in the tray above the message box while it
