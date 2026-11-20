@@ -45,7 +45,7 @@ use crate::claude::TerminalCommand;
 use crate::config::{Config, Connection, McpServer, write_private};
 use crate::engine::{AgentEvent, Ask, FollowUp, Verdict};
 use crate::responses::Usage;
-use crate::session::{Session, ToolUse};
+use crate::session::{Session, Spent, ToolUse};
 
 /// How long Antigravity gets to say what it offers: it unpacks itself first, and each model is asked in turn.
 const INFO_TIMEOUT: Duration = Duration::from_secs(150);
@@ -837,6 +837,17 @@ impl Mapper {
             out.extend(over.map(|id| AgentEvent::Background { id, what: String::new(), ended: true }));
         }
         let spent = usage.unwrap_or_default();
+        // What Antigravity counted for the turn's prompts is what the turn used.
+        let turn = Usage {
+            input_tokens: spent.input,
+            output_tokens: spent.output,
+            cached_tokens: spent.cached_input,
+            cache_write_tokens: spent.cache_write_input,
+        };
+        if !turn.is_empty() {
+            let turn = vec![Spent { model: self.model.clone(), usage: turn, cost: 0.0 }];
+            out.push(AgentEvent::Spent { turn, total: Vec::new() });
+        }
         let (held, size) = self.context;
         // What the context holds is what the next request reads: the turn's own count where it says none.
         let usage = Usage {
@@ -1207,10 +1218,14 @@ mod tests {
 
         mapper.map(sdk::Event::Context { used: 12_000, size: 1_000_000 });
         let ended = mapper.map(completed(sdk::TurnStatus::Completed, "end_turn", None));
-        let AgentEvent::ReplyEnded { usage, model, problem, .. } = &ended[0] else { panic!("the reply ends") };
+        // What the turn used is what Antigravity counted for it; how full the context is, is said apart.
+        let used = Usage { input_tokens: 900, output_tokens: 40, cached_tokens: 700, cache_write_tokens: 0 };
+        let turn = vec![Spent { model: "gemini-3-pro".into(), usage: used, cost: 0.0 }];
+        assert_eq!(ended[0], AgentEvent::Spent { turn, total: Vec::new() });
+        let AgentEvent::ReplyEnded { usage, model, problem, .. } = &ended[1] else { panic!("the reply ends") };
         assert_eq!((usage.input_tokens, usage.cached_tokens, usage.output_tokens), (12_000, 700, 40));
         assert!(model == "gemini-3-pro" && problem.is_empty());
-        assert_eq!(ended[1], AgentEvent::Window(1_000_000));
+        assert_eq!(ended[2], AgentEvent::Window(1_000_000));
         assert_eq!(ended.last(), Some(&AgentEvent::TurnEnded { problem: None }));
         // The next turn starts a new reply; being stopped is no failure.
         assert_eq!(mapper.map(sdk::Event::TurnStarted)[1], AgentEvent::ReplyStarted);

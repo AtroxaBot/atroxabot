@@ -23,7 +23,7 @@ use crate::claude::TerminalCommand;
 use crate::config::{Connection, McpServer};
 use crate::engine::{AgentEvent, Ask, FollowUp, LimitWindow, Limits, Verdict};
 use crate::responses::Usage;
-use crate::session::{Session, ToolUse};
+use crate::session::{Session, Spent, ToolUse};
 
 /// How long Codex gets to say what it offers.
 const INFO_TIMEOUT: Duration = Duration::from_secs(40);
@@ -408,6 +408,8 @@ struct Mapper {
     total: sdk::TokenUsage,
     /// The thread's output tokens when the turn began: the turn's are what was added since.
     output_before: u64,
+    /// What the turn's requests used so far, each added as Codex says it.
+    spent: Usage,
     /// The model's context window, as last said.
     window: u64,
     /// The messages and reasoning that streamed, which their complete item then repeats.
@@ -681,6 +683,11 @@ impl Mapper {
             cached_tokens: self.last.cached_input,
             cache_write_tokens: self.last.cache_write_input,
         };
+        let turn = std::mem::take(&mut self.spent);
+        if !turn.is_empty() {
+            let turn = vec![Spent { model: self.model.clone(), usage: turn, cost: 0.0 }];
+            out.push(AgentEvent::Spent { turn, total: Vec::new() });
+        }
         out.push(AgentEvent::ReplyEnded {
             wire: crate::Wire::Messages,
             raw: Vec::new(),
@@ -723,6 +730,7 @@ impl Mapper {
             }
             sdk::Event::TurnStarted { .. } => {
                 self.output_before = self.total.output;
+                self.spent = Usage::default();
                 out.push(AgentEvent::Working);
                 self.begin(&mut out);
             }
@@ -774,6 +782,16 @@ impl Mapper {
                 out.push(AgentEvent::ToolResult { id, output: "The plan was updated.".to_owned(), is_error: false });
             }
             sdk::Event::TokenUsage { last, total, context_window } => {
+                // Every request of a turn says its own tokens, and the turn used them all. Said again
+                // with the thread's count unchanged, it is no other request.
+                if self.replying && total != self.total {
+                    self.spent = self.spent.plus(Usage {
+                        input_tokens: last.input,
+                        output_tokens: last.output,
+                        cached_tokens: last.cached_input,
+                        cache_write_tokens: last.cache_write_input,
+                    });
+                }
                 (self.last, self.total) = (last, total);
                 self.window = context_window.unwrap_or(self.window);
             }
@@ -971,16 +989,28 @@ mod tests {
             [AgentEvent::Text("\n\n".into()), AgentEvent::Text("Done.".into())]
         );
 
-        mapper.map(sdk::Event::TokenUsage {
-            last: tokens(1_200, 1_000, 40),
-            total: tokens(5_000, 4_000, 90),
+        // Two requests, the second said twice: the turn used both, each once.
+        let earlier = sdk::Event::TokenUsage {
+            last: tokens(1_000, 0, 50),
+            total: tokens(3_800, 3_000, 50),
             context_window: Some(400_000),
-        });
+        };
+        mapper.map(earlier);
+        for _ in 0..2 {
+            mapper.map(sdk::Event::TokenUsage {
+                last: tokens(1_200, 1_000, 40),
+                total: tokens(5_000, 4_000, 90),
+                context_window: Some(400_000),
+            });
+        }
         let ended = mapper.map(completed(sdk::TurnStatus::Completed, None));
-        let AgentEvent::ReplyEnded { usage, model, problem, cost, .. } = &ended[0] else { panic!("the reply ends") };
+        let AgentEvent::Spent { turn, total } = &ended[0] else { panic!("what the turn used") };
+        let used = Usage { input_tokens: 2_200, output_tokens: 90, cached_tokens: 1_000, cache_write_tokens: 0 };
+        assert_eq!((&turn[..], total.len()), (&[Spent { model: "gpt-6.1-sol".into(), usage: used, cost: 0.0 }][..], 0));
+        let AgentEvent::ReplyEnded { usage, model, problem, cost, .. } = &ended[1] else { panic!("the reply ends") };
         assert_eq!((usage.input_tokens, usage.cached_tokens, usage.output_tokens), (1_200, 1_000, 90));
         assert!(model == "gpt-6.1-sol" && problem.is_empty() && *cost == 0.0);
-        assert_eq!(ended[1], AgentEvent::Window(400_000));
+        assert_eq!(ended[2], AgentEvent::Window(400_000));
         assert_eq!(ended.last(), Some(&AgentEvent::TurnEnded { problem: None }));
         // The next turn starts a new reply, and counts only its own output.
         assert_eq!(mapper.map(sdk::Event::TurnStarted { turn_id: "t2".into() })[1], AgentEvent::ReplyStarted);
@@ -990,7 +1020,13 @@ mod tests {
             context_window: None,
         });
         let ended = mapper.map(completed(sdk::TurnStatus::Interrupted, Some("interrupted")));
-        assert!(matches!(&ended[0], AgentEvent::ReplyEnded { usage, .. } if usage.output_tokens == 10));
+        assert!(matches!(&ended[0], AgentEvent::Spent { turn, .. } if turn[0].usage == Usage {
+            input_tokens: 1_300,
+            output_tokens: 10,
+            cached_tokens: 1_200,
+            cache_write_tokens: 0
+        }));
+        assert!(matches!(&ended[1], AgentEvent::ReplyEnded { usage, .. } if usage.output_tokens == 10));
         assert_eq!(ended.last(), Some(&AgentEvent::TurnEnded { problem: None }), "being stopped is no failure");
     }
 

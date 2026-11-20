@@ -206,6 +206,12 @@ pub struct Session {
     /// refused one): a `read` of one shows it no more.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub blind: bool,
+    /// What its engine had counted for it in all, by model, when a turn last ended
+    /// ([`crate::AgentEvent::Spent`]): Claude Code's running totals, which it keeps with the
+    /// conversation and takes up again when that is resumed. What the next turn used is what is
+    /// counted beyond them. Empty for the engines that keep no such count, and until one is said.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub metered: Vec<Spent>,
     /// The git worktree of its own it works in, when it asked for one:
     /// [`Session::workdir`] is a folder in it once it is made. See [`crate::worktree`].
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -304,8 +310,14 @@ pub struct Reply {
     pub wire: Wire,
     /// The model that wrote it.
     pub model: String,
-    /// What it used.
+    /// What it used. For an account's engine, whose reply is a whole turn, this is the turn's last
+    /// request alone: how full the context is ([`Session::context_tokens`]), not what the turn used.
     pub usage: Usage,
+    /// What every request of its turn used, by model: each step of it, and those of its subagents
+    /// ([`crate::AgentEvent::Spent`]). Empty where `usage` says it all: a reply of an API engine, which
+    /// is one request, and one saved before this was kept.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub spent: Vec<Spent>,
     /// Its cost in USD, when the engine reports or can price it.
     pub cost: f64,
     /// Why it ended badly (an error, a refusal, cut off); empty when it finished.
@@ -313,6 +325,36 @@ pub struct Reply {
     pub problem: String,
     /// When it ended, in Unix seconds; 0 for a reply saved before replies were dated.
     pub at: u64,
+}
+
+impl Reply {
+    /// What its turn used in all: every request made for it where the engine counts them
+    /// ([`Reply::spent`]), else what the reply says of itself ([`Reply::usage`]).
+    #[must_use]
+    pub fn used(&self) -> Usage {
+        if self.spent.is_empty() {
+            return self.usage;
+        }
+        self.spent.iter().fold(Usage::default(), |sum, spent| sum.plus(spent.usage))
+    }
+}
+
+/// What one model used: for a turn ([`Reply::spent`]), or for a session so far ([`Session::metered`]).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Spent {
+    /// The model's id.
+    pub model: String,
+    /// The tokens of its requests, added up.
+    pub usage: Usage,
+    /// What they cost in USD, when the engine says.
+    #[serde(skip_serializing_if = "is_nothing")]
+    pub cost: f64,
+}
+
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde's skip_serializing_if passes a reference")]
+fn is_nothing(cost: &f64) -> bool {
+    *cost == 0.0
 }
 
 /// One piece of a reply.
@@ -631,10 +673,11 @@ impl Session {
         self.replies().map(|r| r.cost).sum()
     }
 
-    /// Total tokens in and out of every reply.
+    /// The tokens in and out of every request made for it ([`Reply::used`]).
     #[must_use]
     pub fn tokens(&self) -> u64 {
-        self.replies().map(|r| r.usage.input_tokens.saturating_add(r.usage.output_tokens)).fold(0, u64::saturating_add)
+        let used = self.replies().map(Reply::used);
+        used.map(|used| used.input_tokens.saturating_add(used.output_tokens)).fold(0, u64::saturating_add)
     }
 
     /// The prompt and output tokens of the latest reply: how full the context is.
@@ -1423,6 +1466,31 @@ mod tests {
         assert_eq!(session.cached_until, 0);
         // Left out of the file while it is not known.
         assert!(!serde_json::to_string(&session).unwrap().contains("cached_until"));
+    }
+
+    #[test]
+    fn a_turn_keeps_what_its_requests_used_and_the_session_what_was_counted() {
+        let spent = |input, cost| Spent { model: "opus".into(), usage: Usage::new(input, 10), cost };
+        let mut session = Session::new("scout");
+        session.entries.push(Entry::User { text: "go".into(), note: String::new(), files: Vec::new() });
+        // Saved without either while no engine says them: an older file reads the same.
+        let plain = serde_json::to_string(&session).unwrap();
+        assert!(!plain.contains("spent") && !plain.contains("metered"));
+        session.apply(&crate::AgentEvent::ReplyStarted);
+        session.apply(&crate::AgentEvent::Spent { turn: vec![spent(8_000, 0.5)], total: vec![spent(90_000, 4.0)] });
+        session.apply(&ended());
+        let Some(Entry::Reply(reply)) = session.entries.last() else { panic!("a reply") };
+        // The reply says how full the context is; its turn used every request made for it.
+        assert_eq!((reply.usage, reply.used()), (Usage::new(100, 20), Usage::new(8_000, 10)));
+        assert_eq!((session.context_tokens(), session.tokens()), (120, 8_010));
+        assert_eq!(session.metered, [spent(90_000, 4.0)]);
+        // An engine that keeps no count of the session leaves the one there is.
+        session.apply(&crate::AgentEvent::ReplyStarted);
+        session.apply(&crate::AgentEvent::Spent { turn: vec![spent(500, 0.0)], total: Vec::new() });
+        session.apply(&ended());
+        assert_eq!((session.metered.len(), session.tokens()), (1, 8_520));
+        let read: Session = serde_json::from_str(&serde_json::to_string(&session).unwrap()).unwrap();
+        assert_eq!((&read.metered, &read.entries), (&session.metered, &session.entries));
     }
 
     #[test]

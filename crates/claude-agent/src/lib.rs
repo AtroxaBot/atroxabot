@@ -624,8 +624,12 @@ pub struct TurnResult {
     pub num_turns: u64,
     /// What the session has cost so far, as the binary estimates it.
     pub total_cost_usd: Option<f64>,
-    /// Token counts of the turn.
+    /// Token counts of the turn: its own requests, not those of its subagents.
     pub usage: Usage,
+    /// What every model has used for the session so far, subagents and the binary's own requests
+    /// included (`modelUsage`): running totals, which a resumed session takes up where it left off.
+    /// Empty when not said.
+    pub model_usage: Vec<ModelUsage>,
     /// How many tool calls were denied during the turn.
     pub permission_denials: usize,
     /// The context window of the model that answered (the largest, if several did); 0 when not said.
@@ -635,6 +639,23 @@ pub struct TurnResult {
     pub queued_turn_count: u64,
     /// The whole message.
     pub raw: Value,
+}
+
+/// What one model has used for a session so far, as a `result` counts it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ModelUsage {
+    /// The model's id.
+    pub model: String,
+    /// Uncached input tokens.
+    pub input_tokens: u64,
+    /// Output tokens.
+    pub output_tokens: u64,
+    /// Input tokens read from the prompt cache.
+    pub cache_read_input_tokens: u64,
+    /// Input tokens written to the prompt cache.
+    pub cache_creation_input_tokens: u64,
+    /// What that cost in USD, as the binary estimates it.
+    pub cost_usd: f64,
 }
 
 /// One piece of a message's content.

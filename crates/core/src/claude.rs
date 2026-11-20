@@ -24,7 +24,7 @@ use crate::engine::{AgentEvent, Ask, FollowUp, LimitWindow, Limits, QUESTION_TOO
 use crate::responses::Usage;
 #[cfg(test)]
 use crate::session::TodoState;
-use crate::session::{ContextPart, Session, ToolUse};
+use crate::session::{ContextPart, Session, Spent, ToolUse};
 use crate::tools;
 
 /// Where the user's Claude Code binary is, if it is installed.
@@ -272,9 +272,21 @@ impl ClaudeAgent {
     ) -> Result<Self, sdk::Error> {
         let suggestions: Arc<Mutex<HashMap<String, Vec<Value>>>> = Arc::default();
         let pending = Arc::clone(&suggestions);
-        // The binary's running total includes what a resumed session cost before.
         let tuned = Arc::new(Mutex::new(tuning(&agent.model, &agent.effort)));
-        let mut mapper = Mapper { total: session.cost(), tuned: Arc::clone(&tuned), ..Mapper::default() };
+        // The binary keeps a conversation's running totals with it, and goes on from them when it takes
+        // the conversation up again: what a turn used and cost is what they grew by. A conversation it
+        // starts has none; one saved before the totals were kept has them, but not here.
+        let resumes = !session.remote.is_empty() && session.account == connection.id;
+        let metered = match (resumes, session.metered.is_empty()) {
+            (false, _) => Some(Vec::new()),
+            (true, false) => Some(session.metered.clone()),
+            (true, true) => None,
+        };
+        let total = match &metered {
+            Some(counted) => counted.iter().map(|spent| spent.cost).sum(),
+            None => session.cost(),
+        };
+        let mut mapper = Mapper { total, metered, tuned: Arc::clone(&tuned), ..Mapper::default() };
         let follow_ups = Arc::clone(&mapper.follow_ups);
         let elicitations = Arc::clone(&mapper.elicitations);
         let task_ids = Arc::clone(&mapper.task_ids);
@@ -565,6 +577,48 @@ fn activity(task: &sdk::Task) -> String {
     }
 }
 
+/// What the binary counts of one model, as the app keeps counts: the prompt tokens together, those
+/// read from and written to the cache among them.
+fn counted(used: &sdk::ModelUsage) -> Spent {
+    Spent {
+        model: used.model.clone(),
+        usage: Usage {
+            input_tokens: used
+                .input_tokens
+                .saturating_add(used.cache_read_input_tokens)
+                .saturating_add(used.cache_creation_input_tokens),
+            output_tokens: used.output_tokens,
+            cached_tokens: used.cache_read_input_tokens,
+            cache_write_tokens: used.cache_creation_input_tokens,
+        },
+        cost: used.cost_usd,
+    }
+}
+
+/// What `now` counts beyond `before`, model by model; a model nothing was added for is left out. A
+/// count that fell was started over (another conversation, or totals the binary did not take up
+/// again): all of it is new.
+fn since(before: &[Spent], now: &[Spent]) -> Vec<Spent> {
+    let fell = |was: &Usage, is: &Usage| {
+        was.input_tokens > is.input_tokens
+            || was.output_tokens > is.output_tokens
+            || was.cached_tokens > is.cached_tokens
+            || was.cache_write_tokens > is.cache_write_tokens
+    };
+    let added = now.iter().map(|now| {
+        let was = before.iter().find(|was| was.model == now.model).filter(|was| !fell(&was.usage, &now.usage));
+        let (was, paid) = was.map_or((Usage::default(), 0.0), |was| (was.usage, was.cost));
+        let usage = Usage {
+            input_tokens: now.usage.input_tokens - was.input_tokens,
+            output_tokens: now.usage.output_tokens - was.output_tokens,
+            cached_tokens: now.usage.cached_tokens - was.cached_tokens,
+            cache_write_tokens: now.usage.cache_write_tokens - was.cache_write_tokens,
+        };
+        Spent { model: now.model.clone(), usage, cost: (now.cost - paid).max(0.0) }
+    });
+    added.filter(|spent| !spent.usage.is_empty() || spent.cost > 0.0).collect()
+}
+
 /// Turns the binary's events into the app's, keeping what a turn needs
 /// remembered between them.
 #[derive(Debug, Default)]
@@ -582,6 +636,9 @@ struct Mapper {
     context: sdk::Usage,
     /// The session's cost so far, as the binary last reported it.
     total: f64,
+    /// What the binary had counted for the session by model when it last said, or when the session
+    /// was last saved; `None` while that is not known (a session taken up that was saved without it).
+    metered: Option<Vec<Spent>>,
     /// The subagents (by the call that started each) whose words streamed
     /// since their last complete message, which then repeats them.
     sub_streamed: HashSet<String>,
@@ -614,6 +671,38 @@ struct Mapper {
 }
 
 impl Mapper {
+    /// What the turn that is ending used, by model, what the binary counts for the session by now
+    /// (`models`), and what the turn cost. The binary counts the session, not the turn: the turn's is
+    /// what was added since the count before it, the requests of its subagents and the binary's own
+    /// among them. Where that count is not known, or the binary says none, the turn's `own` requests
+    /// are all that is known of it, at `cost`, what the running total grew by.
+    fn spent(&mut self, models: &[sdk::ModelUsage], own: sdk::Usage, cost: f64) -> (Vec<Spent>, Vec<Spent>, f64) {
+        let counted: Vec<Spent> = models.iter().map(counted).collect();
+        let before = self.metered.as_ref().filter(|_| !counted.is_empty());
+        let (turn, cost) = if let Some(before) = before {
+            let turn = since(before, &counted);
+            let summed: f64 = turn.iter().map(|spent| spent.cost).sum();
+            (turn, if summed > 0.0 { summed } else { cost })
+        } else {
+            let usage = Usage {
+                input_tokens: own
+                    .input_tokens
+                    .saturating_add(own.cache_read_input_tokens)
+                    .saturating_add(own.cache_creation_input_tokens),
+                output_tokens: own.output_tokens,
+                cached_tokens: own.cache_read_input_tokens,
+                cache_write_tokens: own.cache_creation_input_tokens,
+            };
+            let turn =
+                if usage.is_empty() { Vec::new() } else { vec![Spent { model: self.model.clone(), usage, cost }] };
+            (turn, cost)
+        };
+        if !counted.is_empty() {
+            self.metered = Some(counted.clone());
+        }
+        (turn, counted, cost)
+    }
+
     /// Remembers the call `id` if it starts a subagent.
     fn note_agent(&mut self, id: &str, name: &str) {
         if matches!(name, "Agent" | "Task") {
@@ -924,6 +1013,10 @@ impl Mapper {
                 let total = result.total_cost_usd.unwrap_or(self.total);
                 let cost = (total - self.total).max(0.0);
                 self.total = total.max(self.total);
+                let (turn, counted, cost) = self.spent(&result.model_usage, result.usage, cost);
+                if !turn.is_empty() || !counted.is_empty() {
+                    out.push(AgentEvent::Spent { turn, total: counted });
+                }
                 let context = self.context;
                 let usage = Usage {
                     input_tokens: context
@@ -1470,9 +1563,91 @@ mod tests {
             usage: sdk::Usage { output_tokens: 9, ..sdk::Usage::default() },
             permission_denials: 0,
             context_window: 200_000,
+            model_usage: Vec::new(),
             queued_turn_count: 0,
             raw: Value::Null,
         })
+    }
+
+    /// A turn's end at which the binary counts `models` for the session: each a name, the uncached
+    /// input, the cache's read and written, the output and the cost.
+    fn counting(models: &[(&str, [u64; 4], f64)]) -> sdk::Event {
+        let sdk::Event::Result(mut result) = result(false, Some("Done."), 0.0) else { unreachable!() };
+        result.total_cost_usd = Some(models.iter().map(|(_, _, cost)| cost).sum());
+        result.model_usage = models
+            .iter()
+            .map(|(model, [input, read, written, output], cost)| sdk::ModelUsage {
+                model: (*model).into(),
+                input_tokens: *input,
+                output_tokens: *output,
+                cache_read_input_tokens: *read,
+                cache_creation_input_tokens: *written,
+                cost_usd: *cost,
+            })
+            .collect();
+        sdk::Event::Result(result)
+    }
+
+    fn spent_of(events: &[AgentEvent]) -> (Vec<(String, [u64; 4])>, f64, usize) {
+        let said = events.iter().find_map(|event| match event {
+            AgentEvent::Spent { turn, total } => Some((turn.clone(), total.len())),
+            _ => None,
+        });
+        let (turn, total) = said.unwrap_or_default();
+        let cost = events.iter().find_map(|event| match event {
+            AgentEvent::ReplyEnded { cost, .. } => Some(*cost),
+            _ => None,
+        });
+        let count = |spent: &Spent| {
+            let used = spent.usage;
+            (spent.model.clone(), [used.input_tokens, used.cached_tokens, used.cache_write_tokens, used.output_tokens])
+        };
+        (turn.iter().map(count).collect(), cost.unwrap_or(0.0), total)
+    }
+
+    #[test]
+    fn a_turn_used_what_the_binary_counted_since_the_turn_before() {
+        // A conversation the binary starts: nothing was counted before its first turn.
+        let mut mapper = Mapper { metered: Some(Vec::new()), ..Mapper::default() };
+        let first = mapper.map(counting(&[("opus", [2, 0, 24_904, 4], 0.5)]));
+        assert_eq!(spent_of(&first), (vec![("opus".into(), [24_906, 0, 24_904, 4])], 0.5, 1));
+        // The next one read the cache many times over, and a subagent of another model worked for it.
+        let second =
+            mapper.map(counting(&[("haiku", [2, 0, 21_339, 4], 0.25), ("opus", [6, 43_367, 40_106, 223], 1.0)]));
+        let both = vec![("haiku".into(), [21_341, 0, 21_339, 4]), ("opus".into(), [58_573, 43_367, 15_202, 219])];
+        assert_eq!(spent_of(&second), (both, 0.75, 2));
+        // A turn nothing was counted for (a command) used nothing, and says only the totals again.
+        let idle = mapper.map(counting(&[("haiku", [2, 0, 21_339, 4], 0.25), ("opus", [6, 43_367, 40_106, 223], 1.0)]));
+        assert_eq!(spent_of(&idle), (Vec::new(), 0.0, 2));
+        // Totals that fell were started over: all of them are the turn's.
+        let over = mapper.map(counting(&[("opus", [1, 10, 0, 3], 0.125)]));
+        assert_eq!(spent_of(&over), (vec![("opus".into(), [11, 10, 0, 3])], 0.125, 1));
+    }
+
+    #[test]
+    fn a_session_taken_up_goes_on_from_what_was_counted_for_it() {
+        let kept = Spent { model: "opus".into(), usage: Usage::new(1_000, 100), cost: 2.0 };
+        let mut mapper = Mapper { metered: Some(vec![kept]), total: 2.0, ..Mapper::default() };
+        let turn = mapper.map(counting(&[("opus", [1_000, 500, 0, 130], 2.5)]));
+        assert_eq!(spent_of(&turn), (vec![("opus".into(), [500, 500, 0, 30])], 0.5, 1));
+
+        // One saved before the totals were kept: its first turn is known by its own requests alone,
+        // never by all the binary counted before it; the turns after it by what was added.
+        let mut mapper = Mapper { total: 2.0, model: "opus".into(), ..Mapper::default() };
+        let sdk::Event::Result(mut first) = counting(&[("opus", [9_000, 80_000, 500, 900], 2.25)]) else {
+            unreachable!()
+        };
+        first.usage = sdk::Usage {
+            input_tokens: 4,
+            output_tokens: 9,
+            cache_read_input_tokens: 30,
+            cache_creation_input_tokens: 2,
+            cache_ttl: 0,
+        };
+        let first = mapper.map(sdk::Event::Result(first));
+        assert_eq!(spent_of(&first), (vec![("opus".into(), [36, 30, 2, 9])], 0.25, 1));
+        let next = mapper.map(counting(&[("opus", [9_001, 80_100, 500, 905], 2.5)]));
+        assert_eq!(spent_of(&next), (vec![("opus".into(), [101, 100, 0, 5])], 0.25, 1));
     }
 
     fn assistant(blocks: Vec<sdk::Block>) -> sdk::Event {
@@ -1538,7 +1713,10 @@ mod tests {
         assert_eq!(mapper.map(assistant(vec![sdk::Block::Text("Done.".into())])), [AgentEvent::Text("Done.".into())]);
 
         let ended = mapper.map(result(false, Some("Done."), 1.25));
-        let AgentEvent::ReplyEnded { usage, cost, problem, model, .. } = &ended[0] else { panic!("the reply ends") };
+        // A binary that counts no models: the turn's own requests are what it used.
+        let own = Spent { model: "claude-x".into(), usage: Usage::new(0, 9), cost: 0.25 };
+        assert_eq!(ended[0], AgentEvent::Spent { turn: vec![own], total: Vec::new() });
+        let AgentEvent::ReplyEnded { usage, cost, problem, model, .. } = &ended[1] else { panic!("the reply ends") };
         assert_eq!((usage.input_tokens, usage.output_tokens, usage.cached_tokens), (36, 9, 30));
         assert!((cost - 0.25).abs() < 1e-9 && problem.is_empty() && model == "claude-x");
         assert_eq!(ended.last(), Some(&AgentEvent::TurnEnded { problem: None }));
@@ -1831,10 +2009,13 @@ mod live {
             ClaudeAgent::connect(&agent, &own, &session, None, false, move |event| drop(events.send(event))).unwrap();
         live.send("ping", &[]).unwrap();
         let (mut said, mut remote, mut ended) = (String::new(), String::new(), None);
+        let (mut spent, mut counted, mut context) = (Vec::new(), Vec::new(), Usage::default());
         while ended.is_none() {
             match inbox.recv_timeout(Duration::from_secs(180)).expect("the turn ends in time") {
                 AgentEvent::Text(text) => said.push_str(&text),
                 AgentEvent::Remote(id) => remote = id,
+                AgentEvent::Spent { turn, total } => (spent, counted) = (turn, total),
+                AgentEvent::ReplyEnded { usage, .. } => context = usage,
                 AgentEvent::TurnEnded { problem } => ended = Some(problem),
                 AgentEvent::Disconnected(why) => panic!("the binary stopped: {why:?}"),
                 _ => {}
@@ -1844,6 +2025,11 @@ mod live {
         assert_eq!(ended, Some(None), "the turn ended well");
         assert!(said.to_lowercase().contains("pong"), "said {said:?}");
         assert!(!remote.is_empty(), "the session can be resumed");
+        // The binary counts what every model used: of a conversation it started, the first turn used all of it.
+        let used = spent.iter().fold(Usage::default(), |sum, spent| sum.plus(spent.usage));
+        assert!(!spent.is_empty() && spent == counted, "the turn used {spent:?} of {counted:?}");
+        assert!(used.input_tokens >= context.input_tokens && used.output_tokens > 0, "{used:?} against {context:?}");
+        assert!(spent.iter().all(|spent| !spent.model.is_empty()), "every count names its model");
         let _ = std::fs::remove_dir_all(dir);
     }
 

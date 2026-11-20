@@ -940,6 +940,7 @@ fn ledger(agents: [&str; 2]) -> Ledger {
                     .take((seed % 5) as usize)
                     .map(|(name, failed)| ((*name).to_owned(), *failed))
                     .collect(),
+                part: false,
             });
         }
     }

@@ -5,6 +5,11 @@
 //! read back, summarised for whatever period the user looks at. The
 //! accounts' plan limits, as last reported, are kept beside it.
 //!
+//! What is counted is every request made for a response ([`Reply::used`]):
+//! an account's reply is a whole turn, whose every step reads the
+//! conversation again and whose subagents make requests of their own. Where
+//! the engine counts those by model, each model has a record of the turn.
+//!
 //! Days are UTC days since the Unix epoch.
 // ponytail: UTC days, not the user's; a reply late in the evening west of
 // Greenwich lands on the next day. Use the local offset once std has one.
@@ -19,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{Config, write_private};
 use crate::engine::Limits;
 use crate::error::Result;
-use crate::session::{Block, Entry, Reply, Session};
+use crate::session::{Block, Entry, Reply, Session, Spent};
 
 /// Seconds in a day.
 const DAY: u64 = 86_400;
@@ -61,6 +66,10 @@ pub struct Record {
     pub prompts: u64,
     /// The tools it called, and whether each failed.
     pub tools: Vec<(String, bool)>,
+    /// Whether this is only what another model used for a response (a subagent's requests, say): the
+    /// response has a record of its own, and this one is none to count.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub part: bool,
 }
 
 /// Sums over some records.
@@ -91,7 +100,7 @@ impl Tally {
         self.cached += record.cached;
         self.written += record.written;
         self.cost += record.cost;
-        self.replies += 1;
+        self.replies += u64::from(!record.part);
         self.prompts += record.prompts;
         self.tools += record.tools.len() as u64;
     }
@@ -110,10 +119,11 @@ impl Tally {
                 Entry::User { .. } => prompts += 1,
                 Entry::Summary { .. } | Entry::Note { .. } => {}
                 Entry::Reply(reply) => {
-                    tally.input += reply.usage.input_tokens;
-                    tally.output += reply.usage.output_tokens;
-                    tally.cached += reply.usage.cached_tokens;
-                    tally.written += reply.usage.cache_write_tokens;
+                    let used = reply.used();
+                    tally.input += used.input_tokens;
+                    tally.output += used.output_tokens;
+                    tally.cached += used.cached_tokens;
+                    tally.written += used.cache_write_tokens;
                     tally.cost += reply.cost;
                     tally.replies += 1;
                     tally.prompts += std::mem::take(&mut prompts);
@@ -188,24 +198,24 @@ impl Ledger {
                 match entry {
                     Entry::User { .. } => prompts += 1,
                     Entry::Summary { .. } | Entry::Note { .. } => {}
-                    Entry::Reply(reply) => records.push(record(session, reply, std::mem::take(&mut prompts))),
+                    Entry::Reply(reply) => records.extend(records_of(session, reply, std::mem::take(&mut prompts))),
                 }
             }
         }
         Self { records }
     }
 
-    /// The record of the latest response of `session`, as [`Ledger::collect`] makes it, without
-    /// making those of the responses before it: what is logged as each one ends.
+    /// The records of the latest response of `session`, as [`Ledger::collect`] makes them, without
+    /// making those of the responses before it: what is logged as each one ends. None without one.
     #[must_use]
-    pub fn latest(session: &Session) -> Option<Record> {
+    pub fn latest(session: &Session) -> Vec<Record> {
         let is_reply = |entry: &Entry| matches!(entry, Entry::Reply(_));
-        let at = session.entries.iter().rposition(is_reply)?;
-        let Some(Entry::Reply(reply)) = session.entries.get(at) else { return None };
+        let Some(at) = session.entries.iter().rposition(is_reply) else { return Vec::new() };
+        let Some(Entry::Reply(reply)) = session.entries.get(at) else { return Vec::new() };
         // The user messages since the response before it are the ones it answered.
         let since = session.entries[..at].iter().rposition(is_reply).map_or(0, |before| before + 1);
         let prompts = session.entries[since..at].iter().filter(|entry| matches!(entry, Entry::User { .. })).count();
-        Some(record(session, reply, prompts as u64))
+        records_of(session, reply, prompts as u64)
     }
 
     /// Where responses are logged: `usage.jsonl` in the data folder.
@@ -348,12 +358,15 @@ pub fn save_limits<S: std::hash::BuildHasher>(limits: &HashMap<String, Limits, S
     write_private(&Config::dir()?.join(LIMITS_FILE), &serde_json::to_vec(limits)?)
 }
 
-/// The record of the response `reply` of `session`, which answered `prompts` user messages.
-fn record(session: &Session, reply: &Reply, prompts: u64) -> Record {
+/// The records of the response `reply` of `session`, which answered `prompts` user messages: one,
+/// or, where the requests of its turn were counted by model ([`Reply::spent`]), one for each model.
+/// The first is the response, by the model that wrote it; the others are only what another model
+/// used for it ([`Record::part`]).
+fn records_of(session: &Session, reply: &Reply, prompts: u64) -> Vec<Record> {
     let at = if reply.at == 0 { session.updated } else { reply.at };
     let mut tools = Vec::new();
     called(&reply.blocks, &mut tools);
-    Record {
+    let whole = Record {
         day: at / DAY,
         agent: session.agent.clone(),
         session: session.id.clone(),
@@ -368,7 +381,27 @@ fn record(session: &Session, reply: &Reply, prompts: u64) -> Record {
         cost: reply.cost,
         prompts,
         tools,
-    }
+        part: false,
+    };
+    // The model that wrote the reply answers for it; where it is not among those counted, the first does.
+    let writer = reply.spent.iter().position(|spent| spent.model == reply.model).unwrap_or(0);
+    let Some(wrote) = reply.spent.get(writer) else { return vec![whole] };
+    // An engine that prices nothing leaves the reply's own cost where it was.
+    let priced = reply.spent.iter().any(|spent| spent.cost > 0.0);
+    let share = |spent: &Spent, of: Record| Record {
+        model: if spent.model.is_empty() { of.model.clone() } else { spent.model.clone() },
+        input: spent.usage.input_tokens,
+        output: spent.usage.output_tokens,
+        cached: spent.usage.cached_tokens,
+        written: spent.usage.cache_write_tokens,
+        cost: if priced { spent.cost } else { of.cost },
+        ..of
+    };
+    let part = Record { cost: 0.0, prompts: 0, tools: Vec::new(), part: true, ..whole.clone() };
+    let others = reply.spent.iter().enumerate().filter(|(at, _)| *at != writer);
+    let mut records = vec![share(wrote, whole)];
+    records.extend(others.map(|(_, spent)| share(spent, part.clone())));
+    records
 }
 
 /// The tools called in `blocks` and whether each failed, those of subagents included.
@@ -454,9 +487,10 @@ mod tests {
         // Summed without the records, a session comes to the same.
         for session in [&a, &b] {
             assert_eq!(Tally::of(session), Ledger::collect(std::slice::from_ref(session)).summary(0).total);
-            assert_eq!(Ledger::latest(session), Ledger::collect(std::slice::from_ref(session)).records.pop());
+            let last = Ledger::collect(std::slice::from_ref(session)).records.pop();
+            assert_eq!(Ledger::latest(session), last.into_iter().collect::<Vec<_>>());
         }
-        assert_eq!(Ledger::latest(&Session::new("nobody")), None);
+        assert!(Ledger::latest(&Session::new("nobody")).is_empty());
         let ledger = Ledger::collect(&[a, b]);
         assert_eq!(ledger.records.len(), 4);
         assert_eq!(ledger.records.iter().map(|r| r.prompts).collect::<Vec<_>>(), [1, 0, 1, 1]);
@@ -481,6 +515,68 @@ mod tests {
         assert_eq!(ledger.streaks(14), (1, 2), "yesterday still counts while today is quiet");
         assert_eq!(ledger.streaks(16), (0, 2));
         assert_eq!(Ledger::default().streaks(5), (0, 0));
+    }
+
+    #[test]
+    fn a_turn_counts_every_request_made_for_it() {
+        let usage = |input, output, cached| Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cached_tokens: cached,
+            cache_write_tokens: 0,
+        };
+        // A turn of an account: twenty steps on a conversation of 400,000 tokens, and a subagent of
+        // another model. The reply itself says how full the context is; the turn used far more.
+        let spent = vec![
+            Spent { model: "haiku".into(), usage: usage(90_000, 500, 60_000), cost: 0.25 },
+            Spent { model: "opus".into(), usage: usage(8_000_000, 4_000, 7_900_000), cost: 2.5 },
+        ];
+        let turn = Reply {
+            blocks: vec![Block::Tool(ToolUse { name: "Agent".into(), ..ToolUse::default() })],
+            model: "opus".into(),
+            usage: usage(400_000, 200, 399_000),
+            spent,
+            cost: 2.75,
+            at: 10 * DAY,
+            ..Reply::default()
+        };
+        assert_eq!(turn.used(), usage(8_090_000, 4_500, 7_960_000));
+        let mut session = Session::new("scout");
+        session.entries = vec![user(), Entry::from(turn), user(), reply(10 * DAY, "opus", usage(100, 10, 0), 0.5, &[])];
+        // How full the context is stays what the latest reply says of itself.
+        assert_eq!((session.context_tokens(), session.tokens()), (110, 8_094_610));
+
+        let ledger = Ledger::collect(std::slice::from_ref(&session));
+        let rows = ledger.records.iter().map(|r| (r.model.as_str(), r.input, r.prompts, r.tools.len(), r.part));
+        let rows: Vec<_> = rows.collect();
+        // The model that wrote the reply first, with what it answered and called; the other's share after.
+        assert_eq!(rows, [("opus", 8_000_000, 1, 1, false), ("haiku", 90_000, 0, 0, true), ("opus", 100, 1, 0, false)]);
+        let all = ledger.summary(0);
+        assert_eq!(Tally::of(&session), all.total);
+        assert_eq!((all.total.input, all.total.output, all.total.cached), (8_090_100, 4_510, 7_960_000));
+        assert_eq!((all.total.replies, all.total.prompts, all.total.tools), (2, 2, 1), "a share is no response");
+        assert!((all.total.cost - 3.25).abs() < 1e-9);
+        let models: Vec<_> = all.models.iter().map(|(name, tally)| (name.as_str(), tally.input, tally.cost)).collect();
+        assert_eq!(models, [("opus", 8_000_100, 3.0), ("haiku", 90_000, 0.25)]);
+        // What is logged as the turn ends is both of its records; a share is marked in the log.
+        session.entries.truncate(2);
+        assert_eq!(Ledger::latest(&session), ledger.records[..2]);
+        let line = serde_json::to_string(&ledger.records[1]).unwrap();
+        assert!(
+            line.contains(r#""part":true"#) && !serde_json::to_string(&ledger.records[0]).unwrap().contains("part")
+        );
+
+        // An engine that prices nothing (Codex, Antigravity) counts its turn under the reply's model.
+        let unpriced = Reply {
+            model: "gpt".into(),
+            usage: usage(1_200, 40, 1_000),
+            spent: vec![Spent { model: "gpt".into(), usage: usage(2_200, 90, 1_000), cost: 0.0 }],
+            at: DAY,
+            ..Reply::default()
+        };
+        session.entries = vec![user(), Entry::from(unpriced)];
+        let record = Ledger::latest(&session).pop().expect("a record");
+        assert_eq!((record.input, record.output, record.cost, record.part), (2_200, 90, 0.0, false));
     }
 
     #[test]

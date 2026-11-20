@@ -8,7 +8,8 @@ use serde_json::Value;
 use crate::cli::preview;
 use crate::{
     Account, Block, ContextCategory, ContextUsage, Elicitation, Event, Info, Init, McpServerStatus, ModelInfo,
-    PermissionRequest, PlanLimits, PlanUsage, RateLimit, RateWindow, SlashCommand, Task, TaskState, TurnResult, Usage,
+    ModelUsage, PermissionRequest, PlanLimits, PlanUsage, RateLimit, RateWindow, SlashCommand, Task, TaskState,
+    TurnResult, Usage,
 };
 
 /// How a control request of ours that failed is reported: [`Event::Error`] with this before its id.
@@ -145,6 +146,7 @@ pub(crate) fn parse_line(line: &str) -> Parsed {
                 .as_object()
                 .and_then(|models| models.values().map(|model| number(model, "contextWindow")).max())
                 .unwrap_or(0),
+            model_usage: model_usage(field(&data, "modelUsage")),
             queued_turn_count: number(&data, "queued_turn_count"),
             raw: data,
         }),
@@ -551,6 +553,28 @@ fn usage(value: &Value) -> Usage {
         cache_creation_input_tokens: number(value, "cache_creation_input_tokens"),
         cache_ttl,
     }
+}
+
+/// Most models a `result` is read the counts of: far more than a session thinks with.
+const MOST_MODELS: usize = 64;
+
+/// What each model used so far, from a `result`'s `modelUsage`, by the models' names. What is no
+/// object is skipped, and a count that is no number is none.
+fn model_usage(value: &Value) -> Vec<ModelUsage> {
+    let Some(models) = value.as_object() else { return Vec::new() };
+    let counted = models.iter().filter(|(_, counts)| counts.is_object()).take(MOST_MODELS);
+    let mut used: Vec<ModelUsage> = counted
+        .map(|(model, counts)| ModelUsage {
+            model: model.clone(),
+            input_tokens: number(counts, "inputTokens"),
+            output_tokens: number(counts, "outputTokens"),
+            cache_read_input_tokens: number(counts, "cacheReadInputTokens"),
+            cache_creation_input_tokens: number(counts, "cacheCreationInputTokens"),
+            cost_usd: field(counts, "costUSD").as_f64().filter(|cost| cost.is_finite() && *cost > 0.0).unwrap_or(0.0),
+        })
+        .collect();
+    used.sort_by(|a, b| a.model.cmp(&b.model));
+    used
 }
 
 /// The strings of an array; anything else is skipped.
@@ -1190,6 +1214,25 @@ mod tests {
         assert_eq!(result.usage, Usage { input_tokens: 10, output_tokens: 4, ..Usage::default() });
         assert_eq!((result.permission_denials, result.queued_turn_count), (2, 1));
         assert_eq!(result.raw["duration_api_ms"], 1000);
+        assert!(result.model_usage.is_empty(), "no models counted");
+    }
+
+    #[test]
+    fn a_result_counts_what_every_model_used() {
+        // As Claude Code 2.1 writes it: running totals by model, the subagents' requests among them.
+        let line = r#"{"type":"result","subtype":"success","total_cost_usd":0.0112,"usage":{"output_tokens":219},
+            "modelUsage":{"claude-opus-5-5":{"inputTokens":8,"outputTokens":227,"cacheReadInputTokens":43367,
+            "cacheCreationInputTokens":61445,"webSearchRequests":0,"costUSD":0.0112,"contextWindow":1000000},
+            "claude-haiku-5-5":{"inputTokens":"many","outputTokens":-4,"costUSD":"free"},"odd":7,"none":{}}}"#;
+        let Event::Result(result) = event(&line.replace('\n', " ")) else { panic!("not a result") };
+        let names: Vec<&str> = result.model_usage.iter().map(|used| used.model.as_str()).collect();
+        assert_eq!(names, ["claude-haiku-5-5", "claude-opus-5-5", "none"], "by name; what is no object is skipped");
+        assert_eq!(result.model_usage[0], ModelUsage { model: "claude-haiku-5-5".into(), ..ModelUsage::default() });
+        let opus = &result.model_usage[1];
+        assert_eq!((opus.input_tokens, opus.output_tokens), (8, 227));
+        assert_eq!((opus.cache_read_input_tokens, opus.cache_creation_input_tokens), (43_367, 61_445));
+        assert!((opus.cost_usd - 0.0112).abs() < 1e-12);
+        assert_eq!(result.context_window, 1_000_000);
     }
 
     #[test]

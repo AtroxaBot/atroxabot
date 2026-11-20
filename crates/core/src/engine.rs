@@ -35,7 +35,7 @@ use crate::mcp::{McpHub, McpTool};
 use crate::responses::{
     Completion, InputItem, Picture, ResponseRequest, Role, StreamEvent, ToolCall, ToolSpec, Usage, Wire,
 };
-use crate::session::{Block, ContextPart, Entry, Reply, Session, ToolUse};
+use crate::session::{Block, ContextPart, Entry, Reply, Session, Spent, ToolUse};
 use crate::tools::{self, Risk, Workspace};
 
 /// Most model requests one turn may make before it is stopped.
@@ -148,6 +148,16 @@ pub enum AgentEvent {
         cost: f64,
         /// Why it ended badly; empty when it finished.
         problem: String,
+    },
+    /// What the turn that is ending used in all, said just before its [`AgentEvent::ReplyEnded`] by an
+    /// engine whose reply is a whole turn of many requests.
+    Spent {
+        /// What every request of the turn used, by model, those of its subagents included
+        /// ([`Reply::spent`]).
+        turn: Vec<Spent>,
+        /// What the engine has counted for the session in all, where it keeps such a count
+        /// ([`Session::metered`]); empty where it keeps none.
+        total: Vec<Spent>,
     },
     /// Everything before the latest prompt was summarised to this.
     Summarized(String),
@@ -384,6 +394,12 @@ impl Session {
                 reply.problem.clone_from(problem);
                 reply.at = crate::session::unix_now();
             }),
+            AgentEvent::Spent { turn, total } => {
+                if !total.is_empty() {
+                    self.metered.clone_from(total);
+                }
+                self.with_reply(|reply| reply.spent.clone_from(turn));
+            }
             AgentEvent::Summarized(text) => {
                 // Before the prompt being answered, which the summary does not
                 // cover; once the work on it is under way, after everything.

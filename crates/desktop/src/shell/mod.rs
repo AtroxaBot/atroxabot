@@ -1348,14 +1348,16 @@ impl Shell {
                 actions.push(Action::LogUsage(Box::new(record)));
             }
         }
-        // What a response used goes to the usage log, which outlives the session.
-        if matches!(event, AgentEvent::ReplyEnded { .. })
-            && let Some(mut record) = Ledger::latest(&thread.session)
-            && (record.input + record.output > 0 || !record.tools.is_empty())
-        {
-            record.provider = ran_on(thread, &self.agents);
-            record.provider_name = self.config.connection(&record.provider).map(|c| c.name).unwrap_or_default();
-            actions.push(Action::LogUsage(Box::new(record)));
+        // What a response used goes to the usage log, which outlives the session: a record, or one
+        // for each model its turn's requests were counted for.
+        if matches!(event, AgentEvent::ReplyEnded { .. }) {
+            for mut record in Ledger::latest(&thread.session) {
+                if record.input + record.output > 0 || !record.tools.is_empty() {
+                    record.provider = ran_on(thread, &self.agents);
+                    record.provider_name = self.config.connection(&record.provider).map(|c| c.name).unwrap_or_default();
+                    actions.push(Action::LogUsage(Box::new(record)));
+                }
+            }
         }
         // Claude Code started a turn by itself: a follow-up of its own queue, or a background task that ended.
         if !thread.busy && matches!(event, AgentEvent::Working | AgentEvent::ReplyStarted | AgentEvent::FollowUp { .. })

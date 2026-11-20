@@ -563,7 +563,9 @@ server-side compaction on its own API, by a request of the app's elsewhere.
 - **The side panel** (the last icon of the top bar). Where the window is too narrow to set it beside the
   session, it floats over the session under the top bar; Esc or a click outside it puts it away. Taller
   than the window, it scrolls as one, its changed files with the rest.
-  - What the session used and how full its context is. Under a context of 100,000 tokens or more, a
+  - What the session used and how full its context is. The tokens are those of every request made for
+    it: each step of a turn reads the conversation again, and its subagents make requests of their own.
+    The context is what the next request reads. Under a context of 100,000 tokens or more, a
     line says how long the provider still keeps it cached (*Cached for 38 more min*, then *No longer
     cached*), with *Compact* beside it: a message sent in time reads the conversation at about a tenth of
     the usage, a later one counts all of it once, and compacting before that is cheap. It is a line to
@@ -600,7 +602,12 @@ server-side compaction on its own API, by a request of the app's elsewhere.
   day; where the tokens went (output, new input, written to and read from the cache); what each provider,
   model, agent and tool used; and where each account's plan limits stand (kept between runs; opening the
   statistics asks each signed-in account, as the side panel does). They are counted from a
-  usage log of their own, so deleting a session does not lose what it used.
+  usage log of their own, so deleting a session does not lose what it used. Tokens are counted by
+  request: a turn of an account counts every step it took and what its subagents used, each under the
+  model that used it (Claude Code's own count of the session, of which a turn is what was added; Codex's
+  as it says each request; Antigravity's as it says each prompt). Turns logged up to version 0.1.15 were
+  counted by the size of the conversation at their end alone, so the days before read lower than they
+  were; their cost was always the whole turn's.
 
 ### Voice calls
 
@@ -1014,10 +1021,10 @@ Everything lives in `~/.atroxabot/`:
 | `config.json` | Providers (with their API keys), voice providers (with theirs), MCP servers, recent folders, the theme, window and zoom, what closing the window does, whether email addresses are hidden, whether Claude accounts suggest the next message, whether the side panel is open, the order you dragged the sessions into, when unused worktrees are cleaned up, the repositories worktrees were made in, and what a session does when its account runs out. |
 | `agents/<id>.json` | One file per agent. |
 | `memory/<id>/notes.md` | An agent's notes. |
-| `sessions/<id>.json` | A session: its folder (and worktree, if any), the provider, model and effort it keeps, for an API session the system prompt it began with, and what was said and done in its latest turn (its replies as they arrived and the pictures its tools showed), with a count of the entries before those. |
+| `sessions/<id>.json` | A session: its folder (and worktree, if any), the provider, model and effort it keeps, for an API session the system prompt it began with, what its account's engine has counted for it by model, and what was said and done in its latest turn (its replies as they arrived and the pictures its tools showed), with a count of the entries before those. |
 | `sessions/<id>.log` | The session's earlier entries, a line of JSON each, as many as its `.json` counts. A session with only one turn has none. |
 | `sessions/.index.json` | What the sidebar and an opening session need: titles, and each session's provider, model and effort. |
-| `usage.jsonl` | What every reply used (when, which agent and session, the provider its turn ran on, the model, its tokens, cost and tool calls), a line each. The statistics are counted from it; it is started once from the saved sessions and only added to after that. |
+| `usage.jsonl` | What every reply used (when, which agent and session, the provider its turn ran on, the model, its tokens, cost and tool calls), a line each; where the requests of a turn were counted by model, a line for each model. The statistics are counted from it; it is started once from the saved sessions and only added to after that. |
 | `limits.json` | Each account's plan limits as last reported or checked, with the model a week of its own counts. |
 | `icons/` | Your own pictures of providers (see *Provider marks*). The app only reads it. |
 | `attachments/` | Pictures you pasted into a message, one PNG each. |

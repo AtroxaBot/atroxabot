@@ -51,6 +51,23 @@ impl Usage {
     pub fn new(input_tokens: u64, output_tokens: u64) -> Self {
         Self { input_tokens, output_tokens, ..Self::default() }
     }
+
+    /// These counts and `other`'s together.
+    #[must_use]
+    pub fn plus(self, other: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(other.output_tokens),
+            cached_tokens: self.cached_tokens.saturating_add(other.cached_tokens),
+            cache_write_tokens: self.cache_write_tokens.saturating_add(other.cache_write_tokens),
+        }
+    }
+
+    /// Whether nothing was counted.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
 }
 
 #[expect(clippy::trivially_copy_pass_by_ref, reason = "serde's skip_serializing_if passes a reference")]

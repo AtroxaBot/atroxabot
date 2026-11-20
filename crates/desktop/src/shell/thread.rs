@@ -1617,15 +1617,17 @@ impl Thread {
                 actions.push(Action::Copy(reply.blocks.iter().filter_map(words).collect::<Vec<_>>().join("\n\n")));
             }
         }
-        let tokens = reply.usage.input_tokens.saturating_add(reply.usage.output_tokens);
+        // What every request made for it used: for a whole turn, each of its steps.
+        let used = reply.used();
+        let tokens = used.input_tokens.saturating_add(used.output_tokens);
         if tokens > 0 {
             let mut caption = reply.model.clone();
             if !caption.is_empty() {
                 caption.push_str(" · ");
             }
-            let _ = write!(caption, "{} in, {} out", reply.usage.input_tokens, reply.usage.output_tokens);
-            if reply.usage.cached_tokens > 0 {
-                let share = reply.usage.cached_tokens * 100 / reply.usage.input_tokens.max(1);
+            let _ = write!(caption, "{} in, {} out", used.input_tokens, used.output_tokens);
+            if used.cached_tokens > 0 {
+                let share = used.cached_tokens * 100 / used.input_tokens.max(1);
                 let _ = write!(caption, " · {share}% cached");
             }
             if reply.cost > 0.0 {
