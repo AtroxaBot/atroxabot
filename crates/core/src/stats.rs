@@ -380,7 +380,7 @@ mod tests {
                 Block::Tool(ToolUse { name: (*name).into(), is_error: *failed, ..ToolUse::default() })
             })
             .collect();
-        Entry::Reply(Reply { blocks, model: model.into(), usage, cost, at, ..Reply::default() })
+        Entry::from(Reply { blocks, model: model.into(), usage, cost, at, ..Reply::default() })
     }
 
     fn user() -> Entry {

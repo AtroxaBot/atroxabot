@@ -16,7 +16,8 @@ atroxabot-codex = { path = "crates/codex" }
 atroxabot-core = { path = "crates/core" }
 atroxabot-mcp = { path = "crates/mcp" }
 atroxabot-voice = { path = "crates/voice" }
-serde = { version = "1.0.229", features = ["derive"] }
+# `rc`: a session's replies are shared by reference (`Arc<Reply>`) and written and read through it.
+serde = { version = "1.0.229", features = ["derive", "rc"] }
 serde_json = "1.0.154"
 ureq = { version = "3.5.1", default-features = false, features = ["rustls"] }
 winit = "0.30.13"

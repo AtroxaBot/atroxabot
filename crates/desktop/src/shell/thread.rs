@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use atroxabot_core::attach::media_type;
@@ -444,14 +445,18 @@ impl Thread {
         self.status.clear();
         self.started = None;
         let stopped = std::mem::take(&mut self.stopping);
+        // Changed only where there is something to change: a reply left alone stays shared with what
+        // was last saved of it.
         if let Some(Entry::Reply(reply)) = self.session.entries.last_mut() {
             if stopped {
                 // Being interrupted is what was asked for, not a failure.
-                reply.problem.clear();
+                if !reply.problem.is_empty() {
+                    Arc::make_mut(reply).problem.clear();
+                }
             } else if let Some(problem) = problem
                 && reply.problem.is_empty()
             {
-                reply.problem = problem;
+                Arc::make_mut(reply).problem = problem;
             }
         }
     }
@@ -1557,7 +1562,7 @@ mod tests {
                 ..ToolUse::default()
             })
         };
-        let reply = |blocks: Vec<Block>| Entry::Reply(Reply { blocks, ..Reply::default() });
+        let reply = |blocks: Vec<Block>| Entry::from(Reply { blocks, ..Reply::default() });
         let mut thread = Thread::new(Session::new("a"));
         thread.session.prompt("first", "");
         let earlier = agent("old", "", Some("found"), "Done · 1 tool call · 2.0k tokens · 3s");

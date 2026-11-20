@@ -327,7 +327,7 @@ impl Session {
     /// part of the transcript (approvals, status notes) change nothing.
     pub fn apply(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::ReplyStarted => self.entries.push(Entry::Reply(Reply::default())),
+            AgentEvent::ReplyStarted => self.entries.push(Entry::Reply(Arc::default())),
             AgentEvent::Text(more) => self.with_reply(|reply| match reply.blocks.last_mut() {
                 Some(Block::Text { text }) => text.push_str(more),
                 _ => reply.blocks.push(Block::Text { text: more.clone() }),
@@ -397,15 +397,23 @@ impl Session {
             AgentEvent::System(text) => self.system.clone_from(text),
             AgentEvent::Memory(text) => self.memory = Some(text.clone()),
             AgentEvent::ForgetReplays => {
+                // Only a reply that has something to forget is touched: the others stay shared with
+                // what was last saved of them.
                 for entry in &mut self.entries {
                     if let Entry::Reply(reply) = entry
                         && reply.wire == Wire::Messages
+                        && !reply.raw.is_empty()
                     {
-                        reply.raw.clear();
+                        Arc::make_mut(reply).raw.clear();
                     }
                 }
             }
             AgentEvent::Blind => {
+                fn shown(blocks: &[Block]) -> bool {
+                    blocks
+                        .iter()
+                        .any(|block| matches!(block, Block::Tool(call) if call.picture.is_some() || shown(&call.sub)))
+                }
                 fn unseen(blocks: &mut [Block]) {
                     for block in blocks {
                         if let Block::Tool(call) = block {
@@ -419,9 +427,13 @@ impl Session {
                     }
                 }
                 self.blind = true;
+                // Only a reply that showed a picture is touched: the others stay shared with what was
+                // last saved of them.
                 for entry in &mut self.entries {
-                    if let Entry::Reply(reply) = entry {
-                        unseen(&mut reply.blocks);
+                    if let Entry::Reply(reply) = entry
+                        && shown(&reply.blocks)
+                    {
+                        unseen(&mut Arc::make_mut(reply).blocks);
                     }
                 }
             }
@@ -455,10 +467,10 @@ impl Session {
     /// Changes the reply being written: the last entry, started if it is not one.
     fn with_reply(&mut self, change: impl FnOnce(&mut Reply)) {
         if !matches!(self.entries.last(), Some(Entry::Reply(_))) {
-            self.entries.push(Entry::Reply(Reply::default()));
+            self.entries.push(Entry::Reply(Arc::default()));
         }
         if let Some(Entry::Reply(reply)) = self.entries.last_mut() {
-            change(reply);
+            change(Arc::make_mut(reply));
         }
     }
 
@@ -1808,7 +1820,7 @@ mod tests {
             Entry::User { text: "old".into(), note: String::new(), files: Vec::new() },
             Entry::Summary { text: "Earlier.".into() },
             Entry::User { text: "hi".into(), note: "(on a call)".into(), files: Vec::new() },
-            Entry::Reply(Reply {
+            Entry::from(Reply {
                 blocks: vec![Block::Text { text: "Looking.".into() }, tool("server-1", Some("x")), tool("t1", None)],
                 raw: raw.clone(),
                 ..Reply::default()
@@ -1835,7 +1847,7 @@ mod tests {
     #[test]
     fn a_reply_goes_back_as_it_came_only_where_it_can() {
         let reply = |wire: Wire, model: &str, raw: Value| {
-            Entry::Reply(Reply {
+            Entry::from(Reply {
                 blocks: vec![tool("c1", Some("fn main"))],
                 raw: vec![raw],
                 wire,

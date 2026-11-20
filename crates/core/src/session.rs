@@ -1,23 +1,119 @@
-//! Sessions: the conversations of an agent, one JSON file each in
+//! Sessions: the conversations of an agent, two files each in
 //! `~/.atroxabot/sessions/`.
 //!
-//! Next to them, `.index.json` holds a [`SessionSummary`] per session so the
-//! sidebar loads without reading any message bodies. The index is a cache:
-//! [`SessionStore::list`] reconciles it against the files on disk (a
+//! # What is on disk
+//!
+//! * `<id>.json` is one JSON object: the [`Session`] with only its *open*
+//!   entries (the latest ones, which still change) and `sealed`, the number
+//!   of entries before them that the log keeps. It is written whole and
+//!   atomically at every save.
+//! * `<id>.log` holds the *sealed* entries, oldest first, one compact JSON
+//!   [`Entry`] a line (`serde_json` never writes a raw newline). It is only
+//!   ever added to at its end, or cut at the end of a line. A session with
+//!   nothing sealed has none, or an empty one.
+//!
+//! A session's entries are the first `sealed` lines of the log, then the
+//! entries of the JSON file. Whatever the log holds after those lines (a line
+//! a crash tore, lines a later save stopped counting) is not read, and is cut
+//! off before the next line is added. A log with fewer lines than counted
+//! makes the session unreadable: it is reported as any unreadable session is,
+//! and its files are left as they are.
+//!
+//! So a long session is not written again at every save: what a save writes
+//! is the latest turn. The log is read a line at a time, never as one string.
+//!
+//! Files are written with the same private permissions as the config. Fields
+//! added later must be `#[serde(default)]` so older files keep loading. Each
+//! JSON file records the [`Session::VERSION`] that wrote it; one from a newer
+//! version of the app is listed but never opened, since saving it here would
+//! drop what this version does not know. Version 1 had no log: its one file
+//! held every entry and no `sealed`. Such a file loads as it always did, and
+//! its next save writes it as this version, which an app of version 1 then
+//! leaves closed: it would read the open entries alone and save over the rest.
+//!
+//! # How a save decides
+//!
+//! The store that saves (one, on the app's writer thread) remembers of every
+//! session the entries it last wrote and where each line of the log ends
+//! (`Written`). The first entries of those, as many as there are lines, are
+//! the log `L`, which is also exactly what the JSON file on disk counts; all
+//! of them are the previous snapshot `P`. Given the session `S` to save:
+//!
+//! 1. `common` is the length of the longest prefix where `L[i]` is `S[i]`.
+//! 2. `target` is the smaller of the index of the last [`Entry::User`] of `S`
+//!    (0 without one) and the first index where `S` differs from `P`. The
+//!    entries before it came through a save unchanged and belong to earlier
+//!    turns: they are worth sealing.
+//! 3. If `common < L.len()` (a sealed entry changed, or entries went away: a
+//!    `/clear`, a summary put in), `sealed = min(common, target)`, which is
+//!    `target`. The JSON file is written with `S[sealed..]`, *then* the log
+//!    is cut back to `sealed` lines.
+//! 4. Otherwise, if `target > L.len()`: the log is cut back to `L.len()`
+//!    lines where it is longer, `S[L.len()..target]` are added as lines and
+//!    flushed to the disk, *then* the JSON file is written with `S[target..]`.
+//! 5. Otherwise the JSON file is written with `S[L.len()..]`.
+//!
+//! "Is" in these comparisons is [`Arc::ptr_eq`] for a reply and `==` for the
+//! other, small entries. A reply is shared, not copied ([`Entry::Reply`]),
+//! and changed only through [`Arc::make_mut`], which copies it while anyone
+//! else holds it. The store holds every reply it last wrote, so **a reply
+//! that changed since then is another allocation**, and one that is still
+//! the same allocation is what the disk holds. That is why the store keeps
+//! the last snapshot, and why nothing may change a reply behind its `Arc`.
+//!
+//! A store that knows nothing of a session it is to save (it never saved it,
+//! and was handed no [`Kept`]) cannot tell what changed: it writes every
+//! entry to the JSON file with `sealed` 0, then empties the log. To spare
+//! that, what [`SessionStore::load_kept`] found is given to the saving store
+//! with [`SessionStore::adopt`], which takes it only while the JSON file is
+//! still the one that was read.
+//!
+//! # A crash between two steps
+//!
+//! What is on disk always loads as the session before the save or the one
+//! after it, never with entries missing:
+//!
+//! * In 3, before the JSON file is replaced: the old session. After it, with
+//!   the log not yet cut: the new one, for the lines up to `sealed` did not
+//!   change and the ones after them are no longer counted.
+//! * In 4, once the log is cut back to `L.len()` lines: the old session,
+//!   which counts no more than those. While lines are added, or all are but
+//!   the JSON file is not yet replaced: still the old session, the new lines
+//!   (the last perhaps torn) lying beyond its count. After it: the new one.
+//!   The lines are flushed before the JSON file that counts them is written,
+//!   so that no power cut leaves a count the log does not hold.
+//! * In 5, and wherever the JSON file is written: the old file or the new,
+//!   since it is replaced atomically.
+//! * In [`SessionStore::delete`], the JSON file goes first: a crash then
+//!   leaves a log no session counts, which nothing reads.
+//!
+//! A save that fails part of the way leaves the same states, and the store
+//! believing what it believed before, which is still true of the disk. A log
+//! found shorter than the store knows it to be is not the one it wrote: the
+//! session is then written whole, as by a store that knows nothing.
+//!
+//! # Readers on other threads
+//!
+//! Searches, the statistics and opening a session read on threads of their
+//! own while the writer saves. A reader that takes lines from the log reads
+//! the JSON file again afterwards and starts over when it changed meanwhile,
+//! so it never joins the count of one save to the log of another.
+//!
+//! # The index
+//!
+//! Next to the sessions, `.index.json` holds a [`SessionSummary`] per session
+//! so the sidebar loads without reading any message bodies. The index is a
+//! cache: [`SessionStore::list`] reconciles it against the files on disk (a
 //! directory listing plus modification times, no reads) and re-reads only
 //! sessions that are new or changed since the index was written, so a crash
-//! between the two writes of a save heals itself.
-//!
-//! Files are written atomically with the same private permissions as the
-//! config. Fields added later must be `#[serde(default)]` so older files keep
-//! loading. Each file records the [`Session::VERSION`] that wrote it; one
-//! from a newer version of the app is listed but never opened, since saving
-//! it here would drop what this version does not know.
+//! between the writes of a save heals itself.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::ErrorKind;
+use std::hash::Hasher as _;
+use std::io::{BufRead as _, BufReader, ErrorKind, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -25,7 +121,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::Agent;
-use crate::config::{Config, write_private};
+use crate::config::{Config, create_private_dir, write_private};
 use crate::error::{Error, Result};
 use crate::responses::{Picture, Usage, Wire};
 use crate::worktree::Worktree;
@@ -151,8 +247,11 @@ pub enum Entry {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         files: Vec<String>,
     },
-    /// One response of the model: text, reasoning and tool calls with results.
-    Reply(Reply),
+    /// One response of the model: text, reasoning and tool calls with
+    /// results. Shared, so that a copy of a session copies no reply: change
+    /// one through [`Arc::make_mut`] only, which is also how the store tells
+    /// that it changed (see the module's "How a save decides").
+    Reply(Arc<Reply>),
     /// The engine summarised everything before this point; requests start here.
     Summary {
         /// The summary the model continues from.
@@ -164,6 +263,27 @@ pub enum Entry {
         /// What it says.
         text: String,
     },
+}
+
+impl From<Reply> for Entry {
+    /// The reply as an entry of a session.
+    fn from(reply: Reply) -> Self {
+        Self::Reply(Arc::new(reply))
+    }
+}
+
+impl Entry {
+    /// Whether this is `other` as a save sees it: for a reply the very same
+    /// one, not merely one that reads the same (a reply that was changed is
+    /// another allocation, see the module comment); for the other entries,
+    /// which are small, an equal one.
+    fn is(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Reply(one), Self::Reply(two)) => Arc::ptr_eq(one, two),
+            (Self::Reply(_), _) | (_, Self::Reply(_)) => false,
+            _ => self == other,
+        }
+    }
 }
 
 /// One response of the model.
@@ -283,8 +403,9 @@ impl TodoState {
 }
 
 impl Session {
-    /// The current file format.
-    pub const VERSION: u32 = 1;
+    /// The current file format: 2 since a session's sealed entries are kept
+    /// in a log beside its JSON file.
+    pub const VERSION: u32 = 2;
 
     /// The agent's task list as its tool calls left it: Claude Code's
     /// `TaskCreate` and `TaskUpdate`, or a whole list at once from
@@ -525,11 +646,16 @@ impl Session {
     }
 
     fn replies(&self) -> impl DoubleEndedIterator<Item = &Reply> {
-        self.entries.iter().filter_map(|e| if let Entry::Reply(reply) = e { Some(reply) } else { None })
+        self.entries.iter().filter_map(|e| if let Entry::Reply(reply) = e { Some(reply.as_ref()) } else { None })
     }
 
-    /// The tool call `id`, wherever it is: in a reply, or in what a subagent did.
+    /// The tool call `id`, wherever it is: in a reply, or in what a subagent
+    /// did. Only the reply that holds it is made this session's own to
+    /// change; every other one stays shared with whoever else holds it.
     pub fn find_tool(&mut self, id: &str) -> Option<&mut ToolUse> {
+        fn holds(blocks: &[Block], id: &str) -> bool {
+            blocks.iter().any(|block| matches!(block, Block::Tool(call) if call.id == id || holds(&call.sub, id)))
+        }
         fn within<'a>(blocks: &'a mut [Block], id: &str) -> Option<&'a mut ToolUse> {
             for block in blocks.iter_mut().rev() {
                 if let Block::Tool(call) = block {
@@ -543,10 +669,13 @@ impl Session {
             }
             None
         }
-        self.entries.iter_mut().rev().find_map(|entry| match entry {
-            Entry::Reply(reply) => within(&mut reply.blocks, id),
+        // Looked for without asking to change anything: `Arc::make_mut` on a reply that is shared copies it.
+        let at =
+            self.entries.iter().rposition(|entry| matches!(entry, Entry::Reply(reply) if holds(&reply.blocks, id)))?;
+        match &mut self.entries[at] {
+            Entry::Reply(reply) => within(&mut Arc::make_mut(reply).blocks, id),
             _ => None,
-        })
+        }
     }
 
     /// Sends `files` along with the latest prompt.
@@ -694,6 +823,154 @@ struct Index {
     sessions: Vec<SessionSummary>,
 }
 
+/// The first [`Session::VERSION`] whose JSON file counts entries kept in a
+/// log: an older file holds every entry itself, whatever else it says.
+const LOGGED: u32 = 2;
+
+/// How a session's JSON file is written: the session with only its open
+/// entries, and how many came before them.
+#[derive(Serialize)]
+struct Stored<'a> {
+    #[serde(flatten)]
+    session: &'a Session,
+    /// The entries before the session's that its log keeps, a line each.
+    sealed: u64,
+}
+
+/// What a session's JSON file says of its log.
+#[derive(Default, Deserialize)]
+#[serde(default)]
+struct Count {
+    sealed: u64,
+}
+
+/// What stands for a session's JSON file when asking whether it is still the
+/// one that was read: its length and a hash of its bytes.
+type Mark = (u64, u64);
+
+/// The [`Mark`] of a JSON file's `bytes`.
+fn mark(bytes: &[u8]) -> Mark {
+    // Not a secret and nothing to defend: only ever compared with another of this run.
+    let mut hasher = std::hash::DefaultHasher::new();
+    hasher.write(bytes);
+    (bytes.len() as u64, hasher.finish())
+}
+
+/// What a store knows a session's files to hold, which lets it add to them
+/// rather than write them again.
+#[derive(Default)]
+struct Written {
+    /// The entries as they were last written (or read), all of them: what
+    /// the next save is compared with. The store's hold on them is also
+    /// what makes a reply that changes since become another allocation.
+    entries: Vec<Entry>,
+    /// Where each line of the log ends, in bytes from its start: line `i`
+    /// holds `entries[i]`, and the JSON file counts exactly these lines.
+    ends: Vec<u64>,
+}
+
+impl std::fmt::Debug for Written {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The entries themselves would be megabytes.
+        f.debug_struct("Written").field("entries", &self.entries.len()).field("sealed", &self.ends.len()).finish()
+    }
+}
+
+/// What reading a session found on disk, for the store that will save it
+/// ([`SessionStore::adopt`]): with it the first save after opening a session
+/// adds a turn to its files, where a store that knows nothing of them has to
+/// write them all again. It shares the session's replies, so it costs no
+/// memory worth the name while the session is held.
+#[derive(Debug)]
+pub struct Kept {
+    written: Written,
+    /// The JSON file this was read from.
+    mark: Mark,
+}
+
+/// A session as its files hold it.
+struct Found {
+    session: Session,
+    /// Where the line of each sealed entry ends in the log.
+    ends: Vec<u64>,
+    /// The bytes of the JSON file it was read from.
+    file: Vec<u8>,
+}
+
+/// The first `count` entries of the log at `path`, and where the line of
+/// each ends. What the log holds after them is not read.
+fn read_log(path: &Path, count: u64) -> Result<(Vec<Entry>, Vec<u64>)> {
+    let mut reader = BufReader::with_capacity(1 << 16, fs::File::open(path)?);
+    let (mut entries, mut ends, mut end, mut line) = (Vec::new(), Vec::new(), 0_u64, Vec::new());
+    // Counted up to, never allocated for: the count is whatever the file says.
+    while (entries.len() as u64) < count {
+        line.clear();
+        end += reader.read_until(b'\n', &mut line)? as u64;
+        if line.last() != Some(&b'\n') {
+            // The end of the log, or a line a crash tore: either way a line that was counted is not there.
+            let message = "the session's log holds fewer entries than its file counts";
+            return Err(std::io::Error::new(ErrorKind::UnexpectedEof, message).into());
+        }
+        entries.push(serde_json::from_slice(&line)?);
+        ends.push(end);
+    }
+    Ok((entries, ends))
+}
+
+/// Adds `entries` to the log at `path`, a line each, after its first `end`
+/// bytes: what it holds beyond those (lines no JSON file counts, left by a
+/// crash or a save that failed) is cut off first. The lines are on the disk
+/// when this returns where each of them ends; `None` when the log is shorter
+/// than `end`, so not the one the store knows.
+fn append(path: &Path, end: u64, entries: &[Entry]) -> Result<Option<Vec<u64>>> {
+    if let Some(dir) = path.parent() {
+        create_private_dir(dir)?;
+    }
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(path)?;
+    let length = file.metadata()?.len();
+    if length < end {
+        return Ok(None);
+    }
+    if length > end {
+        file.set_len(end)?;
+    }
+    file.seek(SeekFrom::Start(end))?;
+    let (mut ends, mut end, mut line) = (Vec::with_capacity(entries.len()), end, Vec::new());
+    for entry in entries {
+        line.clear();
+        serde_json::to_writer(&mut line, entry)?;
+        line.push(b'\n');
+        file.write_all(&line)?;
+        end += line.len() as u64;
+        ends.push(end);
+    }
+    file.sync_all()?;
+    #[cfg(unix)]
+    if length == 0
+        && let Some(dir) = path.parent()
+    {
+        // A log that may just have been made: its name is to be on the disk too before a JSON file
+        // counts on it. Best effort, as for the files written atomically.
+        let _ = fs::File::open(dir).and_then(|dir| dir.sync_all());
+    }
+    Ok(Some(ends))
+}
+
+/// Cuts the log at `path` back to its first `end` bytes; one that is no
+/// longer, or not there, is left alone.
+fn cut(path: &Path, end: u64) -> std::io::Result<()> {
+    match fs::metadata(path) {
+        Ok(log) if log.len() > end => fs::OpenOptions::new().write(true).open(path)?.set_len(end),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 /// Reads and writes the session files in one directory, keeping the index
 /// up to date.
 #[derive(Debug)]
@@ -702,6 +979,9 @@ pub struct SessionStore {
     /// Summaries, newest first. Valid once `indexed` is set.
     index: Vec<SessionSummary>,
     indexed: bool,
+    /// What the files of each session hold, for those this store saved or
+    /// was handed ([`SessionStore::adopt`]) and did not let go of since.
+    written: HashMap<String, Written>,
 }
 
 impl SessionStore {
@@ -717,7 +997,7 @@ impl SessionStore {
     /// I/O happens until a method needs it.
     #[must_use]
     pub fn at(dir: PathBuf) -> Self {
-        Self { dir, index: Vec::new(), indexed: false }
+        Self { dir, index: Vec::new(), indexed: false, written: HashMap::new() }
     }
 
     /// The directory holding the session files.
@@ -726,9 +1006,10 @@ impl SessionStore {
         &self.dir
     }
 
-    fn path(&self, id: &str) -> Result<PathBuf> {
+    /// The JSON file and the log of the session `id`.
+    fn paths(&self, id: &str) -> Result<(PathBuf, PathBuf)> {
         if valid_id(id) {
-            Ok(self.dir.join(format!("{id}.json")))
+            Ok((self.dir.join(format!("{id}.json")), self.dir.join(format!("{id}.log"))))
         } else {
             Err(Error::Io(std::io::Error::new(ErrorKind::InvalidInput, "invalid session id")))
         }
@@ -784,8 +1065,8 @@ impl SessionStore {
             }
             // A session from a newer version is listed, though it won't open.
             match self.read(id) {
-                Ok(session) => {
-                    let summary = session.summary();
+                Ok(found) => {
+                    let summary = found.session.summary();
                     match known {
                         Some(i) => index[i] = summary,
                         None => index.push(summary),
@@ -818,30 +1099,108 @@ impl SessionStore {
     /// Reads one session with all its messages.
     ///
     /// # Errors
-    /// An invalid id, a missing or unreadable file, malformed JSON, or
-    /// [`Error::Newer`] for a session saved by a newer version of the app.
+    /// An invalid id, a missing or unreadable file, malformed JSON, a log
+    /// that holds fewer entries than the file counts, or [`Error::Newer`]
+    /// for a session saved by a newer version of the app.
     pub fn load(&self, id: &str) -> Result<Session> {
-        let session = self.read(id)?;
-        if session.version > Session::VERSION {
+        Ok(self.found(id)?.session)
+    }
+
+    /// Reads one session as [`SessionStore::load`] does, and with it what
+    /// the store that will save it needs to add to its files rather than
+    /// write them again: hand that to [`SessionStore::adopt`] of that store
+    /// before the session is saved.
+    ///
+    /// # Errors
+    /// Those of [`SessionStore::load`].
+    pub fn load_kept(&self, id: &str) -> Result<(Session, Kept)> {
+        let Found { session, ends, file } = self.found(id)?;
+        // The replies are shared with the session, not copied.
+        let kept = Kept { written: Written { entries: session.entries.clone(), ends }, mark: mark(&file) };
+        Ok((session, kept))
+    }
+
+    /// Takes what a [`SessionStore::load_kept`] found of the session `id`,
+    /// so the next save of the session that came with it adds to its files.
+    /// It is taken only if the session's JSON file is still the one that was
+    /// read: after a save since, the files are no longer what `kept` says,
+    /// and the store goes on with what it knows itself (which, when that is
+    /// nothing, makes the next save write everything).
+    pub fn adopt(&mut self, id: &str, kept: Kept) {
+        let Ok((json, _)) = self.paths(id) else { return };
+        if fs::read(json).is_ok_and(|bytes| mark(&bytes) == kept.mark) {
+            self.written.insert(id.to_owned(), kept.written);
+        }
+    }
+
+    /// Lets go of what the store knows of the session `id`'s files, and so
+    /// of its hold on the session's replies: for a session the app no longer
+    /// holds. Saving it again later writes all of it once.
+    pub fn forget(&mut self, id: &str) {
+        self.written.remove(id);
+    }
+
+    /// Reads one session this version can open.
+    fn found(&self, id: &str) -> Result<Found> {
+        let mut found = self.read(id)?;
+        if found.session.version > Session::VERSION {
             return Err(Error::Newer { what: "session" });
         }
-        Ok(session)
+        // What is held from here on is in this version's shape, and is saved as such.
+        found.session.version = Session::VERSION;
+        Ok(found)
     }
 
     /// Reads one session whatever version wrote it.
-    fn read(&self, id: &str) -> Result<Session> {
-        let mut session: Session = serde_json::from_slice(&fs::read(self.path(id)?)?)?;
-        // The file name is authoritative; it is what `delete` removes.
-        id.clone_into(&mut session.id);
-        Ok(session)
+    fn read(&self, id: &str) -> Result<Found> {
+        /// How often a session whose files change while they are read is read again.
+        const TRIES: usize = 4;
+        let (json, log) = self.paths(id)?;
+        let mut bytes = fs::read(&json)?;
+        let mut tries = 1;
+        loop {
+            let mut session: Session = serde_json::from_slice(&bytes)?;
+            // Only a file of a version that keeps a log counts entries in one.
+            let sealed = if session.version >= LOGGED { serde_json::from_slice::<Count>(&bytes)?.sealed } else { 0 };
+            let mut ends = Vec::new();
+            if sealed > 0 {
+                let read = read_log(&log, sealed);
+                // The writer may have saved this very session meanwhile, on its own thread: the log
+                // read is then not the one this JSON file counted.
+                let now = fs::read(&json)?;
+                if now != bytes {
+                    if tries == TRIES {
+                        let message = "the session's files kept changing while they were read";
+                        return Err(std::io::Error::new(ErrorKind::ResourceBusy, message).into());
+                    }
+                    (bytes, tries) = (now, tries + 1);
+                    continue;
+                }
+                let (mut entries, lines) = read?;
+                entries.append(&mut session.entries);
+                (session.entries, ends) = (entries, lines);
+            }
+            // The file name is authoritative; it is what `delete` removes.
+            id.clone_into(&mut session.id);
+            return Ok(Found { session, ends, file: bytes });
+        }
     }
 
-    /// Writes `session` atomically and updates the index.
+    /// Writes `session` and updates the index: the entries of its latest
+    /// turn to its JSON file, atomically, and the ones before to its log,
+    /// which is added to rather than written again wherever the store knows
+    /// what it holds (the module comment says how, and what a crash leaves).
     ///
     /// # Errors
     /// An invalid id or any I/O failure.
     pub fn save(&mut self, session: &Session) -> Result<()> {
-        write_private(&self.path(&session.id)?, &serde_json::to_vec(session)?)?;
+        let (json, log) = self.paths(&session.id)?;
+        // A store that knows nothing of the files writes every entry, and empties the log.
+        let mut written = self.written.remove(&session.id).unwrap_or_default();
+        let saved = Self::write(&json, &log, &mut written, session);
+        // Kept whether it worked or not: a save that failed changed nothing of what is known.
+        self.written.insert(session.id.clone(), written);
+        saved?;
         self.ensure_indexed()?;
         let summary = session.summary();
         match self.index.iter_mut().find(|s| s.id == session.id) {
@@ -850,6 +1209,51 @@ impl SessionStore {
         }
         self.index.sort_by_key(|s| std::cmp::Reverse(s.updated));
         self.write_index()
+    }
+
+    /// Writes `session` to its files, which hold what `written` says, and
+    /// notes in `written` what they hold then. `written` changes only once
+    /// the JSON file is replaced: until then the files still load as before.
+    fn write(json: &Path, log: &Path, written: &mut Written, session: &Session) -> Result<()> {
+        let entries = &session.entries;
+        let logged = written.ends.len();
+        // The first entry that is not the one last written; what the log shares with the session
+        // (`common` in the module comment) is this, or all of the log.
+        let unchanged = written.entries.iter().zip(entries).take_while(|(old, new)| old.is(new)).count();
+        let turn = entries.iter().rposition(|entry| matches!(entry, Entry::User { .. })).unwrap_or(0);
+        let target = turn.min(unchanged);
+        let rewinds = unchanged < logged;
+        let sealed = if rewinds { target } else { target.max(logged) };
+
+        let mut added = Vec::new();
+        if sealed > logged {
+            let end = written.ends.last().copied().unwrap_or(0);
+            let Some(ends) = append(log, end, &entries[logged..sealed])? else {
+                // The log is not the one this store wrote: all of the session is here, so it is
+                // written as by a store that knows nothing.
+                *written = Written::default();
+                return Self::write(json, log, written, session);
+            };
+            added = ends;
+        }
+
+        // The store's own copy: its entries are what the next save is compared with.
+        let mut open = session.clone();
+        open.version = open.version.max(Session::VERSION);
+        let latest = open.entries.split_off(sealed);
+        let mut earlier = std::mem::replace(&mut open.entries, latest);
+        write_private(json, &serde_json::to_vec(&Stored { session: &open, sealed: sealed as u64 })?)?;
+
+        written.ends.truncate(sealed);
+        written.ends.append(&mut added);
+        earlier.append(&mut open.entries);
+        written.entries = earlier;
+        if rewinds || sealed == 0 {
+            // Only tidying: the JSON file no longer counts those lines, and what stays of them is
+            // cut off before the next line is added.
+            let _ = cut(log, written.ends.last().copied().unwrap_or(0));
+        }
+        Ok(())
     }
 
     /// Every readable session with all its messages, for the statistics.
@@ -888,6 +1292,10 @@ impl SessionStore {
             let Some(id) = path.file_stem().and_then(|s| s.to_str()).filter(|id| valid_id(id)) else {
                 continue;
             };
+            // A session is its JSON file; its log is read with it.
+            if path.extension().is_none_or(|ext| ext != "json") {
+                continue;
+            }
             // Unreadable files are skipped; `list` reports them.
             let Ok(session) = self.load(id) else { continue };
             let found = session.lines().find(|line| line.to_lowercase().contains(&needle));
@@ -901,15 +1309,21 @@ impl SessionStore {
         Ok(hits)
     }
 
-    /// Deletes a session's file and its index entry; deleting a missing
-    /// session succeeds.
+    /// Deletes a session's files and its index entry, and forgets what the
+    /// store knew of them; deleting a missing session succeeds.
     ///
     /// # Errors
     /// An invalid id or any I/O failure other than "not found".
     pub fn delete(&mut self, id: &str) -> Result<()> {
-        match fs::remove_file(self.path(id)?) {
-            Err(e) if e.kind() != ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
+        let (json, log) = self.paths(id)?;
+        self.forget(id);
+        // The JSON file first: without it the log is nobody's, where a JSON file without the log it
+        // counts would be a session that cannot be read.
+        for file in [json, log] {
+            match fs::remove_file(file) {
+                Err(e) if e.kind() != ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
         }
         self.ensure_indexed()?;
         self.index.retain(|s| s.id != id);
@@ -1059,7 +1473,7 @@ mod tests {
     fn session(agent: &str, prompt: &str, answer: &str) -> Session {
         let mut session = Session::new(agent);
         session.entries.push(Entry::User { text: prompt.into(), note: String::new(), files: Vec::new() });
-        session.entries.push(Entry::Reply(Reply {
+        session.entries.push(Entry::from(Reply {
             blocks: vec![
                 Block::Thinking { text: "hm".into() },
                 Block::Tool(ToolUse { id: "t".into(), name: "read".into(), input: "{}".into(), ..ToolUse::default() }),
@@ -1124,7 +1538,7 @@ mod tests {
         let update =
             |id: &str, status: &str| call("TaskUpdate", serde_json::json!({ "taskId": id, "status": status }), None);
         let mut session = Session::new("a");
-        let reply = |blocks| Entry::Reply(Reply { blocks, ..Reply::default() });
+        let reply = |blocks| Entry::from(Reply { blocks, ..Reply::default() });
         session.entries.push(reply(vec![
             create("Read the file", Some("Task #1 created successfully: Read the file")),
             create("Fix the bug", Some("Task #2 created successfully: Fix the bug")),
@@ -1169,5 +1583,691 @@ mod tests {
         assert_eq!(ids.len(), 1000);
         assert!(ids.iter().all(|id| valid_id(id)));
         assert!(!valid_id("") && !valid_id("a/b") && !valid_id(".index"));
+    }
+
+    use crate::AgentEvent;
+
+    /// Numbers that look thrown, the same at every run.
+    struct Dice(u64);
+
+    impl Dice {
+        /// One of `0..sides`.
+        fn roll(&mut self, sides: usize) -> usize {
+            self.0 = self.0.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+            (self.0 >> 33) as usize % sides
+        }
+    }
+
+    /// A tool call that took `input` bytes and returned `output` bytes.
+    fn call(id: &str, input: usize, output: usize) -> ToolUse {
+        ToolUse {
+            id: id.into(),
+            name: "read".into(),
+            input: format!("{{\"path\":\"{}\"}}", "a".repeat(input)),
+            output: Some("b\n".repeat(output / 2)),
+            ..ToolUse::default()
+        }
+    }
+
+    /// Adds a turn to `session`: a prompt, and a reply that called a tool which returned `output` bytes.
+    fn turn(session: &mut Session, prompt: &str, output: usize) {
+        session.prompt(prompt, "");
+        session.apply(&AgentEvent::ReplyStarted);
+        session.apply(&AgentEvent::ToolCall(call(&format!("call-{}", session.entries.len()), 16, output)));
+        session.apply(&AgentEvent::Text(format!("Done with {prompt}.")));
+        session.apply(&ended());
+    }
+
+    fn ended() -> AgentEvent {
+        AgentEvent::ReplyEnded {
+            raw: vec![serde_json::json!({ "type": "text", "text": "Done." })],
+            wire: Wire::Messages,
+            model: "opus".into(),
+            usage: Usage::new(100, 20),
+            cost: 0.25,
+            problem: String::new(),
+        }
+    }
+
+    /// The session as a store that never saw it reads it from `store`'s folder.
+    fn read_back(store: &SessionStore, id: &str) -> Result<Session> {
+        SessionStore::at(store.dir().to_path_buf()).load(id)
+    }
+
+    /// The bytes of a session's JSON file and of its log (none: empty).
+    fn files(store: &SessionStore, id: &str) -> (Vec<u8>, Vec<u8>) {
+        let (json, log) = store.paths(id).unwrap();
+        (fs::read(json).unwrap(), fs::read(log).unwrap_or_default())
+    }
+
+    /// How many entries a session's JSON file says its log keeps.
+    fn sealed(store: &SessionStore, id: &str) -> u64 {
+        serde_json::from_slice::<Count>(&files(store, id).0).unwrap().sealed
+    }
+
+    #[test]
+    fn whatever_changes_between_saves_is_read_back_as_it_was_saved() {
+        let mut writer = store("changes");
+        let dir = writer.dir().to_path_buf();
+        let mut session = Session::new("scout");
+        let mut dice = Dice(7);
+        let (mut calls, mut agents) = (Vec::<String>::new(), Vec::<String>::new());
+        // How often the log grew, was cut back, and was left as it was.
+        let (mut grew, mut shrank, mut stayed, mut length) = (0, 0, 0, 0);
+        for step in 0..1500 {
+            let any = |dice: &mut Dice, ids: &[String]| ids.get(dice.roll(ids.len().max(1))).cloned();
+            match dice.roll(16) {
+                0 | 1 => session.prompt(&format!("prompt {step}"), ""),
+                2 => {
+                    session.apply(&AgentEvent::ReplyStarted);
+                    session.apply(&AgentEvent::Thinking("Hm.".into()));
+                    session.apply(&AgentEvent::Text(format!("Answer {step}.\nOn two lines, with a \"quote\".")));
+                }
+                3 => session.apply(&AgentEvent::Text(format!(" More at {step}."))),
+                4 | 5 => {
+                    let id = format!("call-{step}");
+                    let agent = dice.roll(3) == 0;
+                    let name = if agent { "Agent" } else { "read" };
+                    let call = ToolUse { id: id.clone(), name: name.into(), input: "{}".into(), ..ToolUse::default() };
+                    session.apply(&AgentEvent::ToolCall(call));
+                    if agent {
+                        agents.push(id.clone());
+                    }
+                    calls.push(id);
+                }
+                // A result for a call of any earlier entry, as a subagent in the background gives one.
+                6 | 7 => {
+                    if let Some(id) = any(&mut dice, &calls) {
+                        session.apply(&AgentEvent::ToolResult {
+                            id,
+                            output: format!("result {step}"),
+                            is_error: false,
+                        });
+                    }
+                }
+                8 | 9 => {
+                    if let Some(parent) = any(&mut dice, &agents) {
+                        let id = format!("sub-{step}");
+                        let event = match dice.roll(3) {
+                            0 => AgentEvent::Text(format!("Looking at {step}.")),
+                            1 => AgentEvent::Thinking("Where is it?".into()),
+                            _ => {
+                                calls.push(id.clone());
+                                AgentEvent::ToolCall(call(&id, 8, 8))
+                            }
+                        };
+                        session.apply(&AgentEvent::Sub { parent: parent.clone(), event: Box::new(event) });
+                        session.apply(&AgentEvent::Activity { id: parent, text: format!("Working · {step}") });
+                    }
+                }
+                10 => session.apply(&ended()),
+                11 => match dice.roll(4) {
+                    // A summary put before everything, and the engine's own before the prompt.
+                    0 => session.entries.insert(0, Entry::Summary { text: format!("Until {step}.") }),
+                    1 => session.apply(&AgentEvent::Summarized(format!("So far, at {step}."))),
+                    _ => session.apply(&AgentEvent::Note(format!("Summarised at {step}."))),
+                },
+                12 => {
+                    // As `/clear` empties it.
+                    if dice.roll(6) == 0 {
+                        session.entries.clear();
+                        calls.clear();
+                        agents.clear();
+                    }
+                }
+                13 => match dice.roll(3) {
+                    0 => session.attach(&[format!("/tmp/{step}.png")]),
+                    1 => session.apply(&AgentEvent::FollowUp {
+                        id: format!("follow-{step}"),
+                        text: format!("and {step}"),
+                        note: String::new(),
+                        files: Vec::new(),
+                    }),
+                    _ => {
+                        if let Some(id) = any(&mut dice, &calls) {
+                            session.apply(&AgentEvent::Denied(id));
+                        }
+                    }
+                },
+                14 => match dice.roll(8) {
+                    0 => session.apply(&AgentEvent::ForgetReplays),
+                    1 => session.apply(&AgentEvent::Blind),
+                    2 => {
+                        session.entries.pop();
+                    }
+                    _ => {
+                        if let Some(id) = any(&mut dice, &calls) {
+                            let picture = Picture { media_type: "image/png".into(), data: "AAAA".into() };
+                            session.apply(&AgentEvent::ToolPicture { id, picture });
+                        }
+                    }
+                },
+                _ => {}
+            }
+            if dice.roll(3) > 0 {
+                continue;
+            }
+            writer.save(&session).unwrap();
+            assert_eq!(read_back(&writer, &session.id).unwrap(), session, "after step {step}");
+            let now = files(&writer, &session.id).1.len();
+            match now.cmp(&length) {
+                std::cmp::Ordering::Greater => grew += 1,
+                std::cmp::Ordering::Less => shrank += 1,
+                std::cmp::Ordering::Equal => stayed += 1,
+            }
+            length = now;
+            match dice.roll(12) {
+                // The app is started again: the session is read, and the writer told what was found.
+                0 => {
+                    let (loaded, kept) = SessionStore::at(dir.clone()).load_kept(&session.id).unwrap();
+                    session = loaded;
+                    writer = SessionStore::at(dir.clone());
+                    writer.adopt(&session.id, kept);
+                }
+                // A writer that knows nothing of the files, and one that let go of what it knew.
+                1 => writer = SessionStore::at(dir.clone()),
+                2 => writer.forget(&session.id),
+                _ => {}
+            }
+        }
+        assert!(grew > 20 && shrank > 20 && stayed > 20, "{grew} grew, {shrank} shrank, {stayed} stayed");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_turn_more_is_added_to_the_log_and_what_it_held_is_left_alone() {
+        let mut store = store("appends");
+        let mut session = Session::new("scout");
+        for number in 0..40 {
+            turn(&mut session, &format!("turn {number}"), 100_000);
+        }
+        // A store that knows nothing writes everything to the JSON file; the turns that came through
+        // that save unchanged are sealed by the next.
+        store.save(&session).unwrap();
+        assert_eq!((sealed(&store, &session.id), files(&store, &session.id).1.len()), (0, 0));
+        turn(&mut session, "one more", 1_000);
+        store.save(&session).unwrap();
+        let (json, log) = files(&store, &session.id);
+        assert_eq!(sealed(&store, &session.id), 80);
+        assert!(log.len() > 4_000_000 && json.len() < 4_000, "{} in the log, {} beside it", log.len(), json.len());
+
+        turn(&mut session, "and another", 1_000);
+        store.save(&session).unwrap();
+        let (json, longer) = files(&store, &session.id);
+        assert_eq!(sealed(&store, &session.id), 82);
+        assert!(longer.len() > log.len() && longer.len() < log.len() + 4_000, "only the turn before was added");
+        assert!(longer[..log.len()] == log[..], "what the log held is as it was");
+        assert!(json.len() < 4_000, "{} beside it", json.len());
+        assert_eq!(read_back(&store, &session.id).unwrap(), session);
+
+        // And so for a session the app opens: the writer is handed what the read found.
+        let (mut opened, kept) = SessionStore::at(store.dir().to_path_buf()).load_kept(&session.id).unwrap();
+        assert_eq!(opened, session);
+        let mut writer = SessionStore::at(store.dir().to_path_buf());
+        writer.adopt(&opened.id, kept);
+        turn(&mut opened, "after opening", 1_000);
+        writer.save(&opened).unwrap();
+        let (json, last) = files(&writer, &opened.id);
+        assert_eq!(sealed(&writer, &opened.id), 84);
+        assert!(last.len() > longer.len() && last.len() < longer.len() + 4_000 && json.len() < 4_000);
+        assert!(last[..longer.len()] == longer[..], "the first save after opening added to the log too");
+        assert_eq!(read_back(&writer, &opened.id).unwrap(), opened);
+        fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    #[ignore = "prints what a save costs for a session of some fifty megabytes; run it in release"]
+    fn saving_a_turn_writes_only_the_turn() {
+        use std::time::Instant;
+        // As the owner's longest: 150 entries, 1,000 tool calls of 1.6 KB in and 2.4 KB out, and 90
+        // subagents that each made 100 calls of 4 KB.
+        let mut session = Session::new("scout");
+        for number in 0..75 {
+            session.prompt(&format!("turn {number}"), "");
+            session.apply(&AgentEvent::ReplyStarted);
+            let calls = if number < 25 { 14 } else { 13 };
+            for tool in 0..calls {
+                session.apply(&AgentEvent::ToolCall(call(&format!("call-{number}-{tool}"), 1_600, 2_400)));
+            }
+            let agents = if number < 15 { 2 } else { 1 };
+            for agent in 0..agents {
+                let sub = (0..100).map(|tool| Block::Tool(call(&format!("sub-{number}-{agent}-{tool}"), 1_600, 2_400)));
+                let agent = ToolUse {
+                    name: "Agent".into(),
+                    sub: sub.collect(),
+                    ..call(&format!("agent-{number}-{agent}"), 200, 2_000)
+                };
+                session.apply(&AgentEvent::ToolCall(agent));
+            }
+            session.apply(&AgentEvent::Text(format!("Done with turn {number}.")));
+            session.apply(&ended());
+        }
+        let tools = |blocks: &[Block]| blocks.iter().filter(|block| matches!(block, Block::Tool(_))).count();
+        let (own, agents): (usize, usize) = session.replies().fold((0, 0), |(own, agents), reply| {
+            let started =
+                reply.blocks.iter().filter(|b| matches!(b, Block::Tool(call) if !call.sub.is_empty())).count();
+            (own + tools(&reply.blocks) - started, agents + started)
+        });
+        assert_eq!((session.entries.len(), own, agents), (150, 1_000, 90));
+
+        // As it was: every entry copied on the UI thread, then all of them written anew.
+        let start = Instant::now();
+        let copied: Vec<Entry> = session
+            .entries
+            .iter()
+            .map(|entry| match entry {
+                Entry::Reply(reply) => Entry::from(Reply::clone(reply)),
+                other => other.clone(),
+            })
+            .collect();
+        let copying = start.elapsed();
+        let start = Instant::now();
+        let whole = serde_json::to_vec(&session).unwrap();
+        let serialising = start.elapsed();
+        drop(copied);
+
+        let mut store = store("one-turn");
+        store.save(&session).unwrap();
+        turn(&mut session, "sealing what came before", 2_400);
+        store.save(&session).unwrap();
+        let log = files(&store, &session.id).1.len();
+
+        // As it is: the pointers copied, and the turn written.
+        turn(&mut session, "one more", 2_400);
+        let start = Instant::now();
+        let snapshot = session.clone();
+        let cloning = start.elapsed();
+        let start = Instant::now();
+        store.save(&snapshot).unwrap();
+        let saving = start.elapsed();
+        let (json, longer) = files(&store, &session.id);
+        let written = json.len() + longer.len() - log;
+        println!("a session of {} entries, {} bytes as one file", session.entries.len(), whole.len());
+        println!("before: {copying:?} to copy it, {serialising:?} to serialise it, {} bytes written", whole.len());
+        println!("now:    {cloning:?} to copy it, {saving:?} to save it, {written} bytes written");
+        println!("        ({} to the log of {log} bytes, {} as the JSON file)", longer.len() - log, json.len());
+        assert!(written < 20_000 && whole.len() > 40_000_000, "{written} of {}", whole.len());
+        assert_eq!(read_back(&store, &session.id).unwrap(), session);
+        fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    fn a_crash_while_adding_to_the_log_leaves_the_session_as_it_was() {
+        let mut store = store("crash-adding");
+        let mut session = Session::new("scout");
+        turn(&mut session, "one", 100);
+        store.save(&session).unwrap();
+        turn(&mut session, "two", 100);
+        store.save(&session).unwrap();
+        let (old, id) = (session.clone(), session.id.clone());
+        let (old_json, old_log) = files(&store, &id);
+        assert_eq!(sealed(&store, &id), 2);
+        turn(&mut session, "three", 100);
+        store.save(&session).unwrap();
+        let (new_json, new_log) = files(&store, &id);
+        assert!(sealed(&store, &id) == 4 && new_log.len() > old_log.len());
+        let (json, log) = store.paths(&id).unwrap();
+
+        // Between the steps of that save: the lines added, whole or torn, with the JSON file not yet replaced.
+        fs::write(&json, &old_json).unwrap();
+        for added in [new_log.len(), new_log.len() - 1, old_log.len() + 7, old_log.len()] {
+            fs::write(&log, &new_log[..added]).unwrap();
+            assert_eq!(read_back(&store, &id).unwrap(), old, "with {} bytes added", added - old_log.len());
+        }
+        // Then the JSON file replaced: the session as it is now.
+        fs::write(&log, &new_log).unwrap();
+        fs::write(&json, &new_json).unwrap();
+        assert_eq!(read_back(&store, &id).unwrap(), session);
+
+        // The app starts again where the crash left a torn line: what is added next goes after the
+        // lines that count, not after the torn one.
+        fs::write(&json, &old_json).unwrap();
+        fs::write(&log, &new_log[..old_log.len() + 7]).unwrap();
+        let (mut opened, kept) = SessionStore::at(store.dir().to_path_buf()).load_kept(&id).unwrap();
+        let mut writer = SessionStore::at(store.dir().to_path_buf());
+        writer.adopt(&id, kept);
+        turn(&mut opened, "three again", 100);
+        writer.save(&opened).unwrap();
+        assert_eq!(sealed(&writer, &id), 4);
+        assert!(files(&writer, &id).1.starts_with(&old_log));
+        assert_eq!(read_back(&writer, &id).unwrap(), opened);
+        fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    fn a_crash_before_the_log_is_cut_back_leaves_the_session_as_it_was_saved() {
+        let mut store = store("crash-cutting");
+        let mut session = Session::new("scout");
+        for prompt in ["one", "two", "three"] {
+            turn(&mut session, prompt, 100);
+            store.save(&session).unwrap();
+        }
+        let id = session.id.clone();
+        let (old, (old_json, old_log)) = (session.clone(), files(&store, &id));
+        assert_eq!(sealed(&store, &id), 4);
+        // The first turn's call is answered anew, as a task in the background answers late: a sealed
+        // entry changed, so the count goes back to before it and the log is cut there.
+        session.apply(&AgentEvent::ToolResult { id: "call-2".into(), output: "at last".into(), is_error: false });
+        store.save(&session).unwrap();
+        let (new_json, new_log) = files(&store, &id);
+        assert_eq!(sealed(&store, &id), 1);
+        assert!(new_log.len() < old_log.len() && old_log.starts_with(&new_log));
+        let (json, log) = store.paths(&id).unwrap();
+
+        // Before the JSON file was replaced: as it was. After it, with the log not yet cut: as it is.
+        fs::write(&json, &old_json).unwrap();
+        fs::write(&log, &old_log).unwrap();
+        assert_eq!(read_back(&store, &id).unwrap(), old);
+        fs::write(&json, &new_json).unwrap();
+        assert_eq!(read_back(&store, &id).unwrap(), session);
+
+        // The app starts again with the log still long: the lines no longer counted are cut off
+        // before the next is added.
+        let (mut opened, kept) = SessionStore::at(store.dir().to_path_buf()).load_kept(&id).unwrap();
+        let mut writer = SessionStore::at(store.dir().to_path_buf());
+        writer.adopt(&id, kept);
+        turn(&mut opened, "four", 100);
+        writer.save(&opened).unwrap();
+        assert_eq!(sealed(&writer, &id), 6);
+        assert_eq!(read_back(&writer, &id).unwrap(), opened);
+        let lines = files(&writer, &id).1.split_inclusive(|byte| *byte == b'\n').count();
+        assert_eq!(lines, 6, "nothing of the old lines is left after the new");
+        fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    fn a_session_of_the_version_before_loads_and_is_written_as_this_one() {
+        let mut store = store("version-1");
+        let mut old = Session::new("scout");
+        turn(&mut old, "one", 100);
+        turn(&mut old, "two", 100);
+        old.version = 1;
+        // As version 1 wrote it: every entry in the one file. A count it never wrote means nothing.
+        let (json, log) = store.paths(&old.id).unwrap();
+        fs::create_dir_all(store.dir()).unwrap();
+        let mut text = serde_json::to_string(&old).unwrap();
+        assert!(!text.contains("sealed"));
+        text.insert_str(1, "\"sealed\":3,");
+        fs::write(&json, text).unwrap();
+
+        let (mut session, kept) = store.load_kept(&old.id).unwrap();
+        assert_eq!(session, Session { version: Session::VERSION, ..old.clone() });
+        assert!(!log.exists());
+        store.adopt(&session.id, kept);
+        turn(&mut session, "three", 100);
+        store.save(&session).unwrap();
+        // Everything before the new turn went to the log at once, and the file says who wrote it.
+        assert_eq!(sealed(&store, &old.id), 4);
+        let written: Session = serde_json::from_slice(&files(&store, &old.id).0).unwrap();
+        assert_eq!((written.version, written.entries.len()), (Session::VERSION, 2));
+        assert_eq!(read_back(&store, &old.id).unwrap(), session);
+
+        // One held since before it was this version is written as this version too.
+        let mut held = Session { version: 1, ..Session::new("scout") };
+        turn(&mut held, "one", 100);
+        store.save(&held).unwrap();
+        assert_eq!(read_back(&store, &held.id).unwrap().version, Session::VERSION);
+        fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    fn a_hostile_log_is_an_unreadable_session_and_never_a_panic() {
+        let mut store = store("hostile-log");
+        let mut session = Session::new("scout");
+        for prompt in ["one", "two", "three"] {
+            turn(&mut session, prompt, 100);
+            store.save(&session).unwrap();
+        }
+        let id = session.id.clone();
+        let (good_json, good_log) = files(&store, &id);
+        assert_eq!(sealed(&store, &id), 4);
+        let (json, log) = store.paths(&id).unwrap();
+        let lines: Vec<&[u8]> = good_log.split_inclusive(|byte| *byte == b'\n').collect();
+        let counting = |count: &str| String::from_utf8(good_json.clone()).unwrap().replace("\"sealed\":4", count);
+
+        // What follows the lines that count is not read: garbage, and a line a crash tore.
+        let mut longer = good_log.clone();
+        longer.extend_from_slice(b"garbage\n\xff\xfe\n{\"type\":\"user\",\"text\":\"to");
+        fs::write(&log, &longer).unwrap();
+        assert_eq!(read_back(&store, &id).unwrap(), session);
+
+        let mut garbage = lines.concat();
+        garbage[lines[0].len()] = b'!';
+        let huge = [lines[0], &vec![b'x'; 16 << 20], b"\n", lines[2], lines[3]].concat();
+        let nested = [lines[0], "[".repeat(1 << 20).as_bytes(), b"\n", lines[2], lines[3]].concat();
+        let wrong = [lines[0], b"{\"type\":\"reply\",\"blocks\":7}\n", lines[2], lines[3]].concat();
+        let torn = &good_log[..good_log.len() - 1];
+        let fewer = lines[..3].concat();
+        let blank = [lines[0], b"\n", lines[2], lines[3]].concat();
+        let logs: [(&str, &[u8]); 8] = [
+            ("a line of garbage", &garbage),
+            ("a huge line", &huge),
+            ("a line nested without end", &nested),
+            ("a line of another shape", &wrong),
+            ("a last line torn", torn),
+            ("fewer lines than counted", &fewer),
+            ("an empty line", &blank),
+            ("nothing", b""),
+        ];
+        for (what, bytes) in logs {
+            fs::write(&log, bytes).unwrap();
+            assert!(read_back(&store, &id).is_err(), "{what}");
+            assert!(SessionStore::at(store.dir().to_path_buf()).load_kept(&id).is_err(), "{what}");
+            assert_eq!(
+                files(&store, &id),
+                (good_json.clone(), bytes.to_vec()),
+                "{what}: the files are left as they are"
+            );
+        }
+        fs::remove_file(&log).unwrap();
+        assert!(read_back(&store, &id).is_err(), "no log at all");
+
+        // A count that is no count, or more than any log holds.
+        fs::write(&log, &good_log).unwrap();
+        for count in
+            ["\"sealed\":18446744073709551615", "\"sealed\":-1", "\"sealed\":\"4\"", "\"sealed\":4.5", "\"sealed\":5"]
+        {
+            fs::write(&json, counting(count)).unwrap();
+            assert!(read_back(&store, &id).is_err(), "{count}");
+        }
+        // It is listed as unreadable, not shown, and found by no search; the other sessions are.
+        let mut other = Session::new("scout");
+        turn(&mut other, "findable", 100);
+        store.save(&other).unwrap();
+        // Without the index, which still has it from when it was saved.
+        fs::remove_file(store.dir().join(INDEX_FILE)).unwrap();
+        let mut fresh = SessionStore::at(store.dir().to_path_buf());
+        let (listed, errors) = fresh.list().unwrap();
+        assert_eq!((listed.len(), errors.len(), listed[0].id.as_str()), (1, 1, other.id.as_str()));
+        assert_eq!(fresh.search("done with", 10).unwrap().len(), 1);
+        assert_eq!(fresh.all().len(), 1);
+        assert_eq!(files(&store, &id).1, good_log);
+
+        // Put right, it reads again.
+        fs::write(&json, &good_json).unwrap();
+        assert_eq!(read_back(&store, &id).unwrap(), session);
+        fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    fn a_store_that_knows_nothing_of_a_log_writes_the_session_whole() {
+        let mut store = store("knows-nothing");
+        let mut session = Session::new("scout");
+        for prompt in ["one", "two", "three"] {
+            turn(&mut session, prompt, 100);
+            store.save(&session).unwrap();
+        }
+        let id = session.id.clone();
+        assert!(sealed(&store, &id) == 4 && !files(&store, &id).1.is_empty());
+
+        // It was never told what the files hold, and the session it is given differs from them
+        // where they are sealed: nothing of the log can be trusted to be the session's.
+        let mut writer = SessionStore::at(store.dir().to_path_buf());
+        session.apply(&AgentEvent::ToolResult { id: "call-2".into(), output: "changed".into(), is_error: false });
+        turn(&mut session, "four", 100);
+        writer.save(&session).unwrap();
+        assert_eq!((sealed(&writer, &id), files(&writer, &id).1.len()), (0, 0));
+        assert_eq!(read_back(&writer, &id).unwrap(), session);
+        // From then on it knows, and seals again.
+        turn(&mut session, "five", 100);
+        writer.save(&session).unwrap();
+        assert_eq!(sealed(&writer, &id), 8);
+        assert_eq!(read_back(&writer, &id).unwrap(), session);
+
+        // So does one that let go of what it knew.
+        writer.forget(&id);
+        turn(&mut session, "six", 100);
+        writer.save(&session).unwrap();
+        assert_eq!((sealed(&writer, &id), files(&writer, &id).1.len()), (0, 0));
+        assert_eq!(read_back(&writer, &id).unwrap(), session);
+        fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    fn what_a_read_found_is_not_taken_once_the_files_changed() {
+        let mut writer = store("stale");
+        let mut session = Session::new("scout");
+        for prompt in ["one", "two", "three"] {
+            turn(&mut session, prompt, 100);
+            writer.save(&session).unwrap();
+        }
+        let id = session.id.clone();
+        // Read while a save was still waiting to be written: the files are not what was found.
+        let (mut stale, kept) = SessionStore::at(writer.dir().to_path_buf()).load_kept(&id).unwrap();
+        session.apply(&AgentEvent::ToolResult { id: "call-2".into(), output: "late".into(), is_error: false });
+        turn(&mut session, "four", 100);
+        writer.save(&session).unwrap();
+        turn(&mut session, "five", 100);
+        writer.save(&session).unwrap();
+        writer.forget(&id);
+        writer.adopt(&id, kept);
+        // Had it been taken, the turn would be added after lines of the log that are no longer there.
+        turn(&mut stale, "from what was read", 100);
+        writer.save(&stale).unwrap();
+        assert_eq!(sealed(&writer, &id), 0, "written whole");
+        assert_eq!(read_back(&writer, &id).unwrap(), stale);
+
+        // Nor is a missing session's, or one of another name.
+        let (_, kept) = SessionStore::at(writer.dir().to_path_buf()).load_kept(&id).unwrap();
+        writer.forget(&id);
+        writer.adopt("../etc", kept);
+        let (_, kept) = SessionStore::at(writer.dir().to_path_buf()).load_kept(&id).unwrap();
+        writer.adopt("missing", kept);
+        assert!(writer.written.is_empty());
+        fs::remove_dir_all(writer.dir()).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_session_removes_its_log_too() {
+        let mut store = store("delete-log");
+        let mut session = Session::new("scout");
+        for prompt in ["one", "two", "three"] {
+            turn(&mut session, prompt, 100);
+            store.save(&session).unwrap();
+        }
+        let (json, log) = store.paths(&session.id).unwrap();
+        assert!(json.exists() && log.exists());
+        // Its log is no session of its own: it is listed and found once.
+        assert_eq!(store.list().unwrap().0.len(), 1);
+        assert_eq!(store.search("done with one", 10).unwrap().len(), 1, "what the log holds is searched");
+        assert_eq!(store.all(), [session.clone()]);
+        store.delete(&session.id).unwrap();
+        assert!(!json.exists() && !log.exists() && store.written.is_empty());
+        assert!(store.list().unwrap().0.is_empty());
+        // Saved again after that, it is written whole: nothing of the files is remembered.
+        store.save(&session).unwrap();
+        assert_eq!(sealed(&store, &session.id), 0);
+        assert_eq!(read_back(&store, &session.id).unwrap(), session);
+        fs::remove_dir_all(store.dir()).unwrap();
+    }
+
+    #[test]
+    fn a_session_read_while_it_is_saved_is_one_that_was_saved() {
+        /// What the `number`th save adds: a turn, or a late answer to the first call, by turns.
+        fn change(session: &mut Session, number: u64) {
+            session.window = number;
+            if number % 2 == 1 {
+                let output = format!("answered at {number}");
+                session.apply(&AgentEvent::ToolResult { id: "call-0".into(), output, is_error: false });
+                return;
+            }
+            let (id, text) = (format!("call-{}", session.entries.len() / 2), format!("turn {number}"));
+            session.entries.push(Entry::User { text: text.clone(), note: String::new(), files: Vec::new() });
+            session.entries.push(Entry::from(Reply {
+                blocks: vec![Block::Tool(call(&id, 100, 2_000)), Block::Text { text }],
+                ..Reply::default()
+            }));
+        }
+        const SAVES: u64 = 120;
+        let mut writer = store("read-while-saved");
+        let reader = SessionStore::at(writer.dir().to_path_buf());
+        let mut session = Session::new("scout");
+        change(&mut session, 0);
+        writer.save(&session).unwrap();
+        let id = session.id.clone();
+        let done = std::sync::atomic::AtomicBool::new(false);
+        // Every other save cuts the log back to its first line and the next adds the lines again,
+        // the second of them changed: a reader that took its count from one save and its lines from
+        // another would hold a session that never was.
+        let read = std::thread::scope(|scope| {
+            let reading = scope.spawn(|| {
+                let (mut read, mut expected) = (0, Session::default());
+                while !done.load(Ordering::Relaxed) {
+                    // The writer swapping a file under the reader's hands may fail the read as a
+                    // whole; what does get read is what counts here.
+                    let Ok(loaded) = reader.load(&id) else { continue };
+                    if loaded.window < expected.window || expected.entries.is_empty() {
+                        expected = Session::default();
+                        change(&mut expected, 0);
+                    }
+                    for number in expected.window + 1..=loaded.window {
+                        change(&mut expected, number);
+                    }
+                    assert_eq!(loaded.entries, expected.entries, "as it was after save {}", loaded.window);
+                    read += 1;
+                }
+                read
+            });
+            for number in 1..=SAVES {
+                change(&mut session, number);
+                // Not asserted on: where the reader holds a file open, replacing it may be refused.
+                let _ = writer.save(&session);
+            }
+            done.store(true, Ordering::Relaxed);
+            reading.join().unwrap()
+        });
+        assert!(read > 0, "nothing was read");
+        writer.save(&session).unwrap();
+        assert_eq!(read_back(&writer, &id).unwrap(), session);
+        fs::remove_dir_all(writer.dir()).unwrap();
+    }
+
+    #[test]
+    fn a_copy_of_a_session_shares_its_replies_until_one_changes() {
+        let mut session = Session::new("scout");
+        for prompt in ["one", "two", "three"] {
+            turn(&mut session, prompt, 100);
+        }
+        let saved = session.clone();
+        let shared = |session: &Session| -> Vec<bool> {
+            session.entries.iter().zip(&saved.entries).map(|(now, then)| now.is(then)).collect()
+        };
+        assert!(shared(&session).iter().all(|same| *same));
+        // A result for a call two turns back: only the reply that holds the call becomes another.
+        session.apply(&AgentEvent::ToolResult { id: "call-2".into(), output: "late".into(), is_error: false });
+        assert_eq!(shared(&session), [true, false, true, true, true, true]);
+        assert!(session.find_tool("nowhere").is_none());
+        assert_eq!(shared(&session), [true, false, true, true, true, true], "looking changes nothing");
+        // Text goes to the last reply alone; what has nothing to forget is not touched.
+        session.apply(&AgentEvent::Text("More.".into()));
+        assert_eq!(shared(&session), [true, false, true, true, true, false]);
+        let before = session.clone();
+        session.apply(&AgentEvent::Blind);
+        assert!(session.entries.iter().zip(&before.entries).all(|(now, then)| now.is(then)), "no picture was shown");
+        // The copy still reads as it did when it was made.
+        let Entry::Reply(reply) = &saved.entries[1] else { panic!("a reply") };
+        assert!(matches!(&reply.blocks[0], Block::Tool(call) if call.output.as_deref() != Some("late")));
+        assert!(Entry::Summary { text: "a".into() }.is(&Entry::Summary { text: "a".into() }));
+        assert!(!Entry::from(Reply::default()).is(&Entry::from(Reply::default())), "equal, but not the same");
     }
 }
