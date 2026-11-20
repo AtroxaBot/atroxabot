@@ -71,6 +71,10 @@ pub(super) struct MenuState {
     /// What was typed to narrow the models, or to name one not listed.
     query: Editor,
     scroll: Scroll,
+    /// Whether the row `More models` is open: its choices are listed to its right.
+    flyout_open: bool,
+    /// How far those choices are scrolled.
+    flyout_scroll: Scroll,
 }
 
 /// One choice.
@@ -88,6 +92,8 @@ struct Item {
     inert: bool,
     /// Set apart from the choices above it by a line.
     apart: bool,
+    /// The choices a row opens to the right with (`More models`): none for a choice itself.
+    more: Vec<Item>,
     /// A switch, on or off, rather than a choice: the row wears one, and
     /// flipping it leaves the list open.
     switch: Option<bool>,
@@ -106,6 +112,8 @@ pub(super) struct ModelChoice {
     pub efforts: Vec<String>,
     /// The effort its provider says it thinks at unless told otherwise; empty when it does not say.
     pub usual: String,
+    /// An earlier version of a model that is listed too: offered under the current ones.
+    pub earlier: bool,
 }
 
 /// The efforts offered where a provider does not say which a model takes.
@@ -172,7 +180,15 @@ pub(super) fn effort_label(effort: &str) -> &str {
 impl Shell {
     /// Opens `menu` at the button `anchor`.
     pub(super) fn open_menu(&mut self, menu: Menu, anchor: Rect) {
-        self.menu = Some(MenuState { menu, anchor, rect: anchor, query: Editor::default(), scroll: Scroll::default() });
+        self.menu = Some(MenuState {
+            menu,
+            anchor,
+            rect: anchor,
+            query: Editor::default(),
+            scroll: Scroll::default(),
+            flyout_open: false,
+            flyout_scroll: Scroll::default(),
+        });
     }
 
     /// Opens `menu` at `anchor`, or closes it if it is the one open.
@@ -217,18 +233,22 @@ impl Shell {
     /// user's own picture of it (a file in the `icons` folder), or its
     /// platform's mark. Returns whether there was either.
     pub(super) fn provider_picture(&self, p: &mut Painter, connection: &Connection, rect: Rect) -> bool {
-        let key = icon_key(connection);
-        let Some(path) = self.icons.get(&key) else {
+        self.picture_of(p, &icon_key(connection), rect)
+    }
+
+    /// [`Shell::provider_picture`] for what is filed under `key` (`claude`, `codex`, …).
+    pub(super) fn picture_of(&self, p: &mut Painter, key: &str, rect: Rect) -> bool {
+        let Some(path) = self.icons.get(key) else {
             // A mark that is a picture sits on the badge the way an outline does, in its own colours.
-            if let Some(picture) = Picture::named(&key) {
+            if let Some(picture) = Picture::named(key) {
                 let t = p.theme;
                 p.bordered(rect, t.surface, rect.w * 0.28, 1.0, t.border);
                 p.mark(picture, (rect.x + rect.w * 0.5, rect.y + rect.h * 0.5), (rect.w * 0.6).round(), 1.0);
                 return true;
             }
-            let logo = Logo::named(&key);
+            let logo = Logo::named(key);
             if let Some(logo) = logo {
-                logo_badge(p, rect, logo, Self::provider_tint(connection));
+                logo_badge(p, rect, logo, theme::provider_color(key));
             }
             return logo.is_some();
         };
@@ -346,6 +366,7 @@ impl Shell {
                         detail: model.description.clone(),
                         efforts: model.efforts.clone(),
                         usual: model.default_effort.clone(),
+                        earlier: false,
                     };
                     (model.is_default, choice)
                 })
@@ -369,6 +390,7 @@ impl Shell {
                     efforts: levels(&model.id),
                     // It says the level in use of the model it picks by itself only.
                     usual: if model.id == catalog.model { catalog.effort.clone() } else { String::new() },
+                    earlier: false,
                 })
                 .collect();
             // What Antigravity's own picker lists, the model it picks by itself first.
@@ -377,9 +399,11 @@ impl Shell {
         }
         if connection.kind == ConnectionKind::ClaudeAgent {
             let Some(Account::Ready(info)) = self.claude.get(&connection.id) else { return Vec::new() };
-            // Aliases of one model (`default`, `opus`) are listed once: the first is the default.
-            // Of a family listed in several versions (Fable 5.1 beside 5.2), only the newest is offered.
-            let newer = |model: &atroxabot_core::ClaudeModel| {
+            // Every model Claude Code lists for the account. Aliases of one model (`default`, `opus`) are
+            // listed once: the first is the default. Of a family listed in several versions (Fable 5.1
+            // beside 5.2), the newest is among the current ones and the others follow them, family by
+            // family, newest first.
+            let earlier = |model: &atroxabot_core::ClaudeModel| {
                 let Some((family, version)) = model_parts(&model.resolved) else { return false };
                 let beats = |other: &atroxabot_core::ClaudeModel| {
                     model_parts(&other.resolved).is_some_and(|(theirs, newer)| theirs == family && newer > version)
@@ -388,10 +412,11 @@ impl Shell {
             };
             let mut seen: Vec<&str> = Vec::new();
             let mut choices = Vec::new();
+            // Where each earlier one goes: after the current ones, by its family's place among them.
+            let mut families: Vec<&str> = Vec::new();
+            let mut places: Vec<(bool, usize, Vec<u32>)> = Vec::new();
             for model in &info.models {
-                if newer(model) {
-                    continue;
-                }
+                let earlier = earlier(model);
                 if !model.resolved.is_empty() {
                     if seen.contains(&model.resolved.as_str()) {
                         continue;
@@ -405,15 +430,34 @@ impl Shell {
                     .unwrap_or_else(|| model.display_name.clone());
                 let detail =
                     if about.is_empty() || first == label { about.to_owned() } else { model.description.clone() };
+                let (family, version) = model_parts(&model.resolved).unwrap_or_default();
+                if !earlier && !family.is_empty() && !families.contains(&family) {
+                    families.push(family);
+                }
+                places.push((
+                    earlier,
+                    families.iter().position(|known| *known == family).unwrap_or(usize::MAX),
+                    version,
+                ));
                 choices.push(ModelChoice {
                     value: model.value.clone(),
                     label,
-                    detail,
+                    // What an earlier version is for is what its family's current one says.
+                    detail: if earlier { String::new() } else { detail },
                     efforts: model.efforts.clone(),
                     usual: String::new(),
+                    earlier,
                 });
             }
-            return choices;
+            // The current ones stay as Claude Code lists them.
+            let mut order: Vec<usize> = (0..choices.len()).collect();
+            order.sort_by(|a, b| {
+                let ((a_earlier, a_family, a_version), (b_earlier, b_family, b_version)) = (&places[*a], &places[*b]);
+                let earlier = a_earlier.cmp(b_earlier);
+                if *a_earlier { earlier.then(a_family.cmp(b_family)).then(b_version.cmp(a_version)) } else { earlier }
+            });
+            let mut choices: Vec<Option<ModelChoice>> = choices.into_iter().map(Some).collect();
+            return order.into_iter().filter_map(|at| choices.get_mut(at).and_then(Option::take)).collect();
         }
         let Some(Models::Ready(models)) = self.models.get(&connection.id) else { return Vec::new() };
         let mut choices: Vec<ModelChoice> = models
@@ -424,6 +468,7 @@ impl Shell {
                 detail: if model.name.is_empty() { String::new() } else { model.id.clone() },
                 efforts: model.reasoning_levels.clone(),
                 usual: String::new(),
+                earlier: false,
             })
             .collect();
         // The app's usual Claude model leads Anthropic's list, whatever its order.
@@ -491,17 +536,26 @@ impl Shell {
         let fits = |c: &ModelChoice| {
             needle.is_empty() || c.label.to_lowercase().contains(&needle) || c.value.to_lowercase().contains(&needle)
         };
-        let mut items: Vec<Item> = choices
-            .into_iter()
-            .filter(fits)
-            .map(|choice| Item {
-                selected: in_use == choice.value,
-                value: choice.value,
-                label: choice.label,
-                detail: choice.detail,
+        // Typed, the models that match are listed flat; otherwise the earlier versions wait under one row.
+        let flat = !needle.is_empty();
+        let (earlier, current): (Vec<ModelChoice>, Vec<ModelChoice>) =
+            choices.into_iter().filter(fits).partition(|choice| choice.earlier && !flat);
+        let item = |choice: ModelChoice| Item {
+            selected: in_use == choice.value,
+            value: choice.value,
+            label: choice.label,
+            detail: choice.detail,
+            ..Item::default()
+        };
+        let mut items: Vec<Item> = current.into_iter().map(item).collect();
+        if !earlier.is_empty() {
+            items.push(Item {
+                label: "More models".to_owned(),
+                selected: earlier.iter().any(|choice| choice.value == in_use),
+                more: earlier.into_iter().map(item).collect(),
                 ..Item::default()
-            })
-            .collect();
+            });
+        }
         if items.is_empty() && needle.is_empty() {
             let codex = self.codex.get(&connection.id).filter(|_| connection.kind == ConnectionKind::Codex);
             let antigravity =
@@ -777,6 +831,48 @@ impl Shell {
         }
     }
 
+    /// One row of a list, drawn in `row` within `within`: its mark, label and detail, and what it wears at its
+    /// right (a chevron for a row that opens more, a check for the choice in use, a switch). Returns whether
+    /// the mouse is on it.
+    fn draw_item(&self, p: &mut Painter, ui: &mut Ui, row: Rect, item: &Item, within: Rect) -> bool {
+        let t = p.theme;
+        let hovered = !item.inert && !ui.held && row.contains(ui.mouse) && within.contains(ui.mouse);
+        if hovered || item.selected {
+            p.rect(row, if hovered { t.hover } else { fade(t.hover, 0.6) }, theme::RADIUS_SM);
+        }
+        let mut left = row.x + 10.0;
+        let ink = if item.inert { t.text_faint } else { t.text_muted };
+        if let Some(provider) = &item.provider {
+            self.provider_mark(p, provider, (left + 8.0, row.y + row.h * 0.5), 16.0, ink);
+            left += 26.0;
+        } else if let Some(glyph) = item.glyph {
+            icon::draw(p, glyph, (left + 8.0, row.y + row.h * 0.5), 15.0, ink);
+            left += 26.0;
+        }
+        let room = row.right() - if item.switch.is_some() { 58.0 } else { 34.0 } - left;
+        let mut label = p.layout(&item.label, theme::SMALL, None);
+        label.truncate(p.fonts, room);
+        let color = if item.inert { t.text_faint } else { t.text };
+        if item.detail.is_empty() {
+            p.text(&label, left, row.y + (row.h - label.height()) * 0.5, color);
+        } else {
+            p.text(&label, left, row.y + 6.0, color);
+            let mut detail = p.layout(&item.detail, theme::TINY, None);
+            detail.truncate(p.fonts, room);
+            p.text(&detail, left, row.y + 25.0, t.text_faint);
+        }
+        if !item.more.is_empty() {
+            icon::draw(p, icon::CHEVRON_RIGHT, (row.right() - 16.0, row.y + row.h * 0.5), 14.0, t.text_muted);
+        } else if item.selected {
+            icon::draw(p, icon::CHECK, (row.right() - 16.0, row.y + row.h * 0.5), 14.0, t.text);
+        }
+        if let Some(on) = item.switch {
+            // The row is what is clicked; the switch only shows how it stands.
+            let _ = toggle(p, ui, (row.right() - 48.0, row.y + (row.h - 22.0) * 0.5), on, &item.value);
+        }
+        hovered
+    }
+
     /// Draws the open list over everything and handles its clicks.
     #[expect(clippy::many_single_char_names, reason = "p, t, x, y and w are the drawing code's names everywhere")]
     pub(super) fn draw_menu(&mut self, p: &mut Painter, ui: &mut Ui, actions: &mut Vec<Action>) {
@@ -784,8 +880,13 @@ impl Shell {
         let Some(state) = &self.menu else { return };
         let (menu, anchor) = (state.menu, state.anchor);
         let mut scroll = state.scroll;
+        let mut flyout_open = state.flyout_open;
+        let mut flyout_scroll = state.flyout_scroll;
+        let mut more_row: Option<Rect> = None;
+        let mut flyout_rect: Option<Rect> = None;
         let items = self.menu_items(menu, state.query.text());
-        let searchable = menu.typed() && (items.len() > 7 || !state.query.text().is_empty());
+        let listed: usize = items.iter().map(|item| 1 + item.more.len()).sum();
+        let searchable = menu.typed() && (listed > 7 || !state.query.text().is_empty());
         // The composer's model list also sets the effort, at its foot.
         let thinking = match (menu, self.agent_in_use()) {
             (Menu::Model, Some(agent)) => self.connection(&agent).map(|connection| {
@@ -856,48 +957,59 @@ impl Shell {
             if row.bottom() < list.y || row.y > list.bottom() {
                 continue;
             }
-            let hovered = !item.inert && !ui.held && row.contains(ui.mouse) && list.contains(ui.mouse);
-            if hovered || item.selected {
-                p.rect(row, if hovered { t.hover } else { fade(t.hover, 0.6) }, theme::RADIUS_SM);
+            if !item.more.is_empty() {
+                more_row = Some(row);
             }
-            let mut left = row.x + 10.0;
-            let ink = if item.inert { t.text_faint } else { t.text_muted };
-            if let Some(provider) = &item.provider {
-                self.provider_mark(p, provider, (left + 8.0, row.y + row.h * 0.5), 16.0, ink);
-                left += 26.0;
-            } else if let Some(glyph) = item.glyph {
-                icon::draw(p, glyph, (left + 8.0, row.y + row.h * 0.5), 15.0, ink);
-                left += 26.0;
-            }
-            let room = row.right() - if item.switch.is_some() { 58.0 } else { 34.0 } - left;
-            let mut label = p.layout(&item.label, theme::SMALL, None);
-            label.truncate(p.fonts, room);
-            let color = if item.inert { t.text_faint } else { t.text };
-            if item.detail.is_empty() {
-                p.text(&label, left, row.y + (row.h - label.height()) * 0.5, color);
-            } else {
-                p.text(&label, left, row.y + 6.0, color);
-                let mut detail = p.layout(&item.detail, theme::TINY, None);
-                detail.truncate(p.fonts, room);
-                p.text(&detail, left, row.y + 25.0, t.text_faint);
-            }
-            if item.selected {
-                icon::draw(p, icon::CHECK, (row.right() - 16.0, row.y + row.h * 0.5), 14.0, t.text);
-            }
-            if let Some(on) = item.switch {
-                // The row is what is clicked; the switch only shows how it stands.
-                let _ = toggle(p, ui, (row.right() - 48.0, row.y + (row.h - 22.0) * 0.5), on, &item.value);
-            }
+            let hovered = self.draw_item(p, ui, row, item, list);
             if hovered {
                 ui.cursor = CursorIcon::Pointer;
-                if ui.released {
+                if !item.more.is_empty() {
+                    flyout_open = true;
+                } else if ui.released {
                     picked = Some(item.value.clone());
                 }
             }
         }
         p.set_clip(clip);
         scroll.finish(ui, content, list.h);
+        p.set_clip(clip);
+        scroll.finish(ui, content, list.h);
         scroll.bar(p, ui, list, content);
+        // The earlier models open to the right of their `More models` row.
+        let group = items.iter().find(|item| !item.more.is_empty());
+        if let (true, Some(row), Some(group)) = (flyout_open, more_row, group) {
+            let listed_h: f32 = group.more.iter().map(row_h).sum();
+            let width = 280.0;
+            let height = (listed_h + 12.0).min(440.0).min(view.h - 24.0);
+            let fits_right = rect.right() + 6.0 + width <= view.right() - 12.0;
+            let x = if fits_right { rect.right() + 6.0 } else { rect.x - 6.0 - width };
+            let y = (row.y - 8.0).min(view.bottom() - height - 12.0).max(view.y + 12.0);
+            let fly = Rect::new(x, y, width, height);
+            flyout_rect = Some(fly);
+            p.shadow(Rect::new(fly.x, fly.y + 8.0, fly.w, fly.h), t.shadow, theme::RADIUS, 28.0);
+            p.bordered(fly, t.surface, theme::RADIUS, 1.0, t.border_strong);
+            let fly_list = Rect::new(fly.x, fly.y + 6.0, fly.w, fly.h - 12.0);
+            let offset = flyout_scroll.update(ui, fly.contains(ui.mouse));
+            let clip = p.push_clip(fly_list);
+            let mut y = fly_list.y - offset;
+            for choice in &group.more {
+                let h = row_h(choice);
+                let row = Rect::new(fly_list.x + 6.0, y, fly_list.w - 12.0, h - 2.0);
+                y += h;
+                if row.bottom() < fly_list.y || row.y > fly_list.bottom() {
+                    continue;
+                }
+                if self.draw_item(p, ui, row, choice, fly_list) {
+                    ui.cursor = CursorIcon::Pointer;
+                    if ui.released {
+                        picked = Some(choice.value.clone());
+                    }
+                }
+            }
+            p.set_clip(clip);
+            flyout_scroll.finish(ui, listed_h, fly_list.h);
+            flyout_scroll.bar(p, ui, fly_list, listed_h);
+        }
 
         // Effort: how hard the model thinks, as a row of pills under its list.
         let mut effort = None;
@@ -922,9 +1034,20 @@ impl Shell {
 
         // A click anywhere else puts it away.
         // Letting go of its scroll bar outside it keeps it open.
-        let outside = ui.released && !ui.held && !rect.contains(ui.mouse) && !anchor.contains(ui.mouse);
+        // The earlier models stay open while the mouse is on their row, on them, or on the way between.
+        let on_row = more_row.is_some_and(|row| row.contains(ui.mouse) && list.contains(ui.mouse));
+        let near = flyout_rect.is_some_and(|fly| Rect::new(fly.x - 8.0, fly.y, fly.w + 16.0, fly.h).contains(ui.mouse));
+        if !on_row && !near && !ui.held {
+            flyout_open = false;
+        }
+        let outside = ui.released
+            && !ui.held
+            && !rect.contains(ui.mouse)
+            && !anchor.contains(ui.mouse)
+            && !flyout_rect.is_some_and(|fly| fly.contains(ui.mouse));
         if let Some(state) = &mut self.menu {
             (state.rect, state.scroll) = (rect, scroll);
+            (state.flyout_open, state.flyout_scroll) = (flyout_open, flyout_scroll);
         }
         if let Some(level) = effort {
             // An effort is most often the only thing changed: picking one puts the list away.
@@ -955,7 +1078,11 @@ impl Shell {
             Key::Named(NamedKey::Escape) => self.menu = None,
             Key::Named(NamedKey::Enter) => {
                 let query = state.query.text().to_owned();
-                let first = self.menu_items(menu, &query).into_iter().find(|item| !item.inert).map(|item| item.value);
+                let first = self
+                    .menu_items(menu, &query)
+                    .into_iter()
+                    .find(|item| !item.inert && item.more.is_empty())
+                    .map(|item| item.value);
                 match first {
                     // With nothing typed, Enter just closes a list of models.
                     Some(value) if !query.trim().is_empty() || !menu.typed() => self.choose(menu, &value, actions),
@@ -1003,7 +1130,7 @@ pub(super) fn folder_name(folder: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-    use atroxabot_core::{Agent, ClaudeInfo, ClaudeModel, Config, Model};
+    use atroxabot_core::{Agent, AgentEvent, ClaudeInfo, ClaudeModel, Config, Model};
 
     use super::*;
 
@@ -1070,6 +1197,85 @@ mod tests {
         }
     }
 
+    /// What Claude Code 2.1.329 lists for an account with every model: its aliases, then full names.
+    fn every_model() -> Vec<ClaudeModel> {
+        let named = |id: &str, name: &str| claude(id, id, name);
+        vec![
+            claude("default", "claude-opus-5-5", "Opus 5.5 · Best for everyday, complex tasks"),
+            claude("opus", "claude-opus-5-5", "Opus 5.5 · For complex work and everyday tasks"),
+            claude("fable", "claude-fable-5-2", "Fable 5.2 · For your toughest challenges"),
+            claude("sonnet", "claude-sonnet-5-5", "Sonnet 5.5 · Most efficient for simpler tasks"),
+            claude("haiku", "claude-haiku-5-5", "Haiku 5.5 · Fastest for quick answers"),
+            named("claude-fable-5-1", "Fable 5.1 · Most capable for your hardest and longest-running tasks"),
+            named("claude-haiku-4-5-20251001", "Haiku 4.5 · Fastest for quick answers"),
+            named("claude-sonnet-5", "Sonnet 5 · Efficient for routine tasks"),
+            named("claude-opus-5", "Opus 5 · Best for everyday, complex tasks"),
+            named("claude-fable-5", "Fable 5 · Most capable for your hardest and longest-running tasks"),
+            named("claude-opus-4-8", "Opus 4.8 · Best for everyday, complex tasks"),
+            named("claude-opus-4-7", "Opus 4.7 · Best for everyday, complex tasks"),
+            named("claude-opus-4-6", "Opus 4.6 · Best for everyday, complex tasks"),
+            named("claude-sonnet-4-6", "Sonnet 4.6 · Efficient for routine tasks"),
+            named("claude-mythos-5-2", ""),
+            named("claude-mythos-5-1", ""),
+        ]
+    }
+
+    /// Claude Code was asked when the app started and listed five models; the session that starts later
+    /// is told of all of them, and the menu offers every one: the current ones as Claude Code orders
+    /// them, then the earlier versions under a More models row, family by family.
+    #[test]
+    fn every_model_claude_code_lists_is_offered_and_a_session_brings_the_list_up_to_date() {
+        let mut shell = Shell::new(Config::default(), vec![Agent::new("Scout")], Vec::new());
+        let own = Connection::claude_agent();
+        let mut info = ClaudeInfo { models: every_model()[..5].to_vec(), ..ClaudeInfo::default() };
+        info.account.email = "me@example.com".into();
+        shell.claude_info(&own.id, Ok(info));
+        let names = |shell: &Shell| -> Vec<String> {
+            shell.model_choices(&own).into_iter().map(|choice| choice.label).collect()
+        };
+        assert_eq!(names(&shell), ["Opus 5.5", "Fable 5.2", "Sonnet 5.5", "Haiku 5.5"]);
+
+        let mut actions = Vec::new();
+        shell.send("Hello", false, Vec::new(), &mut actions);
+        let session = shell.current.clone().expect("a session");
+        let offer = AgentEvent::Offer { models: every_model(), version: "2.1.329".into() };
+        shell.agent_event(&session, offer, &mut actions);
+        let current = ["Opus 5.5", "Fable 5.2", "Sonnet 5.5", "Haiku 5.5", "Mythos 5.2"];
+        let earlier = [
+            "Opus 5",
+            "Opus 4.8",
+            "Opus 4.7",
+            "Opus 4.6",
+            "Fable 5.1",
+            "Fable 5",
+            "Sonnet 5",
+            "Sonnet 4.6",
+            "Haiku 4.5",
+            "Mythos 5.1",
+        ];
+        assert_eq!(names(&shell), [&current[..], &earlier[..]].concat());
+        assert_eq!(shell.tool(super::super::Cli::Claude), super::super::tools::Tool::Installed("2.1.329".into()));
+        // The earlier ones wait under one row, which lists them when it is opened.
+        let items = shell.model_items(&own, "", "");
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(labels, ["Opus 5.5", "Fable 5.2", "Sonnet 5.5", "Haiku 5.5", "Mythos 5.2", "More models"]);
+        let more: Vec<&str> = items[5].more.iter().map(|item| item.label.as_str()).collect();
+        assert_eq!(more, earlier);
+        assert!(items[5].more.iter().all(|item| item.detail.is_empty()) && !items[1].detail.is_empty());
+        // Searching for one of them finds it.
+        let found = shell.model_items(&own, "", "4.8");
+        assert!(matches!(&found[..], [_typed, item] if item.value == "claude-opus-4-8"));
+        // Typed, every match is listed flat, the earlier versions too.
+        let flat: Vec<String> = shell.model_items(&own, "", "fable").into_iter().map(|item| item.label).collect();
+        assert_eq!(flat, ["Fable 5.2", "Fable 5.1", "Fable 5"]);
+        // An earlier one is chosen by its full name, which is what Claude Code takes.
+        shell.choose(Menu::Model, "claude-mythos-5-1", &mut actions);
+        assert_eq!(shell.model_in_use(&own, "claude-mythos-5-1").label, "Mythos 5.1");
+        // A list that came empty (a process that said nothing of its models) changes nothing.
+        shell.agent_event(&session, AgentEvent::Offer { models: Vec::new(), version: String::new() }, &mut actions);
+        assert_eq!(names(&shell).len(), 15);
+    }
+
     #[test]
     fn claude_models_come_from_claude_code_with_the_default_first() {
         let agent = Agent::new("Scout");
@@ -1088,8 +1294,9 @@ mod tests {
         };
         shell.claude_info(&own.id, Ok(info));
         let choices = shell.model_choices(&own);
-        let names: Vec<&str> = choices.iter().map(|c| c.label.as_str()).collect();
-        assert_eq!(names, ["Opus 5.5", "Fable 5.2"], "aliases once, and only the newest of a family");
+        let names: Vec<(&str, bool)> = choices.iter().map(|c| (c.label.as_str(), c.earlier)).collect();
+        let listed = [("Opus 5.5", false), ("Fable 5.2", false), ("Fable 5.1", true)];
+        assert_eq!(names, listed, "aliases once, and an earlier version after the current ones");
         assert_eq!(shell.model_in_use(&own, "").label, "Opus 5.5", "no choice means the default, by its name");
         let items = shell.model_items(&own, "", "");
         assert!(items[0].selected && !items[1].selected, "the default is the one in use");

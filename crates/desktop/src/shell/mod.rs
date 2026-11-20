@@ -28,6 +28,7 @@ mod snapshot;
 mod spotlight;
 mod stats;
 mod thread;
+mod tools;
 mod update;
 mod warm;
 mod widgets;
@@ -222,6 +223,10 @@ pub struct Shell {
     antigravity_asked: HashSet<String>,
     /// The tools whose installer was opened and that have not been found since.
     installing: HashSet<Cli>,
+    /// Whether each tool was on disk when last looked for (`tools.rs`): what says so without an account.
+    found: HashMap<Cli, bool>,
+    /// The tools whose updater was opened: their accounts are asked again when the user comes back.
+    updated: HashSet<Cli>,
     /// Problems to tell the user about, oldest first.
     notices: Vec<Notice>,
     /// Warnings from the agents' processes already told this run: each process says them again as it starts.
@@ -303,6 +308,8 @@ impl Shell {
             antigravity: HashMap::new(),
             antigravity_asked: HashSet::new(),
             installing: HashSet::new(),
+            found: HashMap::new(),
+            updated: HashSet::new(),
             notices: Vec::new(),
             warned: HashSet::new(),
             call: None,
@@ -335,6 +342,8 @@ impl Shell {
     /// every Claude account; call once after `new`.
     pub fn start(&mut self, actions: &mut Vec<Action>) {
         self.skills.start(atroxabot_core::skills::Job::Load, actions);
+        // Which of the accounts' tools are installed, for the ones no account speaks for.
+        actions.push(Action::FindTools);
         for connection in self.config.all_connections() {
             self.probe(&connection, actions);
         }
@@ -410,17 +419,25 @@ impl Shell {
         matches!(self.antigravity.get(connection), Some(AntigravityAccount::Ready(info)) if info.signed_in)
     }
 
-    /// How the Codex or Antigravity account `connection` stands.
+    /// How the account `connection` (of Claude, Codex or Antigravity) stands.
     pub(super) fn standing(&self, connection: &Connection) -> Standing {
-        let (answered, missing) = if connection.kind == ConnectionKind::Antigravity {
+        let (answered, missing) = match connection.kind {
             // One that is signed out says so; one that could not be asked (it crashed, or took too
             // long) is not offered a sign-in for it.
-            let state = self.antigravity.get(&connection.id);
-            (matches!(state, Some(AntigravityAccount::Ready(_))), matches!(state, Some(AntigravityAccount::Missing)))
-        } else {
-            let state = self.codex.get(&connection.id);
-            let answered = matches!(state, Some(CodexAccount::Ready(_) | CodexAccount::Failed(_)));
-            (answered, matches!(state, Some(CodexAccount::Missing)))
+            ConnectionKind::Antigravity => {
+                let state = self.antigravity.get(&connection.id);
+                let answered = matches!(state, Some(AntigravityAccount::Ready(_)));
+                (answered, matches!(state, Some(AntigravityAccount::Missing)))
+            }
+            ConnectionKind::ClaudeAgent => {
+                let state = self.claude.get(&connection.id);
+                (matches!(state, Some(Account::Ready(_) | Account::Failed(_))), matches!(state, Some(Account::Missing)))
+            }
+            _ => {
+                let state = self.codex.get(&connection.id);
+                let answered = matches!(state, Some(CodexAccount::Ready(_) | CodexAccount::Failed(_)));
+                (answered, matches!(state, Some(CodexAccount::Missing)))
+            }
         };
         match (self.signed_in(connection), answered, missing) {
             (true, ..) => Standing::SignedIn,
@@ -430,30 +447,45 @@ impl Shell {
         }
     }
 
-    /// Asks the tool of the Codex or Antigravity account `connection` about it anew, as the refresh
-    /// icon on its row does.
+    /// Asks the tool of the account `connection` about it anew, as the refresh icon on its row does.
     pub(super) fn read_anew(&mut self, connection: &Connection, actions: &mut Vec<Action>) {
-        if connection.kind == ConnectionKind::Antigravity {
-            self.antigravity.insert(connection.id.clone(), AntigravityAccount::Checking);
-            self.ask_antigravity(connection, true, actions);
-        } else {
-            self.codex.insert(connection.id.clone(), CodexAccount::Checking);
-            actions.push(Action::ProbeCodex(Box::new(connection.clone())));
+        match connection.kind {
+            ConnectionKind::Antigravity => {
+                self.antigravity.insert(connection.id.clone(), AntigravityAccount::Checking);
+                self.ask_antigravity(connection, true, actions);
+            }
+            ConnectionKind::Codex => {
+                self.codex.insert(connection.id.clone(), CodexAccount::Checking);
+                actions.push(Action::ProbeCodex(Box::new(connection.clone())));
+            }
+            ConnectionKind::ClaudeAgent => {
+                self.claude.insert(connection.id.clone(), Account::Checking);
+                actions.push(Action::ProbeClaude(Box::new(connection.clone())));
+            }
+            ConnectionKind::ClaudeApi | ConnectionKind::OpenAi => {}
         }
     }
 
-    /// The Codex or Antigravity account `connection` was just added and its sign-in opened: it is
-    /// asked about when the user comes back to the window ([`Shell::focused`]).
+    /// The account `connection` was just added and its sign-in opened: it is asked about when the
+    /// user comes back to the window ([`Shell::focused`]).
     pub(super) fn signing_in(&mut self, connection: &Connection) {
-        if connection.kind == ConnectionKind::Antigravity {
-            self.antigravity.insert(connection.id.clone(), AntigravityAccount::Checking);
-        } else {
-            self.codex.insert(connection.id.clone(), CodexAccount::Checking);
+        match connection.kind {
+            ConnectionKind::Antigravity => {
+                self.antigravity.insert(connection.id.clone(), AntigravityAccount::Checking);
+            }
+            ConnectionKind::Codex => {
+                self.codex.insert(connection.id.clone(), CodexAccount::Checking);
+            }
+            ConnectionKind::ClaudeAgent => {
+                self.claude.insert(connection.id.clone(), Account::Checking);
+            }
+            ConnectionKind::ClaudeApi | ConnectionKind::OpenAi => {}
         }
     }
 
-    /// The Codex or Antigravity account `connection` left the list.
+    /// The account `connection` left the list.
     pub(super) fn forget_account(&mut self, connection: &str) {
+        self.claude.remove(connection);
         self.codex.remove(connection);
         self.antigravity.remove(connection);
         self.antigravity_asked.remove(connection);
@@ -533,14 +565,20 @@ impl Shell {
         }
         // A connector may have been added on claude.ai meanwhile: the MCP settings ask again.
         self.connectors.retain(|_, connectors| matches!(connectors, Connectors::Loading));
+        // A tool may have been installed meanwhile, by the installer opened here or by hand.
+        actions.push(Action::FindTools);
+        // One whose updater was opened says its version anew, signed in or not.
+        let updated = std::mem::take(&mut self.updated);
         for connection in self.config.all_connections() {
             let signed_in =
                 matches!(self.claude.get(&connection.id), Some(Account::Ready(info)) if !info.account.email.is_empty());
             let checking = matches!(self.claude.get(&connection.id), Some(Account::Checking));
-            if connection.kind == ConnectionKind::ClaudeAgent && !signed_in && !checking {
-                actions.push(Action::ProbeClaude(Box::new(connection)));
+            if connection.kind == ConnectionKind::ClaudeAgent {
+                if (!signed_in || updated.contains(&Cli::Claude)) && !checking {
+                    actions.push(Action::ProbeClaude(Box::new(connection)));
+                }
             } else if connection.kind == ConnectionKind::Codex
-                && !self.codex_signed_in(&connection.id)
+                && (!self.codex_signed_in(&connection.id) || updated.contains(&Cli::Codex))
                 && !matches!(self.codex.get(&connection.id), Some(CodexAccount::Checking))
             {
                 actions.push(Action::ProbeCodex(Box::new(connection)));
@@ -1360,6 +1398,19 @@ impl Shell {
             AgentEvent::Queued(count) => thread.more = count,
             AgentEvent::Background { id, what, ended } => thread.background_task(id, what, ended),
             AgentEvent::Commands(commands) => thread.commands = Some(commands),
+            // Claude Code's list of models changes while the app runs (it fetches more of them after it
+            // starts, and updates itself): the newest word on an account's is its latest session's.
+            AgentEvent::Offer { models, version } => {
+                let account = thread.session.account.clone();
+                if let Some(Account::Ready(known)) = self.claude.get_mut(&account)
+                    && !models.is_empty()
+                {
+                    known.models = models;
+                    if !version.is_empty() {
+                        known.version = version;
+                    }
+                }
+            }
             // Only between turns: one that started since makes it stale.
             AgentEvent::Suggestion(text) if suggesting && !thread.busy => thread.suggestion = Some(text),
             AgentEvent::TurnEnded { problem } => {

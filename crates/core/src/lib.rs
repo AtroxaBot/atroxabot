@@ -60,11 +60,12 @@ pub use atroxabot_codex::{
 };
 pub use claude::{
     CLAUDE_INSTALL, ClaudeAgent, PlanCheck, TerminalCommand, claude_connectors, claude_info, claude_install,
-    claude_login, claude_usage, find_claude,
+    claude_login, claude_update, claude_usage, find_claude,
 };
 pub use client::{Client, Model};
 pub use codex::{
-    CODEX_INSTALL, CodexAgent, codex_info, codex_install, codex_limits, codex_login, codex_mcp_config, find_codex,
+    CODEX_INSTALL, CodexAgent, codex_info, codex_install, codex_limits, codex_login, codex_mcp_config, codex_update,
+    find_codex,
 };
 pub use config::{Config, Connection, ConnectionKind, McpServer, VoiceSettings, lock_instance};
 pub use engine::{AgentEvent, ApiEngine, Ask, Control, DISMISSED, FollowUp, Inbox, LimitWindow, Limits, Verdict};

@@ -86,6 +86,31 @@ fn snapshots() {
         };
         let mut model = shell();
         model.open_menu(Menu::Model, Rect::new(474.0, 836.0, 150.0, 30.0));
+        // An account with every model: the current ones, then the earlier versions under a line.
+        let every_models = || {
+            let mut models = shell();
+            let mut every = claude("me@example.com", "Claude Max");
+            let named = |id: &str, description: &str| ClaudeModel {
+                value: id.into(),
+                resolved: id.into(),
+                description: description.into(),
+                efforts: ["low", "medium", "high", "xhigh", "max"].map(str::to_owned).into(),
+                ..ClaudeModel::default()
+            };
+            every.models.extend([
+                named("claude-fable-5-1", "Fable 5.1 · Most capable"),
+                named("claude-haiku-4-5-20251001", "Haiku 4.5 · Fastest for quick answers"),
+                named("claude-sonnet-5", "Sonnet 5 · Efficient for routine tasks"),
+                named("claude-opus-5", "Opus 5 · Best for everyday, complex tasks"),
+                named("claude-opus-4-8", "Opus 4.8 · Best for everyday, complex tasks"),
+                named("claude-sonnet-4-6", "Sonnet 4.6 · Efficient for routine tasks"),
+                named("claude-mythos-5-2", ""),
+                named("claude-mythos-5-1", ""),
+            ]);
+            models.claude_info(Connection::CLAUDE_AGENT, Ok(every));
+            models.open_menu(Menu::Model, Rect::new(474.0, 836.0, 150.0, 30.0));
+            models
+        };
         let mut folder = shell();
         folder.open_menu(Menu::Folder, Rect::new(1254.0, 47.0, 98.0, 30.0));
         let mut provider = shell();
@@ -489,6 +514,22 @@ fn snapshots() {
             shell.modal = Some(Modal::Settings(Box::new(settings)));
             shell
         };
+        // Only Claude Code installed, and no account of Codex or Antigravity: their installers are offered, and
+        // nothing can be added to them yet.
+        let fresh = |tab: Tab| {
+            let mut shell = settings(tab);
+            shell.config.connections.retain(|account| account.kind == ConnectionKind::ClaudeAgent);
+            for account in ["codex", "agy"] {
+                shell.forget_account(account);
+            }
+            shell.tools_found([(Cli::Claude, true), (Cli::Codex, false), (Cli::Antigravity, false)], &mut Vec::new());
+            shell
+        };
+        // Codex installed and without an account: which one to add, the terminal's or one kept apart.
+        let mut pick = adding(Tab::Providers, Adding::PickAccount(ConnectionKind::Codex));
+        pick.config.connections.retain(|account| account.kind != ConnectionKind::Codex);
+        pick.forget_account("codex");
+        pick.tools_found([(Cli::Claude, true), (Cli::Codex, true), (Cli::Antigravity, true)], &mut Vec::new());
         // The skills: two installed (one with an update), Anthropic's repository read, another being read.
         let skilled = |open: Option<usize>| {
             let mut shell = shell();
@@ -733,6 +774,7 @@ fn snapshots() {
             ("approval", approval("")),
             ("approval-reason", approval("Only the parser crate: the rest takes ten minutes")),
             ("menu-model", model),
+            ("menu-model-every", every_models()),
             ("menu-folder", folder),
             ("menu-provider", provider),
             ("spotlight", spotlight),
@@ -781,12 +823,15 @@ fn snapshots() {
             ("skills-repository", skilled(Some(0))),
             ("add-provider", adding(Tab::Providers, Adding::PickProvider)),
             ("add-provider-key", adding(Tab::Providers, Adding::Provider(1))),
-            ("add-account", adding(Tab::Providers, Adding::ClaudeAccount)),
-            ("add-codex-account", adding(Tab::Providers, Adding::CodexAccount)),
+            ("add-account", adding(Tab::Providers, Adding::Account(ConnectionKind::ClaudeAgent))),
+            ("add-codex-account", adding(Tab::Providers, Adding::Account(ConnectionKind::Codex))),
+            ("add-account-pick", pick),
+            ("settings-providers-fresh", fresh(Tab::Providers)),
+            ("settings-general-fresh", foot(fresh(Tab::General))),
             // The foot of the providers: the Antigravity accounts, as they are, while one is added and without
             // Antigravity installed.
             ("settings-providers-end", foot(settings(Tab::Providers))),
-            ("add-antigravity-account", foot(adding(Tab::Providers, Adding::AntigravityAccount))),
+            ("add-antigravity-account", foot(adding(Tab::Providers, Adding::Account(ConnectionKind::Antigravity)))),
             ("settings-providers-end-missing", foot(uninstalled(Tab::Providers))),
             ("settings-worktrees", worktrees),
             ("menu-folder-worktree", worktree_menu),
@@ -801,6 +846,7 @@ fn snapshots() {
         ];
         // Tooltips: the mouse rests on a row of the side panel (which starts at x 1112).
         let hovered = [
+            ("menu-model-more", every_models(), (640.0, 726.0)),
             ("tip-task", tasks(), (1200.0, 313.0)),
             ("tip-context", context, (1180.0, 90.0)),
             ("stop-subagent", stoppable(), (1200.0, STOP_ROWS.0)),

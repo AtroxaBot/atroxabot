@@ -190,6 +190,8 @@ pub enum WorkerEvent {
     Problem(String),
     /// Whether the system asks for less motion ([`platform::reduce_motion`]).
     Motion(bool),
+    /// Which of the accounts' tools are on disk.
+    Tools([(Cli, bool); 3]),
     /// The tray icon was clicked, or another start of the app asks for the window.
     Tray(TrayEvent),
     /// What looking for an update or downloading one came to, or how far a download is.
@@ -306,6 +308,10 @@ pub enum Action {
     AntigravityLogin(Box<Connection>),
     /// Open the maker's own installer of Claude Code, Codex or Antigravity, in a terminal.
     Install(Cli),
+    /// Have Claude Code or Codex update itself, with its own command, in a terminal.
+    UpdateTool(Cli),
+    /// Look on disk for Claude Code, Codex and Antigravity.
+    FindTools,
     /// Search every session's messages.
     Search {
         /// The text to find.
@@ -988,6 +994,7 @@ impl App {
             }
             WorkerEvent::Problem(text) => self.shell.notify(text),
             WorkerEvent::Motion(still) => self.ui.still = still,
+            WorkerEvent::Tools(found) => self.shell.tools_found(found, &mut actions),
         }
         self.apply(actions);
         self.window.request_redraw();
@@ -1164,6 +1171,27 @@ impl App {
                     Err(e) => self.shell.notify(format!("The installer could not be opened: {e}")),
                 }
             }
+            Action::UpdateTool(cli) => {
+                // The tool's own command, in a terminal the user sees: the app only starts it. Google
+                // documents none for Antigravity, so nothing offers it.
+                let updater = match cli {
+                    Cli::Claude => atroxabot_core::claude_update().map(|update| ("Update Claude Code", update)),
+                    Cli::Codex => atroxabot_core::codex_update().map(|update| ("Update Codex", update)),
+                    Cli::Antigravity => None,
+                };
+                match updater.map(|(title, update)| in_terminal(title, &update)) {
+                    Some(Ok(())) => self.shell.updating(cli),
+                    Some(Err(e)) => self.shell.notify(format!("The update could not be opened: {e}")),
+                    None => {}
+                }
+            }
+            Action::FindTools => self.spawn(|| {
+                WorkerEvent::Tools([
+                    (Cli::Claude, atroxabot_core::find_claude().is_some()),
+                    (Cli::Codex, atroxabot_core::find_codex().is_some()),
+                    (Cli::Antigravity, atroxabot_core::find_antigravity().is_some()),
+                ])
+            }),
             Action::Search { query, generation } => {
                 if let Some(store) = self.sessions_dir.clone().map(SessionStore::at) {
                     self.spawn(move || WorkerEvent::SearchResults {

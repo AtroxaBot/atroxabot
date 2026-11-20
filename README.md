@@ -129,11 +129,23 @@ your computer; it does not include its own copy, and it never signs you in itsel
 [Claude accounts and Anthropic's terms](#claude-accounts-and-anthropics-terms)). Without Claude Code,
 everything else works: API providers, Codex and Antigravity work as usual.
 
-While Claude Code is missing, Settings, Providers (and Settings, General) show **Install**. It opens a
-terminal running Anthropic's own installer, which downloads Claude Code from Anthropic, checks it and puts
-it in place; you watch it there, and answer it if it asks anything. The account says *Installing* until
-then. Come back to AtroxaBot's settings and it finds Claude Code by itself; the account then offers
-**Sign in**. Codex has the same button, with OpenAI's own installer, and Antigravity with Google's.
+While Claude Code is missing, Settings, Providers shows one row for it over the Claude accounts, with
+**Install** (Settings, General has the same row under *On this computer*). It opens a terminal running
+Anthropic's own installer, which downloads Claude Code from Anthropic, checks it and puts it in place; you
+watch it there, and answer it if it asks anything. The row says *Installing* until then. Come back to
+AtroxaBot's settings and it finds Claude Code by itself; the account then offers **Sign in**. Codex has the
+same row, with OpenAI's own installer, and Antigravity with Google's. Nothing can be added to a tool that
+is not installed: its **Add account** shows once it is. A tool you installed from here and that has no
+account yet gets the one it has in your terminal, so that signing in is all that is left.
+
+**Add account** asks which one, when there is something to choose: *The one in your terminal* (whoever
+`claude`, `codex` or `agy` is signed in as there, with its settings) or *A separate account*, which only
+needs a name and then opens the tool's own sign-in.
+
+**Updating a tool** is in Settings, General, *On this computer*: each tool is listed there with its
+version. *Update* opens a terminal running the tool's own command: `claude update` for Claude Code (which
+also updates itself in the background) and `codex update` for Codex. Antigravity has no such button:
+Google documents no command that updates it. AtroxaBot never updates a tool by itself.
 
 <details>
 <summary><b>Installing Claude Code, Codex or Antigravity by hand</b></summary>
@@ -390,8 +402,9 @@ Each session has its own provider, model and effort.
   what `/model` set in it). The effort always goes along, also one you never picked yourself. A message after the switch goes
   to a Claude Code started for the new account, even if the old one was still answering.
 - **Models from the provider.** The model menu under the message box lists what the provider offers: a
-  Claude account's list comes from Claude Code (so it is always current; of a family in several versions
-  only the newest shows), a Codex account's from Codex (each with its efforts and the effort Codex gives
+  Claude account's list comes from Claude Code: every model it lists for the account, the current ones
+  first and the earlier versions of a family under *More models*, which opens them to its right (asked when the app starts, and told anew by
+  each session as it starts, since Claude Code's list changes while the app runs), a Codex account's from Codex (each with its efforts and the effort Codex gives
   it by default), an Antigravity account's from Antigravity (as it was last asked: the refresh icon in
   Settings, Providers asks again), an API provider's from its `/models`. The provider's default is used until you pick
   another, and any model id can be typed.
@@ -647,7 +660,9 @@ is written to keep them there:
   patch or wrap it.
 - **Installing** is Anthropic's own installer, as its setup page gives it (`irm https://claude.ai/install.ps1 | iex`
   on Windows, `curl -fsSL https://claude.ai/install.sh | bash` elsewhere), started by *Install* in a
-  terminal you see. The app never downloads, unpacks or places Claude Code itself.
+  terminal you see. The app never downloads, unpacks or places Claude Code itself. **Updating** is Claude
+  Code's own `claude update`, which Anthropic's setup page gives for not waiting until it updates itself,
+  started by *Update* the same way.
 - AtroxaBot **never handles your sign-in**. It offers no Claude sign-in of its own and never reads, stores
   or forwards Claude credentials or tokens. *Sign in* opens Claude Code's own `claude auth login` in a
   terminal, which signs you in through Anthropic's flow. Usage is billed to the account you sign in to,
@@ -658,7 +673,7 @@ is written to keep them there:
   already have. An added account starts without your skills, plugins and settings (install them in it by
   running `claude` with its `CLAUDE_CONFIG_DIR`); the skills in Settings, Skills reach every account
   without that. If you would rather have every account explicit, take "Claude" off the list in Settings;
-  it can be put back there. AtroxaBot only tells Claude Code which folder to use; what is in it is Claude
+  *Add account* puts it back. AtroxaBot only tells Claude Code which folder to use; what is in it is Claude
   Code's.
 - The account's email and plan shown in Settings, the model list, the commands and skills, and the plan's
   usage limits are what Claude Code itself reports.
@@ -728,6 +743,8 @@ A Codex account is the Codex CLI you installed, used the way OpenAI documents fo
 - **Installing** is OpenAI's own installer (`irm https://chatgpt.com/codex/install.ps1 | iex` on Windows,
   `curl -fsSL https://chatgpt.com/codex/install.sh | sh` elsewhere), started by *Install* in a terminal
   you see. No account's `CODEX_HOME` goes with it, and the app never downloads or places Codex itself.
+  **Updating** is Codex's own `codex update`, started by *Update* the same way; whether it can put a newer
+  release in place depends on how Codex was installed, which it says there.
 - AtroxaBot **never handles your sign-in**. *Sign in* opens Codex's own `codex login` in a terminal; the
   app never asks the app server to sign in, never reads or stores Codex's credentials, and refuses when
   Codex asks a client for tokens. Usage is billed to the account you sign in to.
@@ -769,7 +786,8 @@ the terms name suspension of the account as what a breach costs.**
   the app does not say it is one of them, so it is offered what any client is: the Gemini models.
 - **Installing** is Google's own installer (`irm https://antigravity.google/cli/install.ps1 | iex` on
   Windows, `curl -fsSL https://antigravity.google/cli/install.sh | bash` elsewhere), started by *Install*
-  in a terminal you see. The app never downloads or places Antigravity itself.
+  in a terminal you see. The app never downloads or places Antigravity itself, and offers no update for
+  it: Google documents no command that updates it.
 - **Signing in** is Antigravity's own. *Sign in* opens its `agy acp --login` in a terminal. A session
   that Antigravity tells it needs a sign-in asks it to use the one it has (the protocol's `authenticate`,
   with `oauth-personal`, which is what Google's page on `agy acp` has a client do): signed in, nothing

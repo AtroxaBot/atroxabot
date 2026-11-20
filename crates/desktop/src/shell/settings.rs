@@ -16,8 +16,9 @@ use winit::window::CursorIcon;
 
 use super::menu::Menu;
 use super::skills::SkillsPage;
+use super::tools::Tool;
 use super::widgets::{Scroll, chip, dropdown, line_field, logo_badge, modal, row, tile, toggle};
-use super::{Account, Cli, Connectors, Shell, Standing};
+use super::{Cli, Connectors, Shell, Standing};
 use crate::app::Action;
 use crate::editor::Editor;
 use crate::form::Fields;
@@ -87,31 +88,19 @@ const CUSTOM: usize = PRESETS.len() - 1;
 const VOICE_PROVIDERS: [(&str, &str, &str); 2] =
     [("fish", "Fish Audio", "Expressive voices and clones"), ("elevenlabs", "ElevenLabs", "Fast, natural voices")];
 
-/// What the settings say under the Codex accounts.
-const CODEX_NOTE: &str = "A Codex account is the Codex CLI installed here, run as it is, with its own tools, sandbox \
-                          and approvals, on your ChatGPT plan or API key. Without it, Install opens OpenAI's own \
-                          installer in a terminal. Each account you add has a Codex home of its own, with its own \
-                          sign-in, settings and conversations. Signing in opens Codex in a terminal; AtroxaBot never \
-                          sees your credentials.";
-
-/// What the settings say under the Antigravity accounts.
-const ANTIGRAVITY_NOTE: &str = "An Antigravity account is the Antigravity CLI (agy) installed here, run as it is, \
-                                with its own tools and models, on your Google account's plan. Without it, Install \
-                                opens Google's own installer in a terminal. Each account you add has a folder of its \
-                                own, with its own sign-in, settings and conversations. Signing in opens Antigravity \
-                                in a terminal; AtroxaBot never sees your credentials. Antigravity takes up to a \
-                                minute to start, so the first message of a session does too.";
+/// What the settings say under the accounts: the one thing no control says.
+const ACCOUNTS_NOTE: &str = "An account runs the tool you installed, as it is, on your own plan. Signing in opens \
+                             it in a terminal: AtroxaBot never sees your credentials.";
 
 /// What is being added, if anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Adding {
     Nothing,
-    /// A Claude account: it only needs a name.
-    ClaudeAccount,
-    /// A Codex account: it only needs a name.
-    CodexAccount,
-    /// An Antigravity account: it only needs a name.
-    AntigravityAccount,
+    /// An account of this kind (Claude, Codex or Antigravity): which one is being chosen, the one
+    /// in the user's terminal or one kept apart.
+    PickAccount(ConnectionKind),
+    /// An account of this kind, kept apart: it only needs a name.
+    Account(ConnectionKind),
     /// An API provider: which one is being chosen.
     PickProvider,
     /// The API provider with this preset: its key (and, for a custom one, its name and address).
@@ -194,9 +183,7 @@ impl Settings {
     /// The fields on screen now, in order: Tab moves among these.
     fn visible(&self) -> Vec<usize> {
         match (self.tab, self.adding) {
-            (Tab::Providers, Adding::ClaudeAccount | Adding::CodexAccount | Adding::AntigravityAccount) => {
-                vec![NAME]
-            }
+            (Tab::Providers, Adding::Account(_)) => vec![NAME],
             (Tab::Providers, Adding::Provider(CUSTOM)) => vec![NAME, URL, KEY],
             (Tab::Providers, Adding::Provider(_)) | (Tab::Voice, Adding::Voice(_)) => vec![KEY],
             (Tab::Integrations, Adding::Mcp(_)) => vec![NAME, URL, VARS],
@@ -525,32 +512,10 @@ impl Settings {
         p.label("On this computer", theme::LABEL, x, y, t.text);
         y += 30.0;
         y = super::update::draw(p, ui, (x, y, w), shell, actions) + 8.0;
-        let installed = shell.claude.values().find_map(|account| match account {
-            Account::Ready(info) => Some(format!("Claude Code {}", info.version)),
-            _ => None,
-        });
-        let missing = installed.is_none() && shell.claude.values().any(|account| matches!(account, Account::Missing));
-        let (title, about) = match (installed, missing) {
-            (Some(version), _) => (version, "Claude accounts run the Claude Code installed here, as it is."),
-            (None, true) if shell.is_installing(Cli::Claude) => (
-                "Installing Claude Code".to_owned(),
-                "Finish in the installer's window. This updates when you come back.",
-            ),
-            (None, true) => (
-                "Claude Code is not installed".to_owned(),
-                "Install it to use Claude accounts. API providers work without it.",
-            ),
-            (None, false) => ("Looking for Claude Code…".to_owned(), ""),
-        };
-        let claude = Rect::new(x, y, w, 58.0);
-        let room = if missing { 130.0 } else { 0.0 };
-        row(p, claude, (icon::SPARKLES, theme::provider_color("claude")), &title, about, room);
-        logo_badge(p, Rect::new(x + 12.0, y + 12.0, 34.0, 34.0), Logo::Claude, theme::provider_color("claude"));
-        let install = Rect::new(claude.right() - 122.0, claude.y + 13.0, 110.0, 32.0);
-        if missing && button(p, ui, install, "Install", ButtonStyle::Secondary, true) {
-            actions.push(Action::Install(Cli::Claude));
+        // What the accounts run, as installed here: each with what installs or updates it.
+        for cli in Cli::ALL {
+            y = shell.tool_row(p, ui, (x, y, w), (cli, false), actions);
         }
-        y += 66.0;
         let data = Rect::new(x, y, w, 58.0);
         row(
             p,
@@ -573,47 +538,53 @@ impl Settings {
         y + 58.0
     }
 
-    /// The accounts of Codex or of Antigravity (`kind`): each the command-line
-    /// agent the user installed, signed in to one account. Returns where what
-    /// follows starts, and whether the settings changed.
-    fn cli_accounts(
+    /// The accounts of Claude, Codex or Antigravity (`cli`): each the
+    /// command-line agent the user installed, signed in to one account.
+    /// While the tool is missing, its row offers its maker's installer and
+    /// nothing can be added. Returns where what follows starts, and whether
+    /// the settings changed.
+    fn accounts(
         &mut self,
         p: &mut Painter,
         ui: &mut Ui,
         (x, mut y, w): (f32, f32, f32),
-        kind: ConnectionKind,
+        cli: Cli,
         shell: &mut Shell,
         actions: &mut Vec<Action>,
     ) -> (f32, bool) {
         let t = p.theme;
-        let antigravity = kind == ConnectionKind::Antigravity;
-        let tool = kind.label();
-        let (cli, adding, command, note) = if antigravity {
-            (Cli::Antigravity, Adding::AntigravityAccount, "agy", ANTIGRAVITY_NOTE)
-        } else {
-            (Cli::Codex, Adding::CodexAccount, "codex", CODEX_NOTE)
-        };
+        let (kind, family) = (cli.kind(), cli.family());
+        let tool = shell.tool(cli);
+        let installed = matches!(tool, Tool::Installed(_));
+        let adding = matches!(self.adding, Adding::PickAccount(of) | Adding::Account(of) if of == kind);
         let sign_in = |account: &Connection| {
             let account = Box::new(account.clone());
-            if antigravity { Action::AntigravityLogin(account) } else { Action::CodexLogin(account) }
+            match kind {
+                ConnectionKind::ClaudeAgent => Action::ClaudeLogin(account),
+                ConnectionKind::Antigravity => Action::AntigravityLogin(account),
+                _ => Action::CodexLogin(account),
+            }
         };
-        if Self::heading(p, ui, (x, y, w), &format!("{tool} accounts"), Some("Add account")) {
-            self.add(adding);
+        let offer = (installed && !adding).then_some("Add account");
+        if Self::heading(p, ui, (x, y, w), &format!("{family} accounts"), offer) {
+            // With the one in the terminal on the list already, there is nothing to choose.
+            self.add(if shell.has_own_account(kind) { Adding::Account(kind) } else { Adding::PickAccount(kind) });
         }
         y += 40.0;
+        if tool == Tool::Missing {
+            y = shell.tool_row(p, ui, (x, y, w), (cli, true), actions);
+        }
         let (mut changed, mut remove) = (false, None);
-        let accounts: Vec<Connection> = shell.config.connections.iter().filter(|c| c.kind == kind).cloned().collect();
+        let accounts: Vec<Connection> =
+            shell.config.all_connections().into_iter().filter(|account| account.kind == kind).collect();
         for account in &accounts {
             let rect = Rect::new(x, y, w, 58.0);
             let title = if self.is_renaming(&account.id) { "" } else { account.name.as_str() };
-            row(
-                p,
-                rect,
-                (icon::TERMINAL, Shell::provider_tint(account)),
-                title,
-                &shell.provider_detail(account),
-                190.0,
-            );
+            let mark = (Shell::provider_glyph(account), Shell::provider_tint(account));
+            // Without its tool, the row over the accounts says what is the matter: here, only that it is.
+            let detail =
+                if tool == Tool::Missing { "Not installed".to_owned() } else { shell.provider_detail(account) };
+            row(p, rect, mark, title, &detail, 190.0);
             if let Some(name) = self.name_field(p, ui, rect, (&account.id, &account.name), 190.0) {
                 shell.config.rename_connection(&account.id, &name);
                 changed = true;
@@ -628,73 +599,88 @@ impl Settings {
             if icon_button(p, ui, Rect::new(right, rect.y + 15.0, 28.0, 28.0), icon::REFRESH, true) {
                 shell.read_anew(account, actions);
             }
-            let act = Rect::new(right - 92.0, rect.y + 13.0, 84.0, 32.0);
             match shell.standing(account) {
                 Standing::SignedIn => icon::draw(p, icon::CHECK, (right - 16.0, rect.y + 29.0), 15.0, t.text_muted),
                 Standing::SignedOut => {
+                    let act = Rect::new(right - 92.0, rect.y + 13.0, 84.0, 32.0);
                     if button(p, ui, act, "Sign in", ButtonStyle::Primary, true) {
                         actions.push(sign_in(account));
                     }
                 }
-                // Its maker's own installer; once the tool is found, the account signs in.
-                Standing::Missing => {
-                    if button(p, ui, act, "Install", ButtonStyle::Primary, true) {
-                        actions.push(Action::Install(cli));
-                    }
-                }
-                Standing::Unknown => {}
+                // The tool's own row, over the accounts, installs it.
+                Standing::Missing | Standing::Unknown => {}
             }
             y += 66.0;
         }
         if let Some(id) = remove {
             // Its folder, and so its sign-in, stays where it is: the account only leaves the list.
+            shell.config.hide_claude_agent |= id == Connection::CLAUDE_AGENT;
             shell.config.connections.retain(|c| c.id != id);
             shell.forget_account(&id);
             changed = true;
         }
-        if accounts.iter().all(|account| !account.config_dir.is_empty()) {
-            // The one the user already has, as they use it in their terminal.
-            let rect = Rect::new(x, y, w, 58.0);
-            let about = format!("Whoever `{command}` is signed in as in your terminal, with its settings.");
-            row(p, rect, (icon::TERMINAL, None), &format!("{tool}'s own sign-in"), &about, 100.0);
-            let add = Rect::new(rect.right() - 92.0, rect.y + 13.0, 80.0, 32.0);
-            if button(p, ui, add, "Use it", ButtonStyle::Secondary, true) {
-                let account = if antigravity { Connection::antigravity(tool) } else { Connection::codex(tool) };
-                shell.read_anew(&account, actions);
-                shell.config.connections.push(account);
-                changed = true;
-            }
+        if installed && accounts.is_empty() && !adding {
+            let empty = Rect::new(x, y, w, 58.0);
+            p.bordered(empty, fade(t.surface, 0.5), theme::RADIUS, 1.0, t.border);
+            p.label_centered(&format!("No {family} account yet."), theme::SMALL, empty, t.text_faint);
             y += 66.0;
         }
-        if self.adding == adding {
-            let card = Rect::new(x, y, w, 108.0);
-            p.bordered(card, t.surface, theme::RADIUS, 1.0, t.border_focus);
-            p.label("A name for the account", theme::CAPTION, card.x + 16.0, card.y + 14.0, t.text_muted);
-            let field = Rect::new(card.x + 16.0, card.y + 38.0, card.w - 32.0 - 250.0, 42.0);
-            self.field(p, ui, NAME, field, "Work, Personal …");
-            let name = self.fields.text(NAME).trim().to_owned();
-            let cancel = Rect::new(card.right() - 242.0, card.y + 38.0, 84.0, 42.0);
-            if button(p, ui, cancel, "Cancel", ButtonStyle::Ghost, true) {
-                self.add(Adding::Nothing);
-            }
-            let add = Rect::new(card.right() - 150.0, card.y + 38.0, 134.0, 42.0);
-            if button(p, ui, add, "Add and sign in", ButtonStyle::Primary, !name.is_empty()) {
-                let made =
-                    if antigravity { Connection::antigravity_account(&name) } else { Connection::codex_account(&name) };
-                match made {
-                    Ok(account) => {
-                        shell.signing_in(&account);
-                        actions.push(sign_in(&account));
-                        shell.config.connections.push(account);
-                        changed = true;
-                    }
-                    Err(e) => shell.notify(format!("The account could not be added: {e}")),
+        match self.adding {
+            // Which one: the account the tool has in the user's terminal, or one kept apart.
+            Adding::PickAccount(of) if of == kind => {
+                let tile_w = (w - 10.0) * 0.5;
+                let about = format!("Whoever `{}` is signed in as there, with its settings.", cli.command());
+                let own = Rect::new(x, y, tile_w, 98.0);
+                if tile(p, ui, own, (icon::TERMINAL, None), "The one in your terminal", &about) {
+                    shell.add_own_account(kind, actions);
+                    changed = true;
+                    self.add(Adding::Nothing);
                 }
-                self.add(Adding::Nothing);
+                let apart = Rect::new(x + tile_w + 10.0, y, tile_w, 98.0);
+                let about = "A sign-in, settings and history of its own.";
+                if tile(p, ui, apart, (icon::PLUS, None), "A separate account", about) {
+                    self.add(Adding::Account(kind));
+                }
+                y += 108.0;
+                if button(p, ui, Rect::new(x, y, 84.0, 34.0), "Cancel", ButtonStyle::Ghost, true) {
+                    self.add(Adding::Nothing);
+                }
+                y += 42.0;
             }
-            y += 116.0;
+            Adding::Account(of) if of == kind => {
+                let card = Rect::new(x, y, w, 108.0);
+                p.bordered(card, t.surface, theme::RADIUS, 1.0, t.border_focus);
+                p.label("A name for the account", theme::CAPTION, card.x + 16.0, card.y + 14.0, t.text_muted);
+                let field = Rect::new(card.x + 16.0, card.y + 38.0, card.w - 32.0 - 250.0, 42.0);
+                self.field(p, ui, NAME, field, "Work, Personal …");
+                let name = self.fields.text(NAME).trim().to_owned();
+                let cancel = Rect::new(card.right() - 242.0, card.y + 38.0, 84.0, 42.0);
+                if button(p, ui, cancel, "Cancel", ButtonStyle::Ghost, true) {
+                    self.add(Adding::Nothing);
+                }
+                let add = Rect::new(card.right() - 150.0, card.y + 38.0, 134.0, 42.0);
+                if button(p, ui, add, "Add and sign in", ButtonStyle::Primary, !name.is_empty()) {
+                    let made = match kind {
+                        ConnectionKind::ClaudeAgent => Connection::claude_account(&name),
+                        ConnectionKind::Antigravity => Connection::antigravity_account(&name),
+                        _ => Connection::codex_account(&name),
+                    };
+                    match made {
+                        Ok(account) => {
+                            shell.signing_in(&account);
+                            actions.push(sign_in(&account));
+                            shell.config.connections.push(account);
+                            changed = true;
+                        }
+                        Err(e) => shell.notify(format!("The account could not be added: {e}")),
+                    }
+                    self.add(Adding::Nothing);
+                }
+                y += 116.0;
+            }
+            _ => {}
         }
-        (Self::note(p, (x, y + 2.0, w), note) + 30.0, changed)
+        (y + 20.0, changed)
     }
 
     fn providers(
@@ -720,133 +706,13 @@ impl Settings {
         }
         y += 58.0 + 34.0;
 
-        // Claude accounts: each a Claude Code profile of its own.
-        if Self::heading(p, ui, (x, y, w), "Claude accounts", Some("Add account")) {
-            self.add(Adding::ClaudeAccount);
-        }
-        y += 40.0;
-        let mut remove = None;
-        let accounts: Vec<Connection> =
-            shell.config.all_connections().into_iter().filter(|c| c.kind == ConnectionKind::ClaudeAgent).collect();
-        for account in &accounts {
-            let rect = Rect::new(x, y, w, 58.0);
-            let state = shell.claude.get(&account.id);
-            let signed_in = matches!(state, Some(Account::Ready(info)) if !info.account.email.is_empty());
-            let can_sign_in = matches!(state, Some(Account::Ready(_) | Account::Failed(_)));
-            let missing = matches!(state, Some(Account::Missing));
-            let mark = (icon::SPARKLES, Shell::provider_tint(account));
-            let title = if self.is_renaming(&account.id) { "" } else { account.name.as_str() };
-            row(p, rect, mark, title, &shell.provider_detail(account), 190.0);
-            if let Some(name) = self.name_field(p, ui, rect, (&account.id, &account.name), 190.0) {
-                shell.config.rename_connection(&account.id, &name);
-                changed = true;
-            }
-            shell.provider_picture(p, account, Rect::new(rect.x + 12.0, rect.y + 12.0, 34.0, 34.0));
-            let mut right = rect.right() - 12.0;
-            right -= 28.0;
-            if icon_button(p, ui, Rect::new(right, rect.y + 15.0, 28.0, 28.0), icon::TRASH, true) {
-                remove = Some(account.id.clone());
-            }
-            right -= 30.0;
-            if icon_button(p, ui, Rect::new(right, rect.y + 15.0, 28.0, 28.0), icon::REFRESH, true) {
-                shell.claude.insert(account.id.clone(), Account::Checking);
-                actions.push(Action::ProbeClaude(Box::new(account.clone())));
-            }
-            if signed_in {
-                icon::draw(p, icon::CHECK, (right - 16.0, rect.y + 29.0), 15.0, t.text_muted);
-            } else if can_sign_in {
-                let sign_in = Rect::new(right - 92.0, rect.y + 13.0, 84.0, 32.0);
-                if button(p, ui, sign_in, "Sign in", ButtonStyle::Primary, true) {
-                    actions.push(Action::ClaudeLogin(Box::new(account.clone())));
-                }
-            } else if missing {
-                // Anthropic's own installer; once Claude Code is found, the account signs in.
-                let install = Rect::new(right - 92.0, rect.y + 13.0, 84.0, 32.0);
-                if button(p, ui, install, "Install", ButtonStyle::Primary, true) {
-                    actions.push(Action::Install(Cli::Claude));
-                }
-            }
-            y += 66.0;
-        }
-        if let Some(id) = remove {
-            // Claude Code's own sign-in is not the app's to delete: it only leaves the list.
-            shell.config.hide_claude_agent |= id == Connection::CLAUDE_AGENT;
-            shell.config.connections.retain(|c| c.id != id);
-            shell.claude.remove(&id);
-            changed = true;
-        }
-        if shell.config.hide_claude_agent {
-            // Off the list, it can be put back.
-            let rect = Rect::new(x, y, w, 58.0);
-            let about = "Whoever `claude` is signed in as in your terminal, with its skills, plugins and settings.";
-            row(p, rect, (icon::TERMINAL, None), "Claude Code's own sign-in", about, 100.0);
-            if button(
-                p,
-                ui,
-                Rect::new(rect.right() - 92.0, rect.y + 13.0, 80.0, 32.0),
-                "Use it",
-                ButtonStyle::Secondary,
-                true,
-            ) {
-                shell.config.hide_claude_agent = false;
-                if let Some(account) = shell.config.connection(Connection::CLAUDE_AGENT) {
-                    shell.claude.insert(account.id.clone(), Account::Checking);
-                    actions.push(Action::ProbeClaude(Box::new(account)));
-                }
-                changed = true;
-            }
-            y += 66.0;
-        }
-        if self.adding == Adding::ClaudeAccount {
-            let card = Rect::new(x, y, w, 108.0);
-            p.bordered(card, t.surface, theme::RADIUS, 1.0, t.border_focus);
-            p.label("A name for the account", theme::CAPTION, card.x + 16.0, card.y + 14.0, t.text_muted);
-            self.field(
-                p,
-                ui,
-                NAME,
-                Rect::new(card.x + 16.0, card.y + 38.0, card.w - 32.0 - 250.0, 42.0),
-                "Work, Personal …",
-            );
-            let name = self.fields.text(NAME).trim().to_owned();
-            if button(
-                p,
-                ui,
-                Rect::new(card.right() - 242.0, card.y + 38.0, 84.0, 42.0),
-                "Cancel",
-                ButtonStyle::Ghost,
-                true,
-            ) {
-                self.add(Adding::Nothing);
-            }
-            let add = Rect::new(card.right() - 150.0, card.y + 38.0, 134.0, 42.0);
-            if button(p, ui, add, "Add and sign in", ButtonStyle::Primary, !name.is_empty()) {
-                match Connection::claude_account(&name) {
-                    Ok(account) => {
-                        shell.claude.insert(account.id.clone(), Account::Checking);
-                        actions.push(Action::ClaudeLogin(Box::new(account.clone())));
-                        shell.config.connections.push(account);
-                        changed = true;
-                    }
-                    Err(e) => shell.notify(format!("The account could not be added: {e}")),
-                }
-                self.add(Adding::Nothing);
-            }
-            y += 116.0;
-        }
-        let note = "\"Claude\" is Claude Code as you use it in your terminal: whoever `claude` is signed in as there, \
-                    with the skills, plugins and settings you have there. Each account you add is a Claude Code \
-                    profile of its own, with its own sign-in, settings and history, and starts without those. \
-                    Without Claude Code, Install opens Anthropic's own installer in a terminal. Signing in opens \
-                    Claude Code in a terminal; AtroxaBot never sees your credentials, and usage is billed to the \
-                    account you sign in to.";
-        y = Self::note(p, (x, y + 2.0, w), note) + 30.0;
-
-        for kind in [ConnectionKind::Codex, ConnectionKind::Antigravity] {
-            let (next, touched) = self.cli_accounts(p, ui, (x, y, w), kind, shell, actions);
+        // The accounts: Claude's, Codex's and Antigravity's, each run by the tool installed here.
+        for cli in Cli::ALL {
+            let (next, touched) = self.accounts(p, ui, (x, y, w), cli, shell, actions);
             y = next;
             changed |= touched;
         }
+        y = Self::note(p, (x, y - 12.0, w), ACCOUNTS_NOTE) + 30.0;
 
         // API providers.
         let adding_provider = matches!(self.adding, Adding::PickProvider | Adding::Provider(_));
