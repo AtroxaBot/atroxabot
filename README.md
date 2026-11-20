@@ -937,6 +937,12 @@ the Visual C++ Redistributable.
 To look at the design without opening the app, draw every screen offscreen in every theme:
 `ATROXABOT_SNAPSHOTS=<folder> cargo test -p atroxabot snapshots -- --ignored`.
 
+To measure what a frame costs (the time to build it, what it allocates, how many times over it covers the
+window, what the GPU needs for it) in a short session, a day's and one of tens of megabytes:
+`cargo test --release -p atroxabot costs -- --ignored --nocapture --test-threads=1` (`shell/perf.rs`). What a
+save writes is measured by `cargo test --release -p atroxabot-core saving_a_turn_writes_only_the_turn --
+--ignored --nocapture`.
+
 ### Layout
 
 | Crate | Purpose |
@@ -977,8 +983,16 @@ and an API session the same way.
 macOS bundle's `Info.plist`, the Linux launcher entry and `install.sh`, the release key's public half
 (`update-key.pub`), `release.sh` (makes a version) and `manifest.sh` (signs a release).
 
-The app redraws only when something changes. A working agent's glowing face is drawn at 60 frames a second
-or a little more, on whole refreshes of the screen, not at every refresh of a fast one; and a window that
+The app redraws only when something changes. A working agent's glowing face is drawn at 30 frames a second
+or a little more, on whole refreshes of the screen, not at every refresh of a fast one, and what agents say
+asks for a frame at 60 a second (30 for a session that is not the one shown), not for one at every arrival;
+what scrolls or eases is drawn at every refresh. A frame costs what is on screen, not what the session holds:
+of a conversation only the entries in view are worked on, the others are their measured height
+(`shell/thread.rs`), and what is summed up from a session (its task list, what it used) is worked out when it
+changes. A long conversation is measured a little a frame after it opens, and a session that is not looked
+at, with no process and nothing waiting, gives its messages back after half an hour (`shell/warm.rs`);
+opening it reads them again. The window is cleared to its own colour, every quad is cut to its clip before
+it is shaded, and a large surface's shadow is drawn only where it shows (`Painter::shadow_under`). A window that
 cannot be seen (minimised, in the tray, or covered where the platform says so) is not drawn at all. A window
 without the keyboard is drawn for whoever may be watching it, not working in it (`sight.rs`): at most thirty
 times a second while the mouse is elsewhere, and, on Windows, which goes on composing a window that lies

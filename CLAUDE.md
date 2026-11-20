@@ -64,7 +64,16 @@ cargo fmt --all --check
   frameworks (egui, iced, Tauri, …).
 - **Beautiful, elegant and fast.** Redraw only when something changes, do minimal work per frame, and keep
   the single-pipeline, single-draw-call renderer (`gpu.rs` + `shader.wgsl`). New visual effects go into
-  that pipeline as new quad kinds, never as extra passes.
+  that pipeline as new quad kinds, never as extra passes. **A frame costs what is on screen, never what the
+  session holds**: nothing reads, parses, sums or copies a whole session per frame or per event. Of a
+  conversation only the entries in view are worked on (`Thread::draw_main`, `Seen`); what a row shows is
+  read from its tool call once (`Thread::row`); what is summed up from a session is worked out when it
+  changes (`Thread::todos`, `Thread::total`). A copy of a session copies pointers (`Entry::Reply` is an
+  `Arc`: change a reply through `Arc::make_mut`, and only the one that changes), and a save adds the turn to
+  the session's files (`core/src/session.rs`, whose module comment is the rule book). A shadow under
+  something opaque is `Painter::shadow_under`. Measure, don't guess: `cargo test --release -p atroxabot costs
+  -- --ignored --nocapture --test-threads=1` (`shell/perf.rs`) says what a frame costs; run it before and
+  after touching what is drawn every frame.
 - **Cross-platform:** Windows, macOS and Linux.
 - **Dependencies are costly.** Add one only if it is truly required and can't reasonably be written by
   hand, with a `# why:` comment. No `thiserror` (write error types by hand: `Display` +
