@@ -59,6 +59,8 @@ pub enum GpuError {
     Device(wgpu::RequestDeviceError),
     /// The surface reports no usable texture format.
     NoSurfaceFormat,
+    /// The driver refused to set the surface up for the window.
+    Configure(String),
 }
 
 impl fmt::Display for GpuError {
@@ -68,6 +70,7 @@ impl fmt::Display for GpuError {
             Self::Adapter(e) => write!(f, "no compatible GPU adapter: {e}"),
             Self::Device(e) => write!(f, "cannot open the GPU device: {e}"),
             Self::NoSurfaceFormat => f.write_str("the window surface supports no texture formats"),
+            Self::Configure(e) => write!(f, "cannot set up the window surface: {e}"),
         }
     }
 }
@@ -78,7 +81,7 @@ impl std::error::Error for GpuError {
             Self::Surface(e) => Some(e),
             Self::Adapter(e) => Some(e),
             Self::Device(e) => Some(e),
-            Self::NoSurfaceFormat => None,
+            Self::NoSurfaceFormat | Self::Configure(_) => None,
         }
     }
 }
@@ -195,7 +198,11 @@ impl Renderer {
             alpha_mode: caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto),
             view_formats: Vec::new(),
         };
-        surface.configure(&device, &config);
+        // Drawing on a surface that was never set up is fatal in wgpu: a refusal fails here instead, and
+        // the caller tries again later (after a driver reset the window may not take a new swapchain yet).
+        if let Some(error) = configure(&surface, &device, &config) {
+            return Err(GpuError::Configure(error.to_string()));
+        }
         let draw = Draw::new(&device, format);
         Ok(Self { surface, device, queue, config, draw, lost, resized: false, hidden: false, retried: false })
     }
@@ -236,8 +243,13 @@ impl Renderer {
         if self.is_lost() || self.hidden {
             return Frame::Skipped;
         }
-        if std::mem::take(&mut self.resized) {
-            self.surface.configure(&self.device, &self.config);
+        if std::mem::take(&mut self.resized)
+            && let Some(error) = configure(&self.surface, &self.device, &self.config)
+        {
+            // Refused for this size: the next frame tries again.
+            crate::log::error(format!("cannot set up the window surface: {error}"));
+            self.resized = true;
+            return Frame::Skipped;
         }
         self.draw.upload(&self.queue, glyphs, images);
         let frame = match self.surface.get_current_texture() {
@@ -266,6 +278,18 @@ impl Renderer {
         self.retried = false;
         Frame::Drawn
     }
+}
+
+/// Sets `surface` up for `device` with `config`, and gives the driver's
+/// refusal, if any, rather than leaving it to the uncaptured-error handler.
+fn configure(
+    surface: &wgpu::Surface,
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> Option<wgpu::Error> {
+    let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+    surface.configure(device, config);
+    crate::app::block_on(scope.pop())
 }
 
 impl Draw {

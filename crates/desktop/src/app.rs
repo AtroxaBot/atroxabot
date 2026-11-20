@@ -379,7 +379,9 @@ pub struct App {
     window: Arc<Window>,
     /// For creating the renderer again after the GPU was lost.
     display: winit::event_loop::OwnedDisplayHandle,
-    renderer: Renderer,
+    /// `None` between a lost GPU's renderer and its successor: the old one
+    /// lets go of the window before the new one takes it.
+    renderer: Option<Renderer>,
     /// When to try again to bring back a lost GPU.
     gpu_retry: Option<Instant>,
     /// When to draw again: after a frame that could not be shown, or the next frame of a working agent's face.
@@ -548,7 +550,7 @@ impl App {
         let mut app = Self {
             window,
             display,
-            renderer,
+            renderer: Some(renderer),
             gpu_retry: None,
             redraw_at: None,
             refresh,
@@ -674,7 +676,9 @@ impl App {
                 return;
             }
             WindowEvent::Resized(size) => {
-                self.renderer.resize(size.width, size.height);
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.resize(size.width, size.height);
+                }
                 self.refresh = refresh_rate(&self.window);
                 self.window.request_redraw();
             }
@@ -1461,14 +1465,16 @@ impl App {
         if self.gpu_retry.is_some_and(|at| at > Instant::now()) {
             return;
         }
+        // The lost one goes first: a window takes one swapchain at a time, and the new one's would be refused.
+        self.renderer = None;
         match block_on(Renderer::new(Arc::clone(&self.window), self.display.clone())) {
-            Ok(renderer) => {
-                self.renderer = renderer;
+            Ok(mut renderer) => {
                 self.atlas.clear();
                 self.images = ImageAtlas::default();
                 self.gpu_retry = None;
                 let size = self.window.inner_size();
-                self.renderer.resize(size.width, size.height);
+                renderer.resize(size.width, size.height);
+                self.renderer = Some(renderer);
             }
             Err(e) => {
                 log::error(format!("cannot restore the GPU: {e}"));
@@ -1479,7 +1485,7 @@ impl App {
 
     /// Builds and presents one frame.
     fn frame(&mut self) {
-        if self.renderer.is_lost() {
+        if self.renderer.as_ref().is_none_or(Renderer::is_lost) {
             self.recover_gpu();
         }
         self.redraw_at = None;
@@ -1542,13 +1548,15 @@ impl App {
             Some(Command::Close) => self.closing = true,
             None => {}
         }
-        let drawn = self.renderer.render(
-            &self.instances,
-            &mut self.atlas.uploads,
-            &mut self.images.uploads,
-            scale,
-            self.palette.panel,
-        );
+        let drawn = self.renderer.as_mut().map_or(Frame::Skipped, |renderer| {
+            renderer.render(
+                &self.instances,
+                &mut self.atlas.uploads,
+                &mut self.images.uploads,
+                scale,
+                self.palette.panel,
+            )
+        });
         self.ui.end();
         if drawn == Frame::Retry {
             // The surface was set up again: draw this frame onto it.
@@ -1613,7 +1621,7 @@ impl App {
     /// Whether the window cannot be seen: minimised, in the tray, or (where the platform says) covered.
     /// The first frame is drawn regardless: it is what shows the window.
     fn unseen(&self) -> bool {
-        self.shown && (self.hidden || self.occluded || self.renderer.is_hidden())
+        self.shown && (self.hidden || self.occluded || self.renderer.as_ref().is_some_and(Renderer::is_hidden))
     }
 
     /// How long the event loop may sleep: until the caret blinks next, a
