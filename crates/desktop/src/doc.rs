@@ -896,6 +896,9 @@ impl Builder<'_> {
         if h > 0.0 {
             h += BLOCK_GAP;
         }
+        // A window shrunk to almost nothing leaves less than no room (its margins are wider than it):
+        // a picture is then a pixel wide, never a width that does not exist.
+        let width = width.max(1.0);
         // Each picture's own size (one whose header says none, as a large photograph), and the most
         // it is shown at: no larger than it is, nor than a thumbnail is decoded at.
         let most = MAX_THUMB as f32 / self.scale;
@@ -1344,6 +1347,9 @@ mod tests {
         let narrow = Doc::markdown_in(&fonts, "![](icon/256.png)\n![](icon/64.png)", (230.0, 1.0), 0, &folder, None);
         let shown: Vec<(f32, f32)> = narrow.decos.iter().map(|piece| (piece.y, piece.x)).collect();
         assert_eq!(shown, [(0.0, 0.0), (224.0 + PICTURE_GAP, 0.0)]);
+        // A column with less than no room (a window shrunk past its margins) still lays them out.
+        let none = Doc::markdown_in(&fonts, "![](icon/256.png)\n![](icon/64.png)", (-8.0, 1.0), 0, &folder, None);
+        assert!(none.decos.iter().all(|piece| matches!(piece.deco, Deco::Picture { w, .. } if w >= 1.0)));
         // Without a folder, a relative path finds nothing.
         assert!(doc("![](icon/256.png)").decos.is_empty());
     }
