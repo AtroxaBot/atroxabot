@@ -547,9 +547,12 @@ const CLAUDE_TOOLS: &str = "\n\n# Your tools\n\n\
     messages from the user. A message introduced as one \"the user sent while you were working\" is the user's: \
     take it into account and carry on with your task.";
 
-/// A count of tokens, short: `840`, `39.6k`, `1.2M`.
+/// A count of tokens, short: `840`, `39.6k`, `1.2M`, `1.5B`.
 fn compact(count: u64) -> String {
-    if count >= 1_000_000 {
+    // A unit is taken once the count rounds to a thousand of the one below, so 999,960 is "1.0M", never "1000.0k".
+    if count >= 999_950_000 {
+        format!("{:.1}B", count as f64 / 1e9)
+    } else if count >= 999_950 {
         format!("{:.1}M", count as f64 / 1e6)
     } else if count >= 1_000 {
         format!("{:.1}k", count as f64 / 1e3)

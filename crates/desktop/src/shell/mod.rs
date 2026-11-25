@@ -2274,9 +2274,12 @@ fn until(now: u64, then: u64) -> String {
     }
 }
 
-/// A count of tokens, short: "840", "12.4k", "3.1M".
+/// A count of tokens, short: "840", "12.4k", "3.1M", "1.5B".
 fn compact(count: u64) -> String {
-    if count >= 1_000_000 {
+    // A unit is taken once the count rounds to a thousand of the one below, so 999,960 is "1.0M", never "1000.0k".
+    if count >= 999_950_000 {
+        format!("{:.1}B", count as f64 / 1e9)
+    } else if count >= 999_950 {
         format!("{:.1}M", count as f64 / 1e6)
     } else if count >= 1_000 {
         format!("{:.1}k", count as f64 / 1e3)
@@ -2324,6 +2327,8 @@ mod tests {
         assert_eq!(times, ("now".into(), "1m".into(), "2h".into(), "2d".into()));
         assert_eq!(ago(0, 100), "now", "a clock that went back");
         assert_eq!((compact(840), compact(12_400), compact(3_100_000)), ("840".into(), "12.4k".into(), "3.1M".into()));
+        let large = (compact(999_960), compact(1_549_400_000), compact(999_960_000), compact(12_300_000_000));
+        assert_eq!(large, ("1.0M".into(), "1.5B".into(), "1.0B".into(), "12.3B".into()));
         assert_eq!((money(0.4249), money(128.4)), ("$0.42".into(), "$128".into()));
         // A turn on another model adds its window; the others keep what they last said.
         let window = |name: &str, used: f64| atroxabot_core::LimitWindow {
